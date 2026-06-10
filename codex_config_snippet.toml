@@ -1,0 +1,56 @@
+# Hermes Reflection MCP v14.0.0 for Codex Desktop.
+# The server emits instructions during MCP initialize, so the config-level
+# instructions field is optional. Do not auto-approve clear_data.
+
+[mcp_servers.hermes-reflection]
+type = "stdio"
+command = "node"
+args = ['C:\Users\<YOU>\.codex\mcp\hermes-reflection-mcp\dist\index.js']
+enabled = true
+startup_timeout_sec = 30
+tool_timeout_sec = 300
+
+[mcp_servers.hermes-reflection.tools.retrieve_heuristics]
+approval_mode = "auto"
+
+[mcp_servers.hermes-reflection.tools.get_reflection_summary]
+approval_mode = "auto"
+
+[mcp_servers.hermes-reflection.tools.search_reflections]
+approval_mode = "auto"
+
+[mcp_servers.hermes-reflection.tools.list_reflections]
+approval_mode = "auto"
+
+[mcp_servers.hermes-reflection.tools.get_recent_reflections]
+approval_mode = "auto"
+
+[mcp_servers.hermes-reflection.tools.get_affordance_gaps]
+approval_mode = "auto"
+
+[mcp_servers.hermes-reflection.tools.get_open_questions]
+approval_mode = "auto"
+
+[mcp_servers.hermes-reflection.tools.get_world_model]
+approval_mode = "auto"
+
+[mcp_servers.hermes-reflection.tools.get_reflection_timeline]
+approval_mode = "auto"
+
+[mcp_servers.hermes-reflection.tools.get_heuristic_history]
+approval_mode = "auto"
+
+[mcp_servers.hermes-reflection.tools.get_heuristic_stats]
+approval_mode = "auto"
+
+[mcp_servers.hermes-reflection.tools.diff_reflections]
+approval_mode = "auto"
+
+[mcp_servers.hermes-reflection.tools.get_store_health]
+approval_mode = "auto"
+
+[mcp_servers.hermes-reflection.tools.export_project_experience_md]
+approval_mode = "auto"
+
+[mcp_servers.hermes-reflection.tools.export_data]
+approval_mode = "auto"

@@ -1,0 +1,24 @@
+{
+  "name": "hermes-reflection-mcp",
+  "version": "14.0.0",
+  "description": "Hermes-inspired post-task reflection MCP server",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "hermes-reflection-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "smoke": "npm run build && node scripts/smoke.mjs",
+    "test": "npm run smoke",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
