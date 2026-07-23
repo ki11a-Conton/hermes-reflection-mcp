@@ -38,7 +38,7 @@ export const STORE_DIR = join(homedir(), ".hermes-reflection");
 const STORE_PATH = join(STORE_DIR, "store.json");
 const REFLECTIONS_PATH = join(STORE_DIR, "reflections.jsonl");
 const RESOLVED_QUESTIONS_PATH = join(STORE_DIR, "resolved_questions.json");
-export const VERSION = "19.2.0";
+export const VERSION = "19.3.0";
 export const HEURISTIC_DEDUP_THRESHOLD = 0.75;
 const WORLD_FACT_DEDUP_THRESHOLD = 0.65;
 export const HEURISTIC_MAX_COUNT = 500;
@@ -120,11 +120,17 @@ function sanitizeHeuristicForOutput(heuristic: Heuristic): Heuristic {
 let mutationQueue: Promise<void> = Promise.resolve();
 let resolvedQuestionsMutationQueue: Promise<void> = Promise.resolve();
 
+interface FileFingerprint {
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+}
+
 interface StoreCache {
   store: ReflectionStore;
   loadedAt: number;
-  storeFileSize: number;
-  reflectionsFileSize: number;
+  storeFingerprint: FileFingerprint;
+  reflectionsFingerprint: FileFingerprint;
   reflectionsAreAscending: boolean;
   sessionIndex: Map<string, number[]>;
   reflectionsWithOpenQuestionsCount: Map<string, number>;
@@ -145,12 +151,19 @@ const CACHE_TTL_MS = 500;
 interface ResolvedQuestionsCache {
   index: ResolvedQuestionIndex;
   loadedAt: number;
-  fileSize: number;
+  fingerprint: FileFingerprint;
 }
 
 let _resolvedQuestionsCache: ResolvedQuestionsCache | null = null;
 let _mutationResolvedIndex: ResolvedQuestionIndex | null = null;
 const RESOLVED_QUESTIONS_CACHE_TTL_MS = 500;
+const PENDING_CLAIM_STALE_MS = 5 * 60_000;
+
+function isPendingClaimStale(mutation: PendingMutation): boolean {
+  if (mutation.state !== "processing" || !mutation.claimed_at) return false;
+  const claimedAt = Date.parse(mutation.claimed_at);
+  return Number.isNaN(claimedAt) || Date.now() - claimedAt >= PENDING_CLAIM_STALE_MS;
+}
 
 function buildSessionIndex(reflections: ReflectionFrame[]): Map<string, number[]> {
   const index = new Map<string, number[]>();
@@ -257,15 +270,15 @@ function cloneSessionIndex(index: Map<string, number[]>): Map<string, number[]> 
 
 function buildStoreCache(
   store: ReflectionStore,
-  storeFileSize: number,
-  reflectionsFileSize: number,
+  storeFingerprint: FileFingerprint,
+  reflectionsFingerprint: FileFingerprint,
   loadedAt = Date.now(),
 ): StoreCache {
   return {
     store,
     loadedAt,
-    storeFileSize,
-    reflectionsFileSize,
+    storeFingerprint,
+    reflectionsFingerprint,
     reflectionsAreAscending: checkIsAscending(store.reflections),
     sessionIndex: buildSessionIndex(store.reflections),
     reflectionsWithOpenQuestionsCount: buildOpenQuestionsIndex(store.reflections),
@@ -286,10 +299,10 @@ async function refreshStoreCacheAfterMutation(
   oldCache: StoreCache | null,
 ): Promise<StoreCache> {
   const loadedAt = Date.now();
-  const storeFileSize = await fileSize(STORE_PATH);
+  const storeFingerprint = await fileFingerprint(STORE_PATH);
 
   if (!oldCache) {
-    return buildStoreCache(store, storeFileSize, await fileSize(REFLECTIONS_PATH), loadedAt);
+    return buildStoreCache(store, storeFingerprint, await fileFingerprint(REFLECTIONS_PATH), loadedAt);
   }
 
   if (reflectionHint === "append-only" && previousReflectionCount <= store.reflections.length) {
@@ -325,8 +338,8 @@ async function refreshStoreCacheAfterMutation(
     return {
       store,
       loadedAt,
-      storeFileSize,
-      reflectionsFileSize: await fileSize(REFLECTIONS_PATH),
+      storeFingerprint,
+      reflectionsFingerprint: await fileFingerprint(REFLECTIONS_PATH),
       reflectionsAreAscending: previousReflectionCount === 0
         ? checkIsAscending(store.reflections)  // B7-fix: validate order on previously-empty store
         : oldCache.reflectionsAreAscending
@@ -348,8 +361,8 @@ async function refreshStoreCacheAfterMutation(
     return {
       store,
       loadedAt,
-      storeFileSize,
-      reflectionsFileSize: oldCache.reflectionsFileSize,
+      storeFingerprint,
+      reflectionsFingerprint: oldCache.reflectionsFingerprint,
       reflectionsAreAscending: oldCache.reflectionsAreAscending,
       sessionIndex: oldCache.sessionIndex,
       reflectionsWithOpenQuestionsCount: oldCache.reflectionsWithOpenQuestionsCount,
@@ -363,7 +376,7 @@ async function refreshStoreCacheAfterMutation(
     };
   }
 
-  return buildStoreCache(store, storeFileSize, await fileSize(REFLECTIONS_PATH), loadedAt);
+  return buildStoreCache(store, storeFingerprint, await fileFingerprint(REFLECTIONS_PATH), loadedAt);
 }
 
 async function getCachedStoreEntry(): Promise<StoreCache> {
@@ -374,11 +387,11 @@ async function getCachedStoreEntry(): Promise<StoreCache> {
 
   if (storeCache) {
     try {
-      const storeFileSize = await fileSize(STORE_PATH);
-      const reflectionsFileSize = await fileSize(REFLECTIONS_PATH);
+      const storeFingerprint = await fileFingerprint(STORE_PATH);
+      const reflectionsFingerprint = await fileFingerprint(REFLECTIONS_PATH);
       if (
-        storeFileSize === storeCache.storeFileSize &&
-        reflectionsFileSize === storeCache.reflectionsFileSize
+        sameFingerprint(storeFingerprint, storeCache.storeFingerprint) &&
+        sameFingerprint(reflectionsFingerprint, storeCache.reflectionsFingerprint)
       ) {
         storeCache = { ...storeCache, loadedAt: now };
         return storeCache;
@@ -391,8 +404,8 @@ async function getCachedStoreEntry(): Promise<StoreCache> {
   const store = await loadStore();
   storeCache = buildStoreCache(
     store,
-    await fileSize(STORE_PATH),
-    await fileSize(REFLECTIONS_PATH),
+    await fileFingerprint(STORE_PATH),
+    await fileFingerprint(REFLECTIONS_PATH),
   );
   return storeCache;
 }
@@ -416,8 +429,8 @@ async function getCachedResolvedQuestions(): Promise<ResolvedQuestionIndex> {
   // TTL expired but cache exists: stat once to check freshness
   if (_resolvedQuestionsCache) {
     try {
-      const currentSize = await fileSize(RESOLVED_QUESTIONS_PATH);
-      if (currentSize === _resolvedQuestionsCache.fileSize) {
+      const currentFingerprint = await fileFingerprint(RESOLVED_QUESTIONS_PATH);
+      if (sameFingerprint(currentFingerprint, _resolvedQuestionsCache.fingerprint)) {
         _resolvedQuestionsCache.loadedAt = now;
         return _resolvedQuestionsCache.index;
       }
@@ -428,7 +441,7 @@ async function getCachedResolvedQuestions(): Promise<ResolvedQuestionIndex> {
   _resolvedQuestionsCache = {
     index,
     loadedAt: Date.now(),
-    fileSize: await fileSize(RESOLVED_QUESTIONS_PATH),
+    fingerprint: await fileFingerprint(RESOLVED_QUESTIONS_PATH),
   };
   return index;
 }
@@ -449,13 +462,14 @@ export async function loadStore(): Promise<ReflectionStore> {
   if (!existsSync(STORE_PATH)) {
     const store = emptyStore();
     store.reflections = await loadReflections();
+    reconcileSessionCounters(store, true);
     return store;
   }
 
   try {
     const raw = await readFile(STORE_PATH, "utf-8");
     const parsed = JSON.parse(raw) as Partial<ReflectionStore>;
-    const legacyReflections = (parsed.reflections ?? []).map((reflection) =>
+    const legacyReflections = asArray<Partial<ReflectionFrame>>(parsed.reflections).map((reflection) =>
       normalizeReflectionFrame(reflection as Partial<ReflectionFrame>)
     );
     if (legacyReflections.length > 0) {
@@ -463,26 +477,32 @@ export async function loadStore(): Promise<ReflectionStore> {
         await replaceReflectionsFile(legacyReflections);
       }
       await writeStoreIndex({
-        sessions: normalizeSessionsRecord(parsed.sessions as Record<string, Partial<Session>> | undefined),
+        sessions: normalizeSessionsRecord(recordValue(parsed.sessions) as Record<string, Partial<Session>>),
         reflections: [],
-        affordance_gaps: (parsed.affordance_gaps ?? []).map((gap) => normalizeAffordanceGapRecord(gap)),
-        heuristics: (parsed.heuristics ?? []) as Heuristic[],
-        version: parsed.version ?? VERSION,
+        affordance_gaps: asArray<Partial<AffordanceGap>>(parsed.affordance_gaps)
+          .map((gap) => normalizeAffordanceGapRecord(gap)),
+        heuristics: asArray<Partial<Heuristic>>(parsed.heuristics).map(normalizeHeuristicRecord),
+        version: typeof parsed.version === "string" ? parsed.version : VERSION,
         memory_board: normalizeMemoryBoard(parsed.memory_board as Partial<MemoryBoard> | undefined),
         user_profile: normalizeMemoryBoard(parsed.user_profile as Partial<MemoryBoard> | undefined, 1800),
-        metadata: parsed.metadata ? { ...parsed.metadata, pending_mutations: parsed.metadata.pending_mutations ?? [] } : undefined,
+        metadata: normalizeStoreMetadata(parsed.metadata),
       }, false);
     }
-    return {
-      sessions: normalizeSessionsRecord(parsed.sessions as Record<string, Partial<Session>> | undefined),
+    const store: ReflectionStore = {
+      sessions: normalizeSessionsRecord(recordValue(parsed.sessions) as Record<string, Partial<Session>>),
       reflections: await loadReflections(legacyReflections),
-      affordance_gaps: (parsed.affordance_gaps ?? []).map((gap) => normalizeAffordanceGapRecord(gap)),
-      heuristics: (parsed.heuristics ?? []).map(normalizeHeuristicRecord),
-      version: parsed.version ?? VERSION,
+      affordance_gaps: uniqueById(
+        asArray<Partial<AffordanceGap>>(parsed.affordance_gaps)
+          .map((gap) => normalizeAffordanceGapRecord(gap)),
+      ),
+      heuristics: uniqueById(asArray<Partial<Heuristic>>(parsed.heuristics).map(normalizeHeuristicRecord)),
+      version: typeof parsed.version === "string" ? parsed.version : VERSION,
       memory_board: normalizeMemoryBoard(parsed.memory_board as Partial<MemoryBoard> | undefined),
       user_profile: normalizeMemoryBoard(parsed.user_profile as Partial<MemoryBoard> | undefined, 1800),
-      metadata: parsed.metadata ? { ...parsed.metadata, pending_mutations: parsed.metadata.pending_mutations ?? [] } : undefined,
+      metadata: normalizeStoreMetadata(parsed.metadata),
     };
+    reconcileSessionCounters(store, false);
+    return store;
   } catch (error) {
     await preserveCorruptStore(error);
     return emptyStore();
@@ -535,73 +555,111 @@ function normalizeFailureMode(value: unknown): ReflectionFrame["failure_mode"] {
     : "success";
 }
 
-function normalizeOpenQuestion(value: Partial<OpenQuestion>): OpenQuestion {
+function normalizeIsoTimestamp(value: unknown, fallback: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) return fallback;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : fallback;
+}
+
+function normalizeNonNegativeInteger(value: unknown, fallback: number, minimum = 0): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= minimum
+    ? Math.floor(value)
+    : fallback;
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function normalizeOpenQuestion(value: Partial<OpenQuestion> | unknown): OpenQuestion {
+  const input = recordValue(value);
+  const now = new Date().toISOString();
   const priority: Priority =
-    value.priority === "high" || value.priority === "low" || value.priority === "medium"
-      ? value.priority
+    input.priority === "high" || input.priority === "low" || input.priority === "medium"
+      ? input.priority
       : "medium";
   return {
-    question: typeof value.question === "string" ? value.question : "",
+    question: typeof input.question === "string" ? input.question : "",
     priority,
-    requires_environment_interaction: value.requires_environment_interaction === true,
-    ...(value.resolved === true ? { resolved: true } : {}),
-    ...(typeof value.resolved_at === "string" ? { resolved_at: value.resolved_at } : {}),
-    ...(typeof value.resolved_by === "string" ? { resolved_by: value.resolved_by } : {}),
+    requires_environment_interaction: input.requires_environment_interaction === true,
+    ...(input.resolved === true ? { resolved: true } : {}),
+    ...(input.resolved === true
+      ? { resolved_at: normalizeIsoTimestamp(input.resolved_at, now) }
+      : {}),
+    ...(typeof input.resolved_by === "string" ? { resolved_by: input.resolved_by } : {}),
   };
 }
 
-function normalizeWorldModelUpdate(value: Partial<WorldModelUpdate>): WorldModelUpdate {
+function normalizeWorldModelUpdate(value: Partial<WorldModelUpdate> | unknown): WorldModelUpdate {
+  const input = recordValue(value);
   return {
-    fact: typeof value.fact === "string" ? value.fact : "",
-    polarity: value.polarity === "negate" ? "negate" : "affirm",
-    source: typeof value.source === "string" ? value.source : "",
-    evidence: typeof value.evidence === "string" ? value.evidence : "",
+    fact: typeof input.fact === "string" ? input.fact : "",
+    polarity: input.polarity === "negate" ? "negate" : "affirm",
+    source: typeof input.source === "string" ? input.source : "",
+    evidence: typeof input.evidence === "string" ? input.evidence : "",
   };
 }
 
-function normalizeToolInsight(value: Partial<ToolInsight>): ToolInsight {
+function normalizeToolInsight(value: Partial<ToolInsight> | unknown): ToolInsight {
+  const input = recordValue(value);
   return {
-    tool: typeof value.tool === "string" ? value.tool : "",
-    insight: typeof value.insight === "string" ? value.insight : "",
-    status: value.status === "confirmed" ? "confirmed" : "needs_verification",
-    evidence: typeof value.evidence === "string" ? value.evidence : "",
+    tool: typeof input.tool === "string" ? input.tool : "",
+    insight: typeof input.insight === "string" ? input.insight : "",
+    status: input.status === "confirmed" ? "confirmed" : "needs_verification",
+    evidence: typeof input.evidence === "string" ? input.evidence : "",
   };
 }
 
-function normalizeContextForget(value: Partial<ContextForget>): ContextForget {
+function normalizeContextForget(value: Partial<ContextForget> | unknown): ContextForget {
+  const input = recordValue(value);
   return {
-    item: typeof value.item === "string" ? value.item : "",
-    reason: typeof value.reason === "string" ? value.reason : "",
+    item: typeof input.item === "string" ? input.item : "",
+    reason: typeof input.reason === "string" ? input.reason : "",
   };
+}
+
+function normalizeSummarySections(value: unknown): Array<{ title: string; content: string }> | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const sections = value.flatMap((section) => {
+    const input = recordValue(section);
+    return typeof input.title === "string" && typeof input.content === "string"
+      ? [{ title: input.title, content: input.content }]
+      : [];
+  });
+  return sections.length > 0 ? sections : undefined;
 }
 
 function normalizeReflectionFrame(input: Partial<ReflectionFrame>): ReflectionFrame {
-  const taskState = (input.task_state ?? {}) as Partial<ReflectionFrame["task_state"]>;
-  const sessionId = typeof input.session_id === "string" && input.session_id ? input.session_id : "legacy";
+  const source = recordValue(input);
+  const taskState = recordValue(source.task_state);
+  const sessionId = typeof source.session_id === "string" && source.session_id ? source.session_id : "legacy";
+  const now = new Date().toISOString();
   return {
-    id: typeof input.id === "string" && input.id ? input.id : generateId(),
-    timestamp: typeof input.timestamp === "string" && input.timestamp ? input.timestamp : new Date().toISOString(),
+    id: typeof source.id === "string" && source.id ? source.id : generateId(),
+    timestamp: normalizeIsoTimestamp(source.timestamp, now),
     session_id: sessionId,
-    task_goal: typeof input.task_goal === "string" ? input.task_goal : "",
-    task_outcome: normalizeTaskOutcome(input.task_outcome),
-    failure_mode: normalizeFailureMode(input.failure_mode),
+    task_goal: typeof source.task_goal === "string" ? source.task_goal : "",
+    task_outcome: normalizeTaskOutcome(source.task_outcome),
+    failure_mode: normalizeFailureMode(source.failure_mode),
     task_state: {
       summary: typeof taskState.summary === "string" ? taskState.summary : "",
-      summary_sections: Array.isArray(taskState.summary_sections) ? taskState.summary_sections : undefined,
+      summary_sections: normalizeSummarySections(taskState.summary_sections),
       immediate_blockers: stringArray(taskState.immediate_blockers),
       active_hypotheses: stringArray(taskState.active_hypotheses),
       proven_safe_paths: stringArray(taskState.proven_safe_paths),
       exhausted_search: stringArray(taskState.exhausted_search),
     },
-    world_model_updates: asArray<Partial<WorldModelUpdate>>(input.world_model_updates).map(normalizeWorldModelUpdate),
-    tool_insights: asArray<Partial<ToolInsight>>(input.tool_insights).map(normalizeToolInsight),
-    context_forget: asArray<Partial<ContextForget>>(input.context_forget).map(normalizeContextForget),
-    open_questions: asArray<Partial<OpenQuestion>>(input.open_questions).map(normalizeOpenQuestion),
-    lessons_learned: stringArray(input.lessons_learned),
-    affordance_gaps: asArray<Partial<AffordanceGap>>(input.affordance_gaps).map((gap) => normalizeAffordanceGapRecord(gap, sessionId)),
-    domain: typeof input.domain === "string" ? normalizeDomain(input.domain) : "general",
-    tags: stringArray(input.tags).map((tag) => tag.toLowerCase().trim()).filter(Boolean),
-    context_notes: typeof input.context_notes === "string" && input.context_notes.trim() ? input.context_notes.slice(0, 2000) : undefined,
+    world_model_updates: asArray<Partial<WorldModelUpdate>>(source.world_model_updates).map(normalizeWorldModelUpdate),
+    tool_insights: asArray<Partial<ToolInsight>>(source.tool_insights).map(normalizeToolInsight),
+    context_forget: asArray<Partial<ContextForget>>(source.context_forget).map(normalizeContextForget),
+    open_questions: asArray<Partial<OpenQuestion>>(source.open_questions).map(normalizeOpenQuestion),
+    lessons_learned: stringArray(source.lessons_learned),
+    affordance_gaps: asArray<Partial<AffordanceGap>>(source.affordance_gaps).map((gap) => normalizeAffordanceGapRecord(gap, sessionId)),
+    domain: typeof source.domain === "string" ? normalizeDomain(source.domain) : "general",
+    tags: stringArray(source.tags).map((tag) => tag.toLowerCase().trim()).filter(Boolean),
+    context_notes: typeof source.context_notes === "string" && source.context_notes.trim() ? source.context_notes.slice(0, 2000) : undefined,
   };
 }
 
@@ -609,36 +667,50 @@ function normalizeHeuristicRecord(h: Partial<Heuristic>): Heuristic {
   const now = new Date().toISOString();
   return {
     id: typeof h.id === "string" && h.id ? h.id : generateId(),
-    created_at: typeof h.created_at === "string" && h.created_at ? h.created_at : now,
-    updated_at: typeof h.updated_at === "string" && h.updated_at ? h.updated_at : now,
+    created_at: normalizeIsoTimestamp(h.created_at, now),
+    updated_at: normalizeIsoTimestamp(h.updated_at, now),
     domain: typeof h.domain === "string" ? normalizeDomain(h.domain) : "general",
     heuristic: typeof h.heuristic === "string" ? h.heuristic : "",
     source_task: typeof h.source_task === "string" ? h.source_task : "",
     session_id: typeof h.session_id === "string" ? h.session_id : undefined,
-    reinforcement_count: typeof h.reinforcement_count === "number" ? h.reinforcement_count : 1,
-    contradiction_count: typeof h.contradiction_count === "number" ? h.contradiction_count : 0,
+    reinforcement_count: normalizeNonNegativeInteger(h.reinforcement_count, 1, 1),
+    contradiction_count: normalizeNonNegativeInteger(h.contradiction_count, 0),
     contradiction_notes: stringArray(h.contradiction_notes),
-    confidence: typeof h.confidence === "number" ? Math.max(0, Math.min(1, h.confidence)) : 0.6,
-    retrieval_count: typeof h.retrieval_count === "number" ? h.retrieval_count : 0,
-    last_retrieved_at: typeof h.last_retrieved_at === "string" ? h.last_retrieved_at : undefined,
+    confidence: typeof h.confidence === "number" && Number.isFinite(h.confidence)
+      ? Math.max(0, Math.min(1, h.confidence))
+      : 0.6,
+    retrieval_count: normalizeNonNegativeInteger(h.retrieval_count, 0),
+    last_retrieved_at: typeof h.last_retrieved_at === "string"
+      ? normalizeIsoTimestamp(h.last_retrieved_at, now)
+      : undefined,
     supersedes: stringArray(h.supersedes),
     superseded_by: typeof h.superseded_by === "string" ? h.superseded_by : undefined,
     pinned: h.pinned === true ? true : undefined,
-    version: typeof h.version === "number" ? h.version : 1,
+    version: normalizeNonNegativeInteger(h.version, 1, 1),
     tags: stringArray(h.tags).map((tag) => tag.toLowerCase().trim()).filter(Boolean),
   };
 }
 
+function uniqueById<T extends { id: string }>(items: T[]): T[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    if (seen.has(item.id)) return false;
+    seen.add(item.id);
+    return true;
+  });
+}
+
 function normalizeMemoryBoard(input: Partial<MemoryBoard> | undefined, defaultCharLimit = 2200): MemoryBoard {
-  const entries: MemoryEntry[] = Array.isArray(input?.entries)
+  const now = new Date().toISOString();
+  const entries: MemoryEntry[] = uniqueById(Array.isArray(input?.entries)
     ? (input!.entries as Partial<MemoryEntry>[]).map((e) => ({
         id: typeof e.id === "string" && e.id ? e.id : generateId(),
         content: typeof e.content === "string" ? e.content : "",
-        created_at: typeof e.created_at === "string" && e.created_at ? e.created_at : new Date().toISOString(),
-        updated_at: typeof e.updated_at === "string" && e.updated_at ? e.updated_at : new Date().toISOString(),
+        created_at: normalizeIsoTimestamp(e.created_at, now),
+        updated_at: normalizeIsoTimestamp(e.updated_at, now),
         source_reflection_id: typeof e.source_reflection_id === "string" && e.source_reflection_id ? e.source_reflection_id : undefined,
       }))
-    : [];
+    : []);
   const raw_limit = typeof input?.char_limit === "number" && Number.isFinite(input.char_limit) && input.char_limit > 0
     ? input.char_limit
     : defaultCharLimit;
@@ -651,7 +723,7 @@ function normalizeAffordanceGapRecord(input: Partial<AffordanceGap>, fallbackSes
   const now = new Date().toISOString();
   return {
     id: typeof input.id === "string" && input.id ? input.id : generateId(),
-    timestamp: typeof input.timestamp === "string" && input.timestamp ? input.timestamp : now,
+    timestamp: normalizeIsoTimestamp(input.timestamp, now),
     session_id: typeof input.session_id === "string" && input.session_id ? input.session_id : fallbackSessionId,
     goal_description: typeof input.goal_description === "string" ? input.goal_description : "",
     failure_description: typeof input.failure_description === "string" ? input.failure_description : "",
@@ -660,24 +732,101 @@ function normalizeAffordanceGapRecord(input: Partial<AffordanceGap>, fallbackSes
     occurrence_count: typeof input.occurrence_count === "number" && Number.isFinite(input.occurrence_count) && input.occurrence_count > 0 ? input.occurrence_count : 1,
     suggested_solution: typeof input.suggested_solution === "string" && input.suggested_solution ? input.suggested_solution : undefined,
     resolved: input.resolved === true ? true : undefined,
-    resolved_at: typeof input.resolved_at === "string" ? input.resolved_at : undefined,
+    resolved_at: input.resolved === true
+      ? normalizeIsoTimestamp(input.resolved_at, now)
+      : undefined,
     resolution_notes: typeof input.resolution_notes === "string" ? input.resolution_notes : undefined,
   };
 }
 
 function normalizeSessionRecord(id: string, input: Partial<Session>): Session {
+  const now = new Date().toISOString();
   return {
     id,
-    started_at: typeof input.started_at === "string" && input.started_at ? input.started_at : new Date().toISOString(),
+    started_at: normalizeIsoTimestamp(input.started_at, now),
     reflection_count: typeof input.reflection_count === "number" && Number.isFinite(input.reflection_count) && input.reflection_count >= 0 ? input.reflection_count : 0,
     affordance_gap_count: typeof input.affordance_gap_count === "number" && Number.isFinite(input.affordance_gap_count) && input.affordance_gap_count >= 0 ? input.affordance_gap_count : 0,
   };
 }
 
+function getOwnSession(sessions: Record<string, Session>, id: string): Session | undefined {
+  return Object.prototype.hasOwnProperty.call(sessions, id) ? sessions[id] : undefined;
+}
+
+function setOwnSession(sessions: Record<string, Session>, id: string, session: Session): void {
+  // Assignment to "__proto__" on an ordinary object invokes its legacy
+  // prototype setter. Define an own data property so every valid session_id is
+  // stored literally.
+  Object.defineProperty(sessions, id, {
+    value: session,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
+}
+
 function normalizeSessionsRecord(input: Record<string, Partial<Session>> | undefined): Record<string, Session> {
-  return Object.fromEntries(
-    Object.entries(input ?? {}).map(([id, session]) => [id, normalizeSessionRecord(id, session)]),
-  );
+  const sessions: Record<string, Session> = {};
+  for (const [id, session] of Object.entries(input ?? {})) {
+    setOwnSession(sessions, id, normalizeSessionRecord(id, session));
+  }
+  return sessions;
+}
+
+function normalizeStoreMetadata(value: unknown): ReflectionStore["metadata"] | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const input = value as Record<string, unknown>;
+  const now = new Date().toISOString();
+  const pending: PendingMutation[] = [];
+  for (const rawMutation of asArray<unknown>(input.pending_mutations)) {
+    const mutation = recordValue(rawMutation);
+    const id = typeof mutation.id === "string" ? mutation.id.trim() : "";
+    const operation = typeof mutation.operation === "string" ? mutation.operation.trim() : "";
+    if (!id || !operation) continue;
+    const isProcessing = mutation.state === "processing"
+      && typeof mutation.claim_token === "string"
+      && mutation.claim_token.length > 0;
+    pending.push({
+      id,
+      created_at: normalizeIsoTimestamp(mutation.created_at, now),
+      operation,
+      preview: typeof mutation.preview === "string" ? mutation.preview : `Queued ${operation} pending approval`,
+      ...(recordValue(mutation.payload) !== mutation.payload
+        ? {}
+        : { payload: mutation.payload as Record<string, unknown> }),
+      ...(typeof mutation.payload_hash === "string" ? { payload_hash: mutation.payload_hash } : {}),
+      ...(isProcessing
+        ? {
+            state: "processing" as const,
+            claim_token: mutation.claim_token as string,
+            claimed_at: normalizeIsoTimestamp(mutation.claimed_at, now),
+          }
+        : { state: "pending" as const }),
+    });
+  }
+
+  const provider = recordValue(input.external_provider);
+  const providerName = typeof provider.name === "string" && provider.name.trim()
+    ? provider.name.trim()
+    : undefined;
+
+  return {
+    created_at: normalizeIsoTimestamp(input.created_at, now),
+    last_written_at: normalizeIsoTimestamp(input.last_written_at, now),
+    write_count: normalizeNonNegativeInteger(input.write_count, 0),
+    ...(typeof input.write_approval === "boolean" ? { write_approval: input.write_approval } : {}),
+    pending_mutations: pending,
+    ...(providerName
+      ? {
+          external_provider: {
+            name: providerName,
+            ...(typeof provider.endpoint === "string" ? { endpoint: provider.endpoint } : {}),
+            ...(typeof provider.db_path === "string" ? { db_path: provider.db_path } : {}),
+            ...(typeof provider.auto_sync === "boolean" ? { auto_sync: provider.auto_sync } : {}),
+          },
+        }
+      : {}),
+  };
 }
 
 // B15: removed dead code saveStore
@@ -788,7 +937,7 @@ async function loadReflections(fallback: ReflectionFrame[] = []): Promise<Reflec
     await preservePartialReflectionsFile();
     console.error(`[hermes] loadReflections: ${results.length} ok, ${skipped} corrupt lines skipped.`);
   }
-  return results.length > 0 ? results : normalizedFallback;
+  return results.length > 0 ? uniqueById(results) : uniqueById(normalizedFallback);
 }
 
 function parseReflectionLines(lines: string[]): ReflectionFrame[] {
@@ -805,7 +954,7 @@ function parseReflectionLines(lines: string[]): ReflectionFrame[] {
   if (skipped > 0) {
     console.error(`[hermes] parseReflectionLines: ${results.length} ok, ${skipped} corrupt lines skipped.`);
   }
-  return results;
+  return uniqueById(results);
 }
 
 async function loadRecentReflections(limit: number): Promise<ReflectionFrame[]> {
@@ -987,16 +1136,44 @@ async function mutateStore<T>(
   return run;
 }
 
-function ensureSession(store: ReflectionStore, sessionId: string): Session {
-  if (!store.sessions[sessionId]) {
-    store.sessions[sessionId] = {
+function ensureSession(store: ReflectionStore, sessionId: string, startedAt?: string): Session {
+  let session = getOwnSession(store.sessions, sessionId);
+  const normalizedStartedAt = normalizeIsoTimestamp(startedAt, new Date().toISOString());
+  if (!session) {
+    session = {
       id: sessionId,
-      started_at: new Date().toISOString(),
+      started_at: normalizedStartedAt,
       reflection_count: 0,
       affordance_gap_count: 0,
     };
+    setOwnSession(store.sessions, sessionId, session);
+  } else if (normalizedStartedAt < session.started_at) {
+    session.started_at = normalizedStartedAt;
   }
-  return store.sessions[sessionId];
+  return session;
+}
+
+function reconcileSessionCounters(store: ReflectionStore, createMissing: boolean): void {
+  for (const session of Object.values(store.sessions)) {
+    session.reflection_count = 0;
+    session.affordance_gap_count = 0;
+  }
+  for (const reflection of store.reflections) {
+    const session = getOwnSession(store.sessions, reflection.session_id)
+      ?? (createMissing ? ensureSession(store, reflection.session_id, reflection.timestamp) : undefined);
+    if (session) {
+      if (reflection.timestamp < session.started_at) session.started_at = reflection.timestamp;
+      session.reflection_count++;
+    }
+  }
+  for (const gap of store.affordance_gaps) {
+    const session = getOwnSession(store.sessions, gap.session_id)
+      ?? (createMissing ? ensureSession(store, gap.session_id, gap.timestamp) : undefined);
+    if (session) {
+      if (gap.timestamp < session.started_at) session.started_at = gap.timestamp;
+      session.affordance_gap_count++;
+    }
+  }
 }
 
 
@@ -1204,7 +1381,11 @@ function upsertHeuristicMut(store: ReflectionStore, input: HeuristicInput): Heur
     const union = inputTokens.size + entry.tokens.size - overlap;
     if (union === 0 || overlap / union < 0.3) continue;
 
-    if (similarity(entry.ref.heuristic, input.heuristic) > HEURISTIC_DEDUP_THRESHOLD) {
+    const dedupSimilarity = Math.max(
+      similarity(entry.ref.heuristic, input.heuristic),
+      similarity(input.heuristic, entry.ref.heuristic),
+    );
+    if (dedupSimilarity > HEURISTIC_DEDUP_THRESHOLD) {
       existing = entry.ref;
       break;
     }
@@ -1520,6 +1701,15 @@ export async function memoryBoardWrite(
       if (matches.length === 0) return { success: false, error: `No entry matches old_text: "${oldText}"`, entries: board.entries, used_chars: board.used_chars, char_limit: board.char_limit };
       if (matches.length > 1) return { success: false, error: `old_text "${oldText}" matches ${matches.length} entries; use a more specific substring`, entries: board.entries, used_chars: board.used_chars, char_limit: board.char_limit };
       const match = matches[0];
+      if (board.entries.some((entry) => entry.id !== match.id && entry.content === newContent)) {
+        return {
+          success: true,
+          note: "no duplicate added (content already exists)",
+          entries: board.entries,
+          used_chars: board.used_chars,
+          char_limit: board.char_limit,
+        };
+      }
       const index = board.entries.findIndex((entry) => entry.id === match.id);
       const newUsed = board.used_chars - match.content.length + newContent.length;
       if (newUsed > board.char_limit) {
@@ -1744,11 +1934,59 @@ export async function getRawMemoryStores(): Promise<RawMemoryStores> {
 export async function rejectPendingMutation(mutationId: string): Promise<PendingMutation | null> {
   return mutateStore((store) => {
     const pending = store.metadata?.pending_mutations ?? [];
-    const index = pending.findIndex((mutation) => mutation.id === mutationId);
+    // A live claim may still be replaying. A stale claim is safe to discard
+    // (rather than replay) after an approver crash or process termination.
+    const index = pending.findIndex((mutation) => mutation.id === mutationId
+      && ((mutation.state ?? "pending") === "pending" || isPendingClaimStale(mutation)));
     if (index < 0) return null;
     const [removed] = pending.splice(index, 1);
     if (store.metadata) store.metadata.pending_mutations = pending;
     return removed;
+  }, "none");
+}
+
+export interface PendingMutationClaim {
+  mutation: PendingMutation;
+  claimToken: string;
+}
+
+/** Atomically reserve a pending mutation so only one approver can replay it. */
+export async function claimPendingMutation(mutationId: string): Promise<PendingMutationClaim | null> {
+  return mutateStore((store) => {
+    const pending = store.metadata?.pending_mutations ?? [];
+    const mutation = pending.find((item) => item.id === mutationId && (item.state ?? "pending") === "pending");
+    if (!mutation) return null;
+    const claimToken = randomUUID();
+    mutation.state = "processing";
+    mutation.claim_token = claimToken;
+    mutation.claimed_at = new Date().toISOString();
+    return { mutation: structuredClone(mutation), claimToken };
+  }, "none");
+}
+
+/** Remove a successfully replayed mutation only when held by this approver. */
+export async function completePendingMutation(mutationId: string, claimToken: string): Promise<PendingMutation | null> {
+  return mutateStore((store) => {
+    const pending = store.metadata?.pending_mutations ?? [];
+    const index = pending.findIndex((item) => item.id === mutationId
+      && item.state === "processing" && item.claim_token === claimToken);
+    if (index < 0) return null;
+    const [removed] = pending.splice(index, 1);
+    if (store.metadata) store.metadata.pending_mutations = pending;
+    return removed;
+  }, "none");
+}
+
+/** Return a failed replay to the queue without making its payload invisible. */
+export async function releasePendingMutation(mutationId: string, claimToken: string): Promise<boolean> {
+  return mutateStore((store) => {
+    const mutation = (store.metadata?.pending_mutations ?? []).find((item) => item.id === mutationId
+      && item.state === "processing" && item.claim_token === claimToken);
+    if (!mutation) return false;
+    mutation.state = "pending";
+    delete mutation.claim_token;
+    delete mutation.claimed_at;
+    return true;
   }, "none");
 }
 
@@ -2529,7 +2767,10 @@ export async function searchReflections(
       const textScore = similarity(haystack, query, 1.5, 0.75, AVG_REFLECTION_DOC_LEN);
       if (textScore < SEARCH_MIN_TEXT_SCORE) return null;
       const ageMs = Date.now() - new Date(reflection.timestamp).getTime();
-      const ageDays = ageMs / (1000 * 60 * 60 * 24);
+      // Clock skew or imported future timestamps must not turn the exponential
+      // recency term into an unbounded boost. Rank by distance from the current
+      // clock so far-future records decay just like equally old records.
+      const ageDays = Math.abs(ageMs) / (1000 * 60 * 60 * 24);
       const recencyFactor = 0.5 + 0.5 * Math.exp(-ageDays / 90);
       return { reflection, score: textScore * recencyFactor };
     })
@@ -2824,7 +3065,7 @@ export async function getSessionSummary(sessionId: string): Promise<SessionSumma
   const cache = await getCachedStoreEntry();
   const store = cache.store;
   const resolvedIndex = await getCachedResolvedQuestions();
-  const session = store.sessions[sessionId];
+  const session = getOwnSession(store.sessions, sessionId);
   if (!session) return null;
 
   const sessionReflections = (cache.sessionIndex.get(sessionId) ?? [])
@@ -3686,6 +3927,21 @@ async function fileSize(path: string): Promise<number> {
   }
 }
 
+async function fileFingerprint(path: string): Promise<FileFingerprint> {
+  try {
+    const info = await stat(path);
+    return { size: info.size, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs };
+  } catch {
+    return { size: 0, mtimeMs: 0, ctimeMs: 0 };
+  }
+}
+
+function sameFingerprint(left: FileFingerprint, right: FileFingerprint): boolean {
+  return left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs;
+}
+
 function resolvedQuestionKey(reflectionId: string, questionIndex: number): string {
   return `${reflectionId}:${questionIndex}`;
 }
@@ -3693,7 +3949,24 @@ function resolvedQuestionKey(reflectionId: string, questionIndex: number): strin
 async function loadResolvedQuestions(): Promise<ResolvedQuestionIndex> {
   if (!existsSync(RESOLVED_QUESTIONS_PATH)) return {};
   try {
-    return JSON.parse(await readFile(RESOLVED_QUESTIONS_PATH, "utf-8")) as ResolvedQuestionIndex;
+    const parsed = JSON.parse(await readFile(RESOLVED_QUESTIONS_PATH, "utf-8")) as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      console.error("[hermes] resolved_questions.json must contain an object; ignoring malformed overlay.");
+      return {};
+    }
+    const now = new Date().toISOString();
+    const normalized: ResolvedQuestionIndex = Object.create(null) as ResolvedQuestionIndex;
+    for (const [key, rawEntry] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!key.includes(":")) continue;
+      const entry = recordValue(rawEntry);
+      normalized[key] = {
+        resolved_at: normalizeIsoTimestamp(entry.resolved_at, now),
+        ...(typeof entry.resolved_by === "string" && entry.resolved_by
+          ? { resolved_by: entry.resolved_by }
+          : {}),
+      };
+    }
+    return normalized;
   } catch (error) {
     console.error("[hermes] resolved_questions.json is invalid; ignoring overlay.", error);
     return {};
@@ -3711,18 +3984,19 @@ async function mutateResolvedQuestions(
   mutator: (index: ResolvedQuestionIndex) => void | Promise<void>,
 ): Promise<void> {
   const run = resolvedQuestionsMutationQueue.then(async () => {
-    if (!_mutationResolvedIndex) {
-      _mutationResolvedIndex = await loadResolvedQuestions();
-    }
-    const index = _mutationResolvedIndex;
-    await mutator(index);
-    await saveResolvedQuestions(index);
-    _mutationResolvedIndex = index;
-    _resolvedQuestionsCache = {
-      index,
-      loadedAt: Date.now(),
-      fileSize: await fileSize(RESOLVED_QUESTIONS_PATH),
-    };
+    await withFileLock(RESOLVED_QUESTIONS_PATH, async () => {
+      // Reload inside the process-shared transaction so every writer merges
+      // against the latest committed overlay rather than a local cache.
+      const index = await loadResolvedQuestions();
+      await mutator(index);
+      await saveResolvedQuestions(index);
+      _mutationResolvedIndex = index;
+      _resolvedQuestionsCache = {
+        index,
+        loadedAt: Date.now(),
+        fingerprint: await fileFingerprint(RESOLVED_QUESTIONS_PATH),
+      };
+    });
   });
   resolvedQuestionsMutationQueue = run.then(
     () => undefined,
@@ -3806,6 +4080,7 @@ export async function importData(
     throw new Error("importData requires a non-null 'incoming' object");
   }
   const mutationResult = await mutateStore((store) => {
+    const originalSessionIds = new Set(Object.keys(store.sessions));
     let replacementResolvedIndex: ResolvedQuestionIndex | undefined;
     let mergedResolvedIndex: ResolvedQuestionIndex | undefined;
     const mergedNewReflections: ReflectionFrame[] = [];
@@ -3818,13 +4093,21 @@ export async function importData(
 
     if (mode === "replace") {
       if (incoming.reflections) {
-        store.reflections = (incoming.reflections as Partial<ReflectionFrame>[]).map(normalizeReflectionFrame);
+        store.reflections = uniqueById(
+          (incoming.reflections as Partial<ReflectionFrame>[]).map(normalizeReflectionFrame),
+        );
         replacementResolvedIndex = resolvedQuestionsFromReflections(store.reflections);
       }
       if (incoming.heuristics) {
-        store.heuristics = (incoming.heuristics as Partial<Heuristic>[]).map(normalizeHeuristicRecord);
+        store.heuristics = uniqueById(
+          (incoming.heuristics as Partial<Heuristic>[]).map(normalizeHeuristicRecord),
+        );
       }
-      if (incoming.affordance_gaps) store.affordance_gaps = (incoming.affordance_gaps as Partial<AffordanceGap>[]).map((gap) => normalizeAffordanceGapRecord(gap));
+      if (incoming.affordance_gaps) {
+        store.affordance_gaps = uniqueById(
+          (incoming.affordance_gaps as Partial<AffordanceGap>[]).map((gap) => normalizeAffordanceGapRecord(gap)),
+        );
+      }
       if (incoming.sessions) store.sessions = normalizeSessionsRecord(incoming.sessions as Record<string, Partial<Session>>);
       if (incoming.memory_board) store.memory_board = normalizeMemoryBoard(incoming.memory_board as Partial<MemoryBoard>);
       if (incoming.user_profile) store.user_profile = normalizeMemoryBoard(incoming.user_profile as Partial<MemoryBoard>, 1800);
@@ -3874,8 +4157,8 @@ export async function importData(
       }
       if (incoming.sessions) {
         for (const [id, session] of Object.entries(incoming.sessions as Record<string, Partial<Session>>)) {
-          if (!store.sessions[id]) {
-            store.sessions[id] = normalizeSessionRecord(id, session);
+          if (!getOwnSession(store.sessions, id)) {
+            setOwnSession(store.sessions, id, normalizeSessionRecord(id, session));
             newSessions++;
           }
         }
@@ -3890,6 +4173,7 @@ export async function importData(
           if (existingIds.has(entry.id)) continue;
           if (board.used_chars + entry.content.length <= board.char_limit) {
             board.entries.push(entry);
+            existingIds.add(entry.id);
             board.used_chars += entry.content.length;
             newMemoryBoard++;  // E4-fix
           }
@@ -3905,12 +4189,20 @@ export async function importData(
           if (existingIds.has(entry.id)) continue;
           if (profile.used_chars + entry.content.length <= profile.char_limit) {
             profile.entries.push(entry);
+            existingIds.add(entry.id);
             profile.used_chars += entry.content.length;
             newUserProfile++;  // E4-fix
           }
         }
       }
     }
+
+    // Session counters are derived from the records actually present in the
+    // store. Partial imports must not leave orphan references or stale counts.
+    reconcileSessionCounters(store, true);
+    newSessions = Object.keys(store.sessions)
+      .filter((id) => !originalSessionIds.has(id))
+      .length;
 
     const mergeCounts = {
       reflections: newReflections,

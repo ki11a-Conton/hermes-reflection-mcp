@@ -1,4 +1,4 @@
-# Hermes Reflection MCP v19.2.0 for Codex Desktop.
+# Hermes Reflection MCP v19.3.0 for Codex Desktop.
 # Local stdio server exposing 28 implemented tools. Lifecycle hooks and
 # session-turn capture require explicit client calls; they are not automatic.
 # The server emits instructions during MCP initialize, so the config-level
@@ -11,6 +11,10 @@ args = ['C:\Users\<YOU>\.codex\mcp\hermes-reflection-mcp\dist\index.js']
 enabled = true
 startup_timeout_sec = 30
 tool_timeout_sec = 300
+
+# Optional automatic review (disabled by default). Prefer injecting a real key
+# through the process environment instead of storing it in this file.
+# env = { HERMES_REFLECTION_LLM_ENABLED = "true", HERMES_REFLECTION_LLM_BASE_URL = "https://provider.example/v1", HERMES_REFLECTION_LLM_MODEL = "your-model", HERMES_REFLECTION_BACKGROUND_ENABLED = "true", HERMES_REFLECTION_BACKGROUND_REVIEW_MODE = "auto", HERMES_REFLECTION_BACKGROUND_AUTO_APPLY = "false" }
 
 [mcp_servers.hermes-reflection.tools.retrieve_heuristics]
 approval_mode = "auto"

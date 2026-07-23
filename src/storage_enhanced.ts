@@ -3,7 +3,15 @@
 // ============================================================
 
 import { AsyncLock, withReadLock, withWriteLock } from "./async_lock.js";
-import { captureMemorySnapshot, getMemorySnapshot, isCapturePending, markPendingCapture, releaseMemorySnapshot } from "./memory_snapshot.js";
+import {
+  cancelPendingCapture,
+  captureMemorySnapshot,
+  getMemorySnapshot,
+  isCapturePending,
+  markPendingCapture,
+  memorySnapshotFingerprints,
+  releaseMemorySnapshot,
+} from "./memory_snapshot.js";
 import {
   getRawMemoryStores,
   memoryBoardRead as _memoryBoardRead,
@@ -49,16 +57,32 @@ export interface EnhancedMemoryBoardResult {
 export async function memoryBoardReadEnhanced(
   sessionId?: string,
   snapshotMode = false
-): Promise<{ content: string; source: "snapshot" | "live"; captured_at?: string }> {
+): Promise<{
+  content: string;
+  source: "snapshot" | "live";
+  captured_at?: string;
+  captured_fingerprint?: string;
+  live_fingerprint?: string;
+  captured_combined_fingerprint?: string;
+  live_combined_fingerprint?: string;
+  live_changed_since_capture?: boolean;
+}> {
   return withReadLock(storageLock, async () => {
     if (snapshotMode) {
       if (!sessionId) throw new Error("session_id is required when mode is snapshot.");
       const snapshot = getMemorySnapshot(sessionId);
       if (!snapshot) throw new Error(`No active snapshot found for session ${sessionId}`);
+      const live = await getRawMemoryStores();
+      const liveFingerprints = memorySnapshotFingerprints(live.memory_board, live.user_profile);
       return {
         content: snapshot.memory_board,
         source: "snapshot" as const,
         captured_at: new Date(snapshot.captured_at).toISOString(),
+        captured_fingerprint: snapshot.fingerprints.memory_board,
+        live_fingerprint: liveFingerprints.memory_board,
+        captured_combined_fingerprint: snapshot.fingerprints.combined,
+        live_combined_fingerprint: liveFingerprints.combined,
+        live_changed_since_capture: snapshot.fingerprints.combined !== liveFingerprints.combined,
       };
     }
 
@@ -77,16 +101,32 @@ export async function memoryBoardReadEnhanced(
 export async function userProfileReadEnhanced(
   sessionId?: string,
   snapshotMode = false
-): Promise<{ content: string; source: "snapshot" | "live"; captured_at?: string }> {
+): Promise<{
+  content: string;
+  source: "snapshot" | "live";
+  captured_at?: string;
+  captured_fingerprint?: string;
+  live_fingerprint?: string;
+  captured_combined_fingerprint?: string;
+  live_combined_fingerprint?: string;
+  live_changed_since_capture?: boolean;
+}> {
   return withReadLock(storageLock, async () => {
     if (snapshotMode) {
       if (!sessionId) throw new Error("session_id is required when mode is snapshot.");
       const snapshot = getMemorySnapshot(sessionId);
       if (!snapshot) throw new Error(`No active snapshot found for session ${sessionId}`);
+      const live = await getRawMemoryStores();
+      const liveFingerprints = memorySnapshotFingerprints(live.memory_board, live.user_profile);
       return {
         content: snapshot.user_profile,
         source: "snapshot" as const,
         captured_at: new Date(snapshot.captured_at).toISOString(),
+        captured_fingerprint: snapshot.fingerprints.user_profile,
+        live_fingerprint: liveFingerprints.user_profile,
+        captured_combined_fingerprint: snapshot.fingerprints.combined,
+        live_combined_fingerprint: liveFingerprints.combined,
+        live_changed_since_capture: snapshot.fingerprints.combined !== liveFingerprints.combined,
       };
     }
 
@@ -158,21 +198,32 @@ export async function captureSessionSnapshot(
 ): Promise<{
   success: boolean;
   message: string;
-  snapshot_info: { memory_board_chars: number; user_profile_chars: number; captured_at: string };
+  snapshot_info: {
+    memory_board_chars: number;
+    user_profile_chars: number;
+    captured_at: string;
+    fingerprints: { memory_board: string; user_profile: string; combined: string };
+  };
 }> {
   return withReadLock(storageLock, async () => {
     markPendingCapture(sessionId);
-    const raw = await getRawMemoryStores();
-    const snapshot = captureMemorySnapshot(sessionId, raw.memory_board, raw.user_profile);
-    return {
-      success: true,
-      message: `Snapshot captured for session ${sessionId}`,
-      snapshot_info: {
-        memory_board_chars: raw.memory_board.used_chars,
-        user_profile_chars: raw.user_profile.used_chars,
-        captured_at: new Date(snapshot.captured_at).toISOString(),
-      },
-    };
+    try {
+      const raw = await getRawMemoryStores();
+      const snapshot = captureMemorySnapshot(sessionId, raw.memory_board, raw.user_profile);
+      return {
+        success: true,
+        message: `Snapshot captured for session ${sessionId}`,
+        snapshot_info: {
+          memory_board_chars: raw.memory_board.used_chars,
+          user_profile_chars: raw.user_profile.used_chars,
+          captured_at: new Date(snapshot.captured_at).toISOString(),
+          fingerprints: { ...snapshot.fingerprints },
+        },
+      };
+    } catch (error) {
+      cancelPendingCapture(sessionId);
+      throw error;
+    }
   });
 }
 

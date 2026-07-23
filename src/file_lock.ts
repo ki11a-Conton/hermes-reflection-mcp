@@ -16,10 +16,34 @@ function errorCode(error: unknown): string | undefined {
     : undefined;
 }
 
+function isProcessAlive(pid: unknown): boolean {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but this process cannot signal it.
+    return errorCode(error) === "EPERM";
+  }
+}
+
 async function quarantineStaleLock(lockPath: string, staleMs: number): Promise<boolean> {
   try {
     const info = await stat(lockPath);
     if (Date.now() - info.mtimeMs <= staleMs) return false;
+
+    try {
+      const metadata = JSON.parse(await readFile(lockPath, "utf8")) as { pid?: unknown };
+      if (isProcessAlive(metadata.pid)) return false;
+    } catch {
+      // Missing/invalid metadata can still be quarantined after the age and
+      // second-stat checks below.
+    }
+
+    // A heartbeat may have refreshed the file after the first stat. Recheck
+    // immediately before rename so that observation cannot evict a live owner.
+    const latest = await stat(lockPath);
+    if (latest.mtimeMs > info.mtimeMs || Date.now() - latest.mtimeMs <= staleMs) return false;
 
     const quarantine = `${lockPath}.stale.${process.pid}.${randomUUID()}`;
     await rename(lockPath, quarantine);

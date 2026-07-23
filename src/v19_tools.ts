@@ -11,16 +11,16 @@ import {
   releaseSessionSnapshot,
 } from "./storage_enhanced.js";
 import {
-  exportData,
   getSessionReflections,
   getRawMemoryStores,
   safeHeuristicText,
   scanHeuristicThreats,
-  upsertHeuristicsBatch,
 } from "../storage.js";
 import { listSessionTurns, listSessionTurnsAround, SESSION_STORAGE_UNAVAILABLE } from "../session_storage.js";
 import type { ReflectionFrame } from "../types.js";
 import { buildCompactionHandoff } from "./compaction_handoff.js";
+import { getReviewReadinessStatus, runReview } from "./review_engine.js";
+import { backgroundLifecycle } from "./background_lifecycle.js";
 
 // ============================================================
 // Schemas
@@ -52,8 +52,10 @@ export const ScrollSessionContextSchema = z.object({
 });
 
 export const TriggerBackgroundReviewSchema = z.object({
+  action: z.enum(["run", "status"]).default("run"),
   session_id: z.string().min(1).max(200),
   review_scope: z.enum(["recent", "full"]).default("recent"),
+  review_mode: z.enum(["deterministic", "llm", "auto"]).default("deterministic"),
   auto_apply: z.boolean().default(false),
 });
 
@@ -94,6 +96,7 @@ export async function handleSessionLifecycleHook(args: any): Promise<string> {
     case "start": {
       const captureResult = await captureSessionSnapshot(session_id);
       actions.push("Captured or refreshed memory snapshot");
+      const background = await backgroundLifecycle.status();
 
       return JSON.stringify({
         success: captureResult.success,  // A13-fix: use actual result instead of hardcoded true
@@ -101,11 +104,18 @@ export async function handleSessionLifecycleHook(args: any): Promise<string> {
         session_id,
         actions_performed: actions,
         snapshot_info: captureResult.snapshot_info,
+        background_lifecycle: background.runtime,
       }, null, 2);
     }
 
     case "end": {
       const releaseResult = releaseSessionSnapshot(session_id);
+      let backgroundNotificationError: string | undefined;
+      try {
+        await backgroundLifecycle.notifySessionEnd(session_id);
+      } catch {
+        backgroundNotificationError = "background_state_unavailable";
+      }
       // J3-fix: only push "Released" actions if release actually succeeded
       if (releaseResult.success) {
         actions.push("Released memory snapshot");
@@ -120,6 +130,8 @@ export async function handleSessionLifecycleHook(args: any): Promise<string> {
         session_id,
         message: releaseResult.message,
         actions_performed: actions,
+        background_lifecycle: (await backgroundLifecycle.status()).runtime,
+        background_notification_error: backgroundNotificationError,
       }, null, 2);
     }
 
@@ -131,6 +143,7 @@ export async function handleSessionLifecycleHook(args: any): Promise<string> {
         session_id,
         snapshot_changed: false,
         message: `Client lifecycle event recorded: ${event}. Codex execution state is not controlled by this MCP.`,
+        background_lifecycle: (await backgroundLifecycle.status()).runtime,
       }, null, 2);
       
     default:
@@ -241,124 +254,31 @@ export async function handleCompactSessionContext(args: unknown): Promise<string
  * trigger_background_review - Analyze reflections and extract heuristics
  */
 export async function handleTriggerBackgroundReview(args: any): Promise<string> {
-  const { session_id, review_scope, auto_apply } = TriggerBackgroundReviewSchema.parse(args);
-
-  const MAX_FULL_REFLECTIONS = 200;
-  const MAX_CANDIDATES = 50;
-
-  const store = await exportData();
-  const allSessionReflections = store.reflections
-    .filter((reflection) => reflection.session_id === session_id)
-    .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-  const reviewedReflections = review_scope === "recent"
-    ? allSessionReflections.slice(-10)
-    : allSessionReflections.slice(-MAX_FULL_REFLECTIONS);
-  const existingHeuristics = new Set(
-    store.heuristics
-      .filter((heuristic) => !heuristic.superseded_by)
-      .map((heuristic) => normalizeCandidateText(heuristic.heuristic))
-  );
-
-  const candidateHeuristics = buildReviewHeuristicCandidates(reviewedReflections, existingHeuristics)
-    .slice(0, MAX_CANDIDATES);
-  const skipped = candidateHeuristics.filter((candidate) => candidate.skipped_reason);
-  const safeCandidates = candidateHeuristics.filter((candidate) => !candidate.skipped_reason);
-  const applied = { heuristics_added: 0, heuristic_ids: [] as string[] };
-  let autoApplyBlocked: string | undefined;
-
-  if (auto_apply && store.metadata?.write_approval === true) {
-    autoApplyBlocked = "write_approval_enabled";
-  } else if (auto_apply && safeCandidates.length > 0) {
-    const saved = await upsertHeuristicsBatch(
-      safeCandidates.map((candidate) => ({
-        domain: candidate.domain,
-        heuristic: candidate.heuristic,
-        source_task: `background_review:${session_id}`,
-        session_id,
-        confidence: 0.65,
-        tags: candidate.tags,
-      })),
-    );
-    applied.heuristics_added = saved.length;
-    applied.heuristic_ids = saved.map((item) => item.id);
+  const { action, session_id, review_scope, review_mode, auto_apply } = TriggerBackgroundReviewSchema.parse(args);
+  if (action === "status") {
+    const background = await backgroundLifecycle.status();
+    return JSON.stringify({
+      success: true,
+      action,
+      session_id,
+      llm: getReviewReadinessStatus(),
+      background_lifecycle: {
+        runtime: background.runtime,
+        durable: {
+          schema_version: background.durable.schema_version,
+          dirty_session_count: background.durable.dirty_session_count,
+          lease: background.durable.lease,
+          recent_runs: background.durable.recent_runs,
+        },
+      },
+    }, null, 2);
   }
-
-  return JSON.stringify({
-    success: true,
+  return JSON.stringify(await runReview({
     session_id,
     review_scope,
+    review_mode,
     auto_apply,
-    auto_apply_blocked: autoApplyBlocked,
-    capabilities: {
-      heuristic_candidates: true,
-      memory_candidates: false,
-      user_profile_candidates: false,
-      skill_suggestions: false,
-    },
-    limits: {
-      max_recent_reflections: 10,
-      max_full_reflections: MAX_FULL_REFLECTIONS,
-      max_candidates: MAX_CANDIDATES,
-    },
-    source_reflection_ids: reviewedReflections.map((reflection) => reflection.id),
-    candidate_heuristics: candidateHeuristics,
-    candidate_memory_entries: [],
-    candidate_user_profile_entries: [],
-    skipped_items: skipped,
-    applied,
-  }, null, 2);
-}
-
-// ============================================================
-// Helper Functions
-// ============================================================
-
-function normalizeCandidateText(text: string): string {
-  return text.trim().replace(/\s+/g, " ").toLowerCase();
-}
-
-function buildReviewHeuristicCandidates(
-  reflections: ReflectionFrame[],
-  existingHeuristics: Set<string>,
-): Array<{
-  heuristic: string;
-  source_reflection_id: string;
-  domain: string;
-  tags: string[];
-  skipped_reason?: string;
-  threat_patterns?: string[];
-}> {
-  const seen = new Set(existingHeuristics);
-  const candidates: Array<{
-    heuristic: string;
-    source_reflection_id: string;
-    domain: string;
-    tags: string[];
-    skipped_reason?: string;
-    threat_patterns?: string[];
-  }> = [];
-
-  for (const reflection of reflections) {
-    for (const lesson of reflection.lessons_learned) {
-      const heuristic = lesson.trim();
-      if (!heuristic) continue;
-      const normalized = normalizeCandidateText(heuristic);
-      if (seen.has(normalized)) continue;
-      seen.add(normalized);
-
-      const threatPatterns = scanHeuristicThreats(heuristic, "strict");
-      candidates.push({
-        heuristic: threatPatterns.length > 0 ? safeHeuristicText(heuristic) : heuristic,
-        source_reflection_id: reflection.id,
-        domain: reflection.domain,
-        tags: [...new Set([...(reflection.tags ?? []), "background-review"])],
-        skipped_reason: threatPatterns.length > 0 ? "threat_pattern_detected" : undefined,
-        threat_patterns: threatPatterns.length > 0 ? threatPatterns : undefined,
-      });
-    }
-  }
-
-  return candidates;
+  }), null, 2);
 }
 
 // ============================================================
@@ -432,13 +352,15 @@ export const NEW_TOOL_DEFINITIONS = {
   
   trigger_background_review: {
     name: "trigger_background_review",
-    description: "Deterministically review stored reflections for safe heuristic candidates. Preview is the default; auto_apply atomically upserts safe heuristics. This tool does not call an LLM, modify skills, or generate Memory Board/User Profile candidates.",
+    description: "Review stored reflections for safe heuristic candidates. Deterministic preview remains the default; optional explicitly configured LLM review and status are available. auto_apply atomically upserts safe candidates and never modifies skills or User Profile/Memory Board entries.",
     inputSchema: {
       type: "object",
       required: ["session_id"],
       properties: {
+        action: { type: "string", enum: ["run", "status"], default: "run", description: "Run a review or inspect sanitized background/LLM readiness." },
         session_id: { type: "string", maxLength: 200 },
         review_scope: { type: "string", enum: ["recent", "full"], default: "recent", description: "Recent analyzes last 10 reflections, full scans entire session" },
+        review_mode: { type: "string", enum: ["deterministic", "llm", "auto"], default: "deterministic", description: "Deterministic is local; llm requires dedicated config; auto falls back to deterministic." },
         auto_apply: { type: "boolean", default: false, description: "If true, automatically apply extracted updates" },
       },
     },

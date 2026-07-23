@@ -36,16 +36,17 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, } from "@modelcontextprotocol/sdk/types.js";
-import { readFile, writeFile } from "fs/promises";
-import { dirname, isAbsolute as pathIsAbsolute, relative, resolve } from "path";
+import { readFile, realpath, writeFile } from "fs/promises";
+import { basename, dirname, isAbsolute as pathIsAbsolute, join, relative, resolve } from "path";
 import { z } from "zod";
-import { saveReflectionAndHeuristics, upsertHeuristic, deleteHeuristic, listHeuristics, searchHeuristics, retrieveRelevantHeuristics, searchReflections, listReflections, getRecentReflections, getOpenQuestions, resolveOpenQuestion, generateId, firstHeuristicThreatMessage, safeHeuristicText, STORE_DIR, REFLECTION_SOFT_LIMIT, exportData, importData, clearData, memoryBoardWrite, memoryBoardBatchWrite, memoryBoardRead, userProfileWrite, userProfileBatchWrite, userProfileRead, listPendingMutations, rejectPendingMutation, } from "./storage.js";
-import { appendSessionTurn, searchSessions, listRecentSessions, clearSessionStorage, SESSION_STORAGE_UNAVAILABLE } from "./session_storage.js";
+import { saveReflectionAndHeuristics, upsertHeuristic, deleteHeuristic, listHeuristics, searchHeuristics, retrieveRelevantHeuristics, searchReflections, listReflections, getRecentReflections, getOpenQuestions, resolveOpenQuestion, generateId, firstHeuristicThreatMessage, safeHeuristicText, STORE_DIR, REFLECTION_SOFT_LIMIT, exportData, importData, clearData, memoryBoardWrite, memoryBoardBatchWrite, memoryBoardRead, userProfileWrite, userProfileBatchWrite, userProfileRead, listPendingMutations, rejectPendingMutation, claimPendingMutation, completePendingMutation, releasePendingMutation, } from "./storage.js";
+import { appendSessionTurn, searchSessions, listRecentSessions, clearSessionStorage, closeSessionStorage, SESSION_STORAGE_UNAVAILABLE } from "./session_storage.js";
 // v19 integration imports
 import { handleCaptureMemorySnapshot, handleSessionLifecycleHook, handleScanMemoryThreats, handleScrollSessionContext, handleTriggerBackgroundReview, handleCompactSessionContext, NEW_TOOL_DEFINITIONS, } from "./src/v19_tools.js";
 import { memoryBoardBatchWriteEnhanced, memoryBoardReadEnhanced, memoryBoardWriteEnhanced, userProfileBatchWriteEnhanced, userProfileReadEnhanced, userProfileWriteEnhanced, } from "./src/storage_enhanced.js";
 import { safeJsonPreview } from "./src/redaction.js";
-const SERVER_VERSION = "19.2.0";
+import { backgroundLifecycle } from "./src/background_lifecycle.js";
+const SERVER_VERSION = "19.3.0";
 const EXPORT_INLINE_LIMIT_BYTES = 500 * 1024;
 const SERVER_INSTRUCTIONS = `Hermes Reflection MCP provides persistent reflection memory with Codex Desktop integration.
 
@@ -60,12 +61,12 @@ Core Workflow:
 8. Use export_data / import_data to backup or transfer data. Use clear_data (requires confirm:true) to reset collections.
 9. Node.js 20 or newer is required for the supported better-sqlite3 session tools.
 
-v19.2.0 Client Integration Features:
+v19.3.0 Client Integration Features:
 - capture_memory_snapshot and session_lifecycle_hook require explicit client calls. Installing this MCP does not make Codex Desktop invoke them automatically.
 - append_session_turn is also an explicit client call; only turns submitted to it are indexed.
 - Snapshot reads require mode:"snapshot" together with the matching session_id. Missing snapshots return an error instead of falling back to live memory.
 - compact_session_context creates a deterministic reference-only historical handoff. It does not control Codex's actual context window or compaction.
-- trigger_background_review deterministically derives heuristic candidates from stored reflections. It calls no LLM, writes no skills, and generates no Memory Board or User Profile candidates.
+- trigger_background_review defaults to local deterministic preview. Explicitly configured LLM review and an opt-in fenced background scheduler are available; neither writes skills nor generates Memory Board/User Profile candidates.
 - When write approval is enabled, use list_pending_mutations and approve_pending_mutation to inspect, approve/replay, or reject queued writes.
 - scan_memory_threats: Audit memory board or user profile for injection/exfiltration patterns. Use scope='strict' for comprehensive security audit.
 - scroll_session_context: Navigate session history around anchor points with pagination.
@@ -159,8 +160,8 @@ const optionalDomainSchema = z.string()
     .optional()
     .transform((value) => value?.toLowerCase().trim());
 const ReflectOnTaskSchema = z.object({
-    session_id: z.string().min(1).max(200), // E10-fix: was max(200) without min(1)
-    task_goal: z.string().min(1).max(1000), // E10-fix: was max(1000) without min(1)
+    session_id: z.string().trim().min(1).max(200),
+    task_goal: z.string().trim().min(1).max(1000),
     task_outcome: z.enum(["success", "partial", "failure"]),
     failure_mode: z.enum([
         "incorrect_task_interpretation",
@@ -182,7 +183,7 @@ const ReflectOnTaskSchema = z.object({
     open_questions: nullableArray(OpenQuestionSchema),
     lessons_learned: nullableArray(z.string().max(1000)).refine((value) => value.length <= 50, "lessons_learned accepts at most 50 items."),
     context_notes: z.string().max(2000).optional(),
-    missing_capability: z.string().max(500).optional(),
+    missing_capability: z.string().trim().min(1).max(500).optional(),
     available_tools: nullableArray(z.string().max(200)),
     auto_extract_heuristics: z.boolean().default(true),
     domain: domainSchema,
@@ -216,8 +217,8 @@ const SearchHeuristicsSchema = z.object({
 });
 const AddHeuristicSchema = z.object({
     domain: domainSchema,
-    heuristic: z.string().max(1000),
-    source_task: z.string().max(500),
+    heuristic: z.string().trim().min(1).max(1000),
+    source_task: z.string().trim().min(1).max(500),
     tags: nullableArray(z.string().max(100)),
     confidence: z.number().min(0).max(1).default(0.7),
 });
@@ -378,16 +379,36 @@ function err(text) {
  * STORE_DIR or its parent directory. Prevents path traversal attacks via
  * export_data(output_path) and import_data(input_path).
  */
-function safePath(userPath) {
+async function safePath(userPath) {
     const resolved = resolve(userPath);
     const storeDirResolved = resolve(STORE_DIR);
     const parentDirResolved = dirname(storeDirResolved);
-    // Path must be within STORE_DIR or its parent directory.
-    const rel = relative(parentDirResolved, resolved);
-    if (rel.startsWith("..") || pathIsAbsolute(rel)) {
-        return { ok: false, error: `Path must be within ${parentDirResolved}: ${userPath}` };
+    try {
+        const canonicalRoot = await realpath(parentDirResolved);
+        let canonicalPath;
+        try {
+            canonicalPath = await realpath(resolved);
+        }
+        catch (error) {
+            const code = error && typeof error === "object" && "code" in error
+                ? String(error.code)
+                : "";
+            if (code !== "ENOENT")
+                throw error;
+            // Export targets may not exist yet; resolve their existing parent so a
+            // junction/symlink cannot redirect the write outside the allowed root.
+            canonicalPath = join(await realpath(dirname(resolved)), basename(resolved));
+        }
+        const rel = relative(canonicalRoot, canonicalPath);
+        if (rel.startsWith("..") || pathIsAbsolute(rel)) {
+            return { ok: false, error: `Path must remain within ${canonicalRoot}: ${userPath}` };
+        }
+        return { ok: true, path: canonicalPath };
     }
-    return { ok: true, path: resolved };
+    catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { ok: false, error: `Path could not be resolved safely: ${userPath}: ${message}` };
+    }
 }
 /**
  * B5-fix: Helper for v19 tools that return JSON with a `success` field.
@@ -422,7 +443,10 @@ function prepareReflectionSave(input) {
             occurrence_count: 1,
         });
     }
-    const deduplicatedLessons = [...new Map(input.lessons_learned.map((lesson) => [lesson.toLowerCase().trim(), lesson])).values()];
+    const deduplicatedLessons = [...new Map(input.lessons_learned
+            .map((lesson) => lesson.trim())
+            .filter(Boolean)
+            .map((lesson) => [lesson.toLowerCase(), lesson])).values()];
     const tags = [...new Set(input.tags.map((tag) => tag.toLowerCase().trim()).filter(Boolean))];
     const reflection = {
         id: generateId(),
@@ -558,8 +582,8 @@ Optional context_notes is stored but not used for heuristic extraction or search
             type: "object",
             required: ["session_id", "task_goal", "task_outcome", "failure_mode", "summary"],
             properties: {
-                session_id: { type: "string", maxLength: 200 },
-                task_goal: { type: "string", maxLength: 1000 },
+                session_id: { type: "string", minLength: 1, maxLength: 200 },
+                task_goal: { type: "string", minLength: 1, maxLength: 1000 },
                 task_outcome: { type: "string", enum: ["success", "partial", "failure"] },
                 failure_mode: {
                     type: "string",
@@ -593,7 +617,7 @@ Optional context_notes is stored but not used for heuristic extraction or search
                 context_forget: objectArraySchema(contextForgetJsonSchema),
                 open_questions: objectArraySchema(openQuestionJsonSchema),
                 lessons_learned: { ...stringArraySchema(1000), maxItems: 50 },
-                missing_capability: { type: "string", maxLength: 500 },
+                missing_capability: { type: "string", minLength: 1, maxLength: 500 },
                 available_tools: stringArraySchema(200),
                 auto_extract_heuristics: { type: "boolean", default: true },
                 domain: { type: "string", maxLength: 100, default: "general" },
@@ -839,8 +863,8 @@ Optional context_notes is stored but not used for heuristic extraction or search
             required: ["heuristic", "source_task"],
             properties: {
                 domain: { type: "string", maxLength: 100, default: "general" },
-                heuristic: { type: "string", maxLength: 1000 },
-                source_task: { type: "string", maxLength: 500 },
+                heuristic: { type: "string", minLength: 1, maxLength: 1000 },
+                source_task: { type: "string", minLength: 1, maxLength: 500 },
                 tags: stringArraySchema(100),
                 confidence: { type: "number", minimum: 0, maximum: 1, default: 0.7 },
             },
@@ -1573,6 +1597,7 @@ async function replayPendingMutation(mutation) {
                 throw new Error(`Pending mutation ${mutation.id} has malformed reflection payload: missing required fields (id, timestamp, task_goal, task_outcome)`);
             }
             const saved = await saveReflectionAndHeuristics(r, p.lessons, p.domain, p.sourceTask, p.confidence, p.tags);
+            await backgroundLifecycle.notifyReflectionSaved(r.session_id);
             return `executed reflect_on_task (${saved.reflectionCount} reflection(s) total)`;
         }
         case "add_heuristic": {
@@ -1590,6 +1615,11 @@ async function replayPendingMutation(mutation) {
         case "clear_data": {
             const input = ClearDataSchema.parse({ ...payload, confirm: true });
             await clearData(input.collection);
+            if (input.collection === "sessions" || input.collection === "all") {
+                const cleared = await clearSessionStorage();
+                if (!cleared)
+                    throw new Error("SQLite session storage could not be cleared.");
+            }
             return `executed clear_data (${input.collection})`;
         }
         case "import_data": {
@@ -1667,6 +1697,12 @@ ${prepared.save.reflection.lessons_learned.length > 0
 No data was written. Remove dry_run:true to persist this reflection.`);
                 }
                 const { session, reflectionCount, nearSoftLimit } = await saveReflectionAndHeuristics(prepared.save.reflection, prepared.save.lessons, prepared.save.domain, prepared.save.sourceTask, prepared.save.confidence, prepared.save.tags, "reflect_on_task");
+                try {
+                    await backgroundLifecycle.notifyReflectionSaved(input.session_id);
+                }
+                catch (backgroundError) {
+                    console.warn("[hermes] background lifecycle notification failed:", backgroundError instanceof Error ? backgroundError.message : backgroundError);
+                }
                 const reflectionLimitWarning = nearSoftLimit
                     ? `\n\n[WARN] Reflection store has ${reflectionCount} entries (soft limit: ${REFLECTION_SOFT_LIMIT}). Consider exporting and archiving old data with export_data(output_path=...).`
                     : "";
@@ -1980,7 +2016,7 @@ Session [${input.session_id.slice(0, 8)}]: ${session.reflection_count} reflectio
                 const json = JSON.stringify(selected, null, 2);
                 const byteLength = Buffer.byteLength(json, "utf8");
                 if (input.output_path) {
-                    const pathCheck = safePath(input.output_path);
+                    const pathCheck = await safePath(input.output_path);
                     if (!pathCheck.ok)
                         return err(pathCheck.error);
                     try {
@@ -2015,8 +2051,9 @@ Pass output_path to write the JSON to a file, or use a smaller collection export
                 let sessionClearedNote = "";
                 if (input.collection === "sessions" || input.collection === "all") {
                     const cleared = await clearSessionStorage();
-                    if (cleared)
-                        sessionClearedNote = "\nNote: SQLite session database was also cleared.";
+                    if (!cleared)
+                        return err("JSON data was cleared, but SQLite session storage could not be cleared.");
+                    sessionClearedNote = "\nNote: SQLite session database was also cleared.";
                 }
                 const warning = input.collection === "sessions"
                     ? "\nWarning: reflections still retain their session_id fields."
@@ -2028,7 +2065,7 @@ Pass output_path to write the JSON to a file, or use a smaller collection export
             }
             case "import_data": {
                 const input = ImportDataSchema.parse(args ?? {});
-                const pathCheck = safePath(input.input_path);
+                const pathCheck = await safePath(input.input_path);
                 if (!pathCheck.ok)
                     return err(pathCheck.error);
                 let raw;
@@ -2162,6 +2199,7 @@ Pass output_path to write the JSON to a file, or use a smaller collection export
                         id: mutation.id,
                         created_at: mutation.created_at,
                         operation: mutation.operation,
+                        state: mutation.state ?? "pending",
                         preview: safeJsonPreview(mutation.payload ?? mutation.preview, 300),
                     })),
                 }, null, 2));
@@ -2171,19 +2209,26 @@ Pass output_path to write the JSON to a file, or use a smaller collection export
                     mutation_id: z.string().min(1).max(100),
                     decision: z.enum(["approve", "reject"]),
                 }).parse(args ?? {});
-                const pending = await listPendingMutations();
-                const mutation = pending.find((item) => item.id === input.mutation_id);
-                if (!mutation)
-                    return err(`Pending mutation not found: ${input.mutation_id}`);
                 if (input.decision === "reject") {
-                    await rejectPendingMutation(mutation.id);
-                    return ok(`Pending mutation rejected: ${mutation.id}`);
+                    const removed = await rejectPendingMutation(input.mutation_id);
+                    if (!removed)
+                        return err(`Pending mutation is missing or already being processed: ${input.mutation_id}`);
+                    return ok(`Pending mutation rejected: ${removed.id}`);
                 }
-                const replayResult = await replayPendingMutation(mutation);
-                const removed = await rejectPendingMutation(mutation.id);
-                if (!removed)
-                    return err(`Replay succeeded but pending record could not be removed: ${mutation.id}`);
-                return ok(`Pending mutation approved and ${replayResult}`);
+                const claim = await claimPendingMutation(input.mutation_id);
+                if (!claim)
+                    return err(`Pending mutation is missing or already being processed: ${input.mutation_id}`);
+                try {
+                    const replayResult = await replayPendingMutation(claim.mutation);
+                    const removed = await completePendingMutation(claim.mutation.id, claim.claimToken);
+                    if (!removed)
+                        return err(`Replay succeeded but its pending record could not be finalized: ${claim.mutation.id}`);
+                    return ok(`Pending mutation approved and ${replayResult}`);
+                }
+                catch (error) {
+                    await releasePendingMutation(claim.mutation.id, claim.claimToken);
+                    throw error;
+                }
             }
             // // Store:
             // Version: ${store.version}
@@ -2292,10 +2337,32 @@ function formatCounts(counts) {
 }
 async function main() {
     const transport = new StdioServerTransport();
+    transport.onclose = () => { void shutdown(false); };
     await server.connect(transport);
+    backgroundLifecycle.start();
     console.error(`hermes-reflection-mcp v${SERVER_VERSION} ready (store: ${STORE_DIR})`);
 }
+let shutdownPromise;
+function shutdown(exitAfter) {
+    if (!shutdownPromise) {
+        shutdownPromise = (async () => {
+            await backgroundLifecycle.shutdown(2_000).catch((error) => {
+                console.error("[hermes] background shutdown failed:", error instanceof Error ? error.message : error);
+            });
+            closeSessionStorage();
+            await server.close().catch(() => undefined);
+        })();
+    }
+    if (exitAfter) {
+        void shutdownPromise.finally(() => process.exit(0));
+    }
+    return shutdownPromise;
+}
+process.stdin.once("close", () => { void shutdown(false); });
+process.once("SIGINT", () => { void shutdown(true); });
+process.once("SIGTERM", () => { void shutdown(true); });
 main().catch((error) => {
     console.error("Fatal:", error);
+    closeSessionStorage();
     process.exit(1);
 });

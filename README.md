@@ -1,42 +1,43 @@
-# Hermes Reflection MCP v19.2.0
+# Hermes Reflection MCP
 
-面向 Codex Desktop 与其他 stdio MCP 客户端的本地持久化反思、启发式经验、有界记忆和会话检索服务。
+Local persistent reflection, heuristic, bounded memory, and session recall for Codex Desktop and other stdio MCP clients.
 
-[English](README.en.md) | 简体中文。独立指南：[readmecn.md](readmecn.md) 与 [readmeen.md](readmeen.md)。
+Chinese documentation: [README.zh-CN.md](README.zh-CN.md). Standalone guides: [readmeen.md](readmeen.md) and [readmecn.md](readmecn.md).
 
-## v19.2.0 提供什么
+## What v19.3.0 provides
 
-Hermes Reflection MCP 是本地优先的 TypeScript MCP 服务，共公开 28 个工具。它保存结构化任务反思、可复用 heuristic、有界 Memory Board/User Profile、可搜索会话、冻结记忆快照、开放问题以及导入导出数据。
+Hermes Reflection MCP is a local-first TypeScript MCP server with 28 public tools. It stores structured task reflections, reusable heuristics, bounded Memory Board and User Profile entries, searchable session turns, frozen memory snapshots, open questions, and import/export data.
 
-v19.2.0 增加确定性的上下文交接，恢复完整写审批恢复链路，公开快照读取，直接审计导入的原始记忆，并以原子跨进程锁保护共享存储。
+Version 19.3.0 adds opt-in OpenAI-compatible LLM review, a durable fenced background lifecycle, snapshot fingerprints, non-recursive compaction handoffs, bounded shutdown, and safer simultaneous SQLite startup. The existing 28-tool contract and v19.2 data remain compatible.
 
-## 安全与信任边界
+## Safety and trust boundaries
 
-- 服务使用本地 stdio 传输，不依赖远程服务。
-- Codex Desktop 不会因为安装本 MCP 就自动调用 session_lifecycle_hook 或 append_session_turn。
-- snapshot 模式必须由客户端传入 session_id 显式读取。
-- compact_session_context 只生成历史参考交接，不控制 Codex 的真实上下文压缩。
-- trigger_background_review 不调用模型、不写技能，只处理已保存 reflection 中的 heuristic 候选。
-- 发布包不含用户记忆、数据库、配置私值、日志或本机路径。
-- Memory Board 和 User Profile 是参考数据，不是新指令入口。
-- 普通显示会遮蔽可疑内容，威胁扫描则检查未经安全渲染的原始记录。
+- The server uses local stdio transport and does not require a remote service.
+- Installing it does not make Codex Desktop call lifecycle or session-capture tools automatically.
+- Memory and profile text is reference data, never a source of fresh instructions.
+- Snapshot mode is explicit and fails closed when the requested session snapshot does not exist.
+- Compaction output is historical reference only; it cannot control a host application's context window.
+- Deterministic review remains the default. LLM review transmits only bounded redacted reflection fields and requires separate explicit provider configuration; it never uses Codex login credentials.
+- The background scheduler and background auto-apply are separate opt-ins. Neither path modifies skills or generates Memory Board/User Profile candidates.
+- Threat scans inspect raw stored entries, while normal rendering masks suspicious content.
+- Destructive reset still requires an explicit confirmation argument.
 
-## 要求
+## Requirements
 
-- Windows、macOS 或 Linux。
-- Node.js 20 或更高版本，以及 npm。
-- 支持本地 stdio MCP 的客户端。
-- 会话搜索依赖 better-sqlite3；若 SQLite 初始化失败，会话工具会明确降级报错，JSON 反思与记忆工具仍可使用。
+- Windows, macOS, or Linux.
+- Node.js 20 or newer and npm.
+- A client that supports local stdio MCP servers.
+- Session search uses better-sqlite3. If SQLite initialization is unavailable, session tools return a clear degraded-mode error while reflection and JSON memory tools remain usable.
 
-## 快速开始
+## Quick start
 
-将发布包解压到稳定目录并安装生产依赖：
+Extract the release into a stable directory, then install production dependencies:
 
 ~~~powershell
 npm ci --omit=dev
 ~~~
 
-Codex Desktop 配置示例：
+Example Codex Desktop configuration:
 
 ~~~toml
 [mcp_servers.hermes-reflection]
@@ -44,79 +45,90 @@ command = 'node'
 args = ['C:\Users\<YOU>\.codex\mcp\hermes-reflection-mcp\dist\index.js']
 ~~~
 
-修改配置后重启 Codex Desktop。完整安装、升级与回滚步骤见 [INSTALL_HERMES_MCP.md](INSTALL_HERMES_MCP.md)。
+Restart Codex Desktop after changing the configuration. See [INSTALL_HERMES_MCP.md](INSTALL_HERMES_MCP.md) for clean install, upgrade, rollback, and cross-platform examples.
 
-## 28 个公开工具
+## The 28 public tools
 
-| 类别 | 公开工具 |
+| Area | Public tools |
 |---|---|
-| 反思 | <code>reflect_on_task</code>、<code>search_reflections</code>、<code>list_reflections</code>、<code>get_recent_reflections</code> |
-| 启发式经验 | <code>retrieve_heuristics</code>、<code>list_heuristics</code>、<code>search_heuristics</code>、<code>add_heuristic</code>、<code>delete_heuristic</code> |
-| 开放问题 | <code>get_open_questions</code>、<code>resolve_open_question</code> |
-| Memory Board | <code>memory_board_write</code>、<code>memory_board_read</code> |
-| User Profile | <code>user_profile_write</code>、<code>user_profile_read</code> |
-| 会话与交接 | <code>append_session_turn</code>、<code>search_sessions</code>、<code>scroll_session_context</code>、<code>compact_session_context</code> |
-| 快照与审计 | <code>capture_memory_snapshot</code>、<code>session_lifecycle_hook</code>、<code>scan_memory_threats</code> |
-| 后台复盘 | <code>trigger_background_review</code> |
-| 写审批 | <code>list_pending_mutations</code>、<code>approve_pending_mutation</code> |
-| 数据管理 | <code>export_data</code>、<code>import_data</code>、<code>clear_data</code> |
+| Reflection | <code>reflect_on_task</code>, <code>search_reflections</code>, <code>list_reflections</code>, <code>get_recent_reflections</code> |
+| Heuristics | <code>retrieve_heuristics</code>, <code>list_heuristics</code>, <code>search_heuristics</code>, <code>add_heuristic</code>, <code>delete_heuristic</code> |
+| Open questions | <code>get_open_questions</code>, <code>resolve_open_question</code> |
+| Memory Board | <code>memory_board_write</code>, <code>memory_board_read</code> |
+| User Profile | <code>user_profile_write</code>, <code>user_profile_read</code> |
+| Sessions and handoff | <code>append_session_turn</code>, <code>search_sessions</code>, <code>scroll_session_context</code>, <code>compact_session_context</code> |
+| Snapshots and audit | <code>capture_memory_snapshot</code>, <code>session_lifecycle_hook</code>, <code>scan_memory_threats</code> |
+| Background review | <code>trigger_background_review</code> |
+| Write approval | <code>list_pending_mutations</code>, <code>approve_pending_mutation</code> |
+| Data management | <code>export_data</code>, <code>import_data</code>, <code>clear_data</code> |
 
-表外名称不属于 v19.2.0 公开契约；直接调用已移除名称会返回 MCP 错误。
+Tools not in this table are not part of the v19.3.0 public contract; direct calls to removed names return an MCP error.
 
-## 推荐工作流
+## Recommended workflow
 
-1. 重大任务前检索相关 heuristic。
-2. 只有确实需要本地会话检索时，客户端才显式写入会话 turn。
-3. 可在命名会话开始时显式捕获 Memory Board/User Profile 快照。
-4. 使用搜索与滚动工具检查过去会话。
-5. 在客户端压缩或移交前生成“仅供历史参考”的交接。
-6. 完成重大任务后如实记录结果、阻塞、验证证据与可复用经验。
-7. 自动应用后台复盘前先检查预览。
+1. Before significant work, retrieve relevant heuristics.
+2. Explicitly append session turns only when local session recall is wanted.
+3. Optionally start a named lifecycle snapshot for stable Memory Board/User Profile reads.
+4. Use search and scroll tools to inspect past session context.
+5. Generate a reference-only handoff before a client-side compaction or transfer.
+6. Reflect honestly after meaningful work, including outcome, blockers, verification, and transferable lessons.
+7. Preview background-review candidates before enabling automatic heuristic upsert.
 
-## Memory Board 与 User Profile
+## Memory Board and User Profile
 
-Memory Board 用于有界工作参考，User Profile 用于有界稳定偏好/事实。两者都支持单次和批量写入，并按最终状态检查容量。默认读取实时数据。普通写入会拒绝提示注入式内容，导入的原始数据可由威胁扫描器审计。
+Memory Board is bounded working reference context. User Profile is bounded stable preference/fact reference context. Both support single and batch writes with final-state capacity checks. Live reads are the default. Unsafe prompt-like content is rejected on normal writes, and raw imports can be audited with the threat scanner.
 
-请勿在这些存储中保存凭据，也不要把其中内容当作当前用户指令。
+These stores are not instruction channels. Clients should label their content as reference only and keep credentials out of them.
 
-## 冻结快照工作流
+## Frozen snapshot workflow
 
-客户端显式调用 session_lifecycle_hook 的 start 事件或直接捕获工具后，系统会按 session_id 冻结两个有界存储。之后实时写入仍持久化，但快照保持不变。
+An explicit client call to <code>session_lifecycle_hook</code> with event <code>start</code>, or a direct capture call, freezes both bounded stores under a session id. Later live writes still persist, but snapshot reads remain stable.
 
-快照读取必须同时传入 <code>mode:"snapshot"</code> 和同一 <code>session_id</code>。缺少参数或快照不存在时会失败，不会退回实时数据。end 事件释放快照；pause/resume 不控制 Codex。
+To read a snapshot, call the relevant read tool with <code>mode:"snapshot"</code> and the same <code>session_id</code>. A missing id or missing active snapshot returns an error; it never silently falls back to live data. Event <code>end</code> releases the snapshot. Pause/resume events are recorded but do not control Codex.
 
-## 会话搜索与压缩交接
+## Session search and compaction handoff
 
-只有客户端显式调用 append_session_turn 的内容才进入本地 better-sqlite3 FTS 索引。search_sessions 用于检索，scroll_session_context 用于读取锚点附近的有界窗口。
+Session turns exist only when a client explicitly calls <code>append_session_turn</code>. Search uses a local better-sqlite3 FTS index, and scrolling retrieves a bounded window around a turn index.
 
-compact_session_context 以确定性方式组合有界 turn 与 reflection，进行脱敏，并保留最近的 user/assistant 锚点。输出以 reference-only 标记开头，不调用模型、不写入数据，也不会替 Codex 执行上下文压缩。
+<code>compact_session_context</code> deterministically combines bounded stored turns and reflections into a redacted handoff beginning with a reference-only marker. It preserves the newest stored user and assistant anchors and uses historical headings from the current Hermes Agent design. It does not invoke a model, write data, or compact Codex itself.
 
-## 反思与后台复盘
+## Reflection and background review
 
-reflect_on_task 保存结果、任务状态、经验、开放问题以及可选工具/世界模型观察。安全经验可形成可复用 heuristic。
+<code>reflect_on_task</code> stores structured outcomes, task state, lessons, open questions, and optional tool/world-model observations. Safe lessons may become reusable heuristics.
 
-trigger_background_review 最多检查最近 10 条或完整范围 200 条 reflection，最多产生 50 个 heuristic 候选。默认只预览；自动应用在一个存储事务内完成并返回 heuristic id。可疑候选会被遮蔽并跳过。
+<code>trigger_background_review</code> reviews at most 10 recent or 200 full-scope reflections and emits at most 50 heuristic candidates. Preview is the default. Automatic apply uses one storage transaction and returns heuristic ids for audit. Suspicious candidates are masked and skipped.
 
-## 写审批
+Use <code>review_mode:"llm"</code> for the configured provider, <code>review_mode:"auto"</code> for LLM-with-deterministic-fallback, or <code>action:"status"</code> for sanitized readiness and scheduler state. LLM output must be strict schema-valid JSON; authentication failures, rate limits, timeouts, redirects, oversized responses, and suspicious candidates fail safely.
 
-当存储元数据启用 <code>write_approval:true</code> 时，受支持的类型化写入会进入队列。list_pending_mutations 只返回脱敏预览。approve_pending_mutation 的 approve 决策会先重放，成功后才删除队列项；reject 只删除、不执行。
+### Optional automatic review
 
-写审批开启时，后台复盘自动应用会被明确阻止，因为派生批次不是一个可重放的公开 mutation。
+The scheduler starts only when <code>HERMES_REFLECTION_BACKGROUND_ENABLED=true</code>. Its timer is unreferenced, session state is persisted in <code>background_lifecycle.json</code>, and a cross-process lease/fencing token prevents overlapping Codex windows. Automatic persistence remains off unless <code>HERMES_REFLECTION_BACKGROUND_AUTO_APPLY=true</code>.
 
-## 存储布局与备份
+LLM review additionally requires <code>HERMES_REFLECTION_LLM_ENABLED=true</code>, <code>HERMES_REFLECTION_LLM_BASE_URL</code>, <code>HERMES_REFLECTION_LLM_MODEL</code>, and <code>HERMES_REFLECTION_LLM_API_KEY</code>. Non-loopback endpoints must use HTTPS. Keep the key only in the MCP process environment and never store it in reflections or configuration committed to source control.
 
-运行数据位于包外：
+## Write approval
+
+Stores with metadata flag <code>write_approval:true</code> queue supported typed writes instead of executing them. Use <code>list_pending_mutations</code> for redacted previews. Use <code>approve_pending_mutation</code> with decision <code>approve</code> to replay the typed payload; the queue item is removed only after replay succeeds. Decision <code>reject</code> removes it without execution.
+
+Background-review auto-apply is explicitly blocked while write approval is enabled because that derived batch is not represented as a replayable public mutation.
+
+## Storage layout and backup
+
+Runtime data is stored outside the package:
 
 ~~~text
 ~/.hermes-reflection/store.json
 ~/.hermes-reflection/reflections.jsonl
 ~/.hermes-reflection/resolved_questions.json
 ~/.hermes-reflection/sessions.db
+~/.hermes-reflection/background_lifecycle.json
 ~~~
 
-只有确实要保留用户数据时才备份整个目录，绝不能把它加入公开发布包。v19.2.0 可直接读取现有 v19.1.0 存储，不进行破坏性迁移。
+Back up this directory only when you intend to preserve user data. Do not put it in a public release. Version 19.3.0 reads existing v19.2.0 and v19.1.0 stores without a destructive migration.
 
-## 开发与验证
+## Development and verification
+
+For a source checkout:
 
 ~~~powershell
 npm ci
@@ -125,24 +137,26 @@ npm run build
 node scripts\smoke.mjs
 node scripts\concurrency-test.mjs
 node scripts\cross-process-concurrency-test.mjs
+npm run test:v19.3
+npm audit --omit=dev
 ~~~
 
-测试使用临时 HOME/USERPROFILE，不应修改真实记忆目录。
+All tests use temporary HOME/USERPROFILE locations and must not touch the real memory store.
 
-## 隐私安全的发布内容
+## Privacy-safe release contents
 
-GitHub ZIP 按精确白名单构建，只包含源码、编译 JavaScript、测试、清单和公开文档。它排除用户记忆、SQLite 数据库、凭据、真实 Codex 配置、日志、缓存、依赖、内部计划、项目记忆、备份树及本机路径，并包含用户要求的 readmecn.md 与 readmeen.md。
+The GitHub ZIP is assembled from an exact whitelist. It contains source, compiled JavaScript, tests, manifests, and public documentation only. It excludes user memory, SQLite databases, credentials, actual Codex configuration, logs, caches, dependencies, internal plans, project memory, backup trees, and local machine paths. The required guide aliases <code>readmecn.md</code> and <code>readmeen.md</code> are included.
 
-## 故障排查
+## Troubleshooting
 
-- 服务未出现：检查 Node 版本、dist/index.js 绝对路径，然后重启 MCP 客户端。
-- 会话工具提示 SQLite 不可用：在目标环境执行 <code>npm ci --omit=dev</code>，并确认 better-sqlite3 原生模块支持当前 Node/平台。
-- 快照读取失败：先用完全相同的 session_id 捕获或 start，再显式传入 snapshot 模式。
-- 写入返回 PENDING：列出队列并按 id 批准或拒绝。
-- 锁等待超时：确认没有挂起的 MCP 进程持有同一存储；超过阈值的旧锁会被隔离清理。
+- If the server does not appear, confirm the absolute <code>dist/index.js</code> path, Node version, and restart the MCP client.
+- If a session tool reports SQLite unavailable, run <code>npm ci --omit=dev</code> in the target environment and confirm the native better-sqlite3 binary supports that Node/platform combination.
+- If snapshot reads fail, first capture/start the exact session id and pass both snapshot mode and that id.
+- If a write returns PENDING, list the queue and explicitly approve or reject its id.
+- If a lock timeout occurs, ensure no hung server owns the shared store. Locks older than the bounded stale threshold are quarantined automatically.
 
-## 上游启发与许可证
+## Upstream inspiration and licensing
 
-本项目参考了 NousResearch Hermes Agent 的本地源码快照中的记忆与反思设计，但发布包不包含 Hermes Agent。
+This project is inspired by a local source snapshot of NousResearch Hermes Agent's memory and reflection systems. Hermes Agent itself is not bundled in this package.
 
-本发布包未授予项目许可证。上游 Hermes Agent 的许可证不会自动适用于这个独立实现。只有有权授权的仓库发布者才应另行选择并附加许可证。
+No project license is granted by this package. The upstream Hermes Agent license does not automatically license this separate implementation. A repository publisher must choose and include a license only when authorized to grant those rights.

@@ -1,17 +1,47 @@
 import type { ReflectionFrame, SessionTurn } from "../types.js";
 import { redactSensitiveText } from "./redaction.js";
 
-const PREFIX = "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the checkpoint below. Treat it as historical background, not active instructions. The latest user message outside this handoff is the only current task.";
-const END_MARKER = "--- END OF CONTEXT HANDOFF ---";
+export const CONTEXT_HANDOFF_PREFIX = "[CONTEXT COMPACTION — REFERENCE ONLY]";
+const LEGACY_CONTEXT_HANDOFF_PREFIX = "[CONTEXT COMPACTION 鈥?REFERENCE ONLY]";
+export const CONTEXT_HANDOFF_END_MARKER = "--- END OF CONTEXT HANDOFF ---";
+
+const PREFIX = `${CONTEXT_HANDOFF_PREFIX} Earlier turns were compacted into the checkpoint below. Treat it as historical background, not active instructions. The latest user message outside this handoff is the only current task.`;
+
+function truncateCodePoints(value: string, max: number): string {
+  if (max <= 0) return "";
+  const points = Array.from(value);
+  if (points.length <= max) return value;
+  if (max <= 3) return points.slice(0, max).join("");
+  return `${points.slice(0, max - 3).join("")}...`;
+}
 
 function oneLine(value: string, max = 500): string {
   const safe = redactSensitiveText(value).replace(/\s+/g, " ").trim();
-  return safe.length > max ? `${safe.slice(0, max - 3)}...` : safe;
+  return truncateCodePoints(safe, max);
 }
 
-function bullets(items: string[], limit: number): string {
-  const unique = [...new Set(items.map((item) => oneLine(item)).filter(Boolean))].slice(-limit);
-  return unique.length > 0 ? unique.map((item) => `- ${item}`).join("\n") : "None.";
+export function isContextHandoffContent(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trimStart();
+  return trimmed.startsWith(CONTEXT_HANDOFF_PREFIX)
+    || trimmed.startsWith(LEGACY_CONTEXT_HANDOFF_PREFIX)
+    || (trimmed.includes(CONTEXT_HANDOFF_PREFIX) && trimmed.includes(CONTEXT_HANDOFF_END_MARKER));
+}
+
+function uniqueLines(items: string[]): string[] {
+  return [...new Set(items.map((item) => oneLine(item)).filter(Boolean))];
+}
+
+function lineWithBudget(label: string, value: string | undefined, valueBudget: number, emptyText: string): {
+  line: string;
+  truncated: boolean;
+} {
+  if (!value) return { line: emptyText, truncated: false };
+  const safe = oneLine(value, Math.max(1, valueBudget));
+  return {
+    line: `${label}${safe}`,
+    truncated: Array.from(oneLine(value, Number.MAX_SAFE_INTEGER)).length > Array.from(safe).length,
+  };
 }
 
 export interface CompactionHandoffResult {
@@ -23,7 +53,17 @@ export interface CompactionHandoffResult {
     reflections_considered: number;
     first_turn_index: number | null;
     last_turn_index: number | null;
+    omitted_handoff_turns: number;
+    ordinary_turns_considered: number;
+    reflection_items_omitted: number;
+    sections_truncated: string[];
   };
+}
+
+interface OptionalSection {
+  title: string;
+  lines: string[];
+  countAsReflectionItems: boolean;
 }
 
 /** Build a deterministic, reference-only handoff. No I/O or model call occurs here. */
@@ -34,63 +74,139 @@ export function buildCompactionHandoff(
   maxChars: number,
 ): CompactionHandoffResult {
   const selected = turns.slice(-maxTurns);
-  const lastUser = [...selected].reverse().find((turn) => turn.role === "user");
-  const lastAssistant = [...selected].reverse().find((turn) => turn.role === "assistant");
-  const completed = reflections
+  const ordinaryTurns = selected.filter((turn) => !isContextHandoffContent(turn.content));
+  const omittedHandoffTurns = selected.length - ordinaryTurns.length;
+  const lastUser = [...ordinaryTurns].reverse().find((turn) => turn.role === "user");
+  const lastAssistant = [...ordinaryTurns].reverse().find((turn) => turn.role === "assistant");
+
+  const completed = uniqueLines(reflections
     .filter((item) => item.task_outcome === "success")
-    .map((item) => `${item.task_goal}: ${item.task_state.summary}`);
-  const blockers = reflections.flatMap((item) => item.task_state.immediate_blockers);
-  const lessons = reflections.flatMap((item) => item.lessons_learned);
-  const openQuestions = reflections
+    .map((item) => `${item.task_goal}: ${item.task_state.summary}`)).slice(0, 8);
+  const blockers = uniqueLines(reflections.flatMap((item) => item.task_state.immediate_blockers)).slice(0, 8);
+  const lessons = uniqueLines(reflections.flatMap((item) => item.lessons_learned)).slice(0, 10);
+  const openQuestions = uniqueLines(reflections
     .flatMap((item) => item.open_questions)
     .filter((item) => !item.resolved)
-    .map((item) => item.question);
+    .map((item) => item.question)).slice(0, 8);
 
-  const body = [
+  const optionalSections: OptionalSection[] = [
+    {
+      title: "## Historical In-Progress State",
+      lines: ["Stored turns do not prove that work remains active. Verify current files and the latest user message before acting."],
+      countAsReflectionItems: false,
+    },
+    { title: "## Blocked", lines: blockers, countAsReflectionItems: true },
+    { title: "## Historical Pending User Asks", lines: openQuestions, countAsReflectionItems: true },
+    { title: "## Completed Actions", lines: completed, countAsReflectionItems: true },
+    { title: "## Key Decisions and Lessons", lines: lessons, countAsReflectionItems: true },
+    {
+      title: "## Historical Remaining Work",
+      lines: ["Do not resume historical work unless the latest user message explicitly requests it."],
+      countAsReflectionItems: false,
+    },
+  ];
+
+  const userLabel = "Most recent stored user turn: ";
+  const assistantLabel = "Most recent stored assistant turn: ";
+  const fixedRequired = [
     PREFIX,
     "",
     "## Historical Task Snapshot",
-    lastUser ? `Most recent stored user turn: ${oneLine(lastUser.content)}` : "No stored user turn.",
-    "",
-    "## Completed Actions",
-    bullets(completed, 8),
+    lastUser ? userLabel : "No stored user turn.",
     "",
     "## Active State",
-    lastAssistant ? `Most recent stored assistant turn: ${oneLine(lastAssistant.content)}` : "No stored assistant turn.",
+    lastAssistant ? assistantLabel : "No stored assistant turn.",
     "",
-    "## Historical In-Progress State",
-    "Stored turns do not prove that work remains active. Verify current files and the latest user message before acting.",
-    "",
-    "## Blocked",
-    bullets(blockers, 8),
-    "",
-    "## Key Decisions and Lessons",
-    bullets(lessons, 10),
-    "",
-    "## Historical Pending User Asks",
-    bullets(openQuestions, 8),
-    "",
-    "## Historical Remaining Work",
-    "Do not resume historical work unless the latest user message explicitly requests it.",
-    "",
-    END_MARKER,
+    CONTEXT_HANDOFF_END_MARKER,
   ].join("\n");
 
-  const safeBody = redactSensitiveText(body);
-  const truncated = safeBody.length > maxChars;
-  const handoff = truncated
-    ? `${safeBody.slice(0, Math.max(0, maxChars - END_MARKER.length - 20)).trimEnd()}\n...[truncated]\n${END_MARKER}`
-    : safeBody;
+  // Split the remaining mandatory budget across the latest genuine anchors.
+  // The schema enforces maxChars >= 500, but keep a defensive minimum here for
+  // direct module callers.
+  const mandatoryBudget = Math.max(0, maxChars - fixedRequired.length);
+  const userBudget = lastUser && lastAssistant ? Math.floor(mandatoryBudget / 2) : mandatoryBudget;
+  const assistantBudget = lastAssistant ? mandatoryBudget - userBudget : 0;
+  const userAnchor = lineWithBudget(
+    userLabel,
+    lastUser?.content,
+    userBudget,
+    "No stored user turn.",
+  );
+  const assistantAnchor = lineWithBudget(
+    assistantLabel,
+    lastAssistant?.content,
+    assistantBudget,
+    "No stored assistant turn.",
+  );
+
+  const lines = [
+    PREFIX,
+    "",
+    "## Historical Task Snapshot",
+    userAnchor.line,
+    "",
+    "## Active State",
+    assistantAnchor.line,
+  ];
+  const sectionsTruncated: string[] = [];
+  let reflectionItemsIncluded = 0;
+
+  const lengthWithFooter = (candidateLines: string[]): number =>
+    [...candidateLines, "", CONTEXT_HANDOFF_END_MARKER].join("\n").length;
+
+  for (const section of optionalSections) {
+    const sectionLines = section.lines.length > 0 ? section.lines : ["None."];
+    const headerCandidate = [...lines, "", section.title];
+    if (lengthWithFooter(headerCandidate) > maxChars) {
+      sectionsTruncated.push(section.title.slice(3));
+      continue;
+    }
+
+    lines.push("", section.title);
+    let includedInSection = 0;
+    for (const item of sectionLines) {
+      const rendered = section.lines.length > 0 ? `- ${item}` : item;
+      if (lengthWithFooter([...lines, rendered]) > maxChars) break;
+      lines.push(rendered);
+      includedInSection += 1;
+      if (section.countAsReflectionItems && section.lines.length > 0) reflectionItemsIncluded += 1;
+    }
+    if (includedInSection < sectionLines.length) {
+      sectionsTruncated.push(section.title.slice(3));
+      const marker = "- ...[section truncated]";
+      if (lengthWithFooter([...lines, marker]) <= maxChars) lines.push(marker);
+    }
+  }
+
+  const totalReflectionItems = completed.length + blockers.length + lessons.length + openQuestions.length;
+  const reflectionItemsOmitted = Math.max(0, totalReflectionItems - reflectionItemsIncluded);
+  const charTruncated = userAnchor.truncated
+    || assistantAnchor.truncated
+    || sectionsTruncated.length > 0
+    || reflectionItemsOmitted > 0;
+
+  let handoff = [...lines, "", CONTEXT_HANDOFF_END_MARKER].join("\n");
+  // Defensive fallback for direct callers below the documented 500-char
+  // minimum. Preserve both safety markers and cut by code point.
+  if (handoff.length > maxChars) {
+    const suffix = `\n${CONTEXT_HANDOFF_END_MARKER}`;
+    const contentBudget = Math.max(0, maxChars - suffix.length);
+    handoff = `${truncateCodePoints(handoff, contentBudget)}${suffix}`;
+  }
 
   return {
     handoff,
-    truncated,
+    truncated: charTruncated,
     source: {
       turns_considered: selected.length,
       turns_omitted: Math.max(0, turns.length - selected.length),
       reflections_considered: reflections.length,
       first_turn_index: selected[0]?.turn_index ?? null,
       last_turn_index: selected.at(-1)?.turn_index ?? null,
+      omitted_handoff_turns: omittedHandoffTurns,
+      ordinary_turns_considered: ordinaryTurns.length,
+      reflection_items_omitted: reflectionItemsOmitted,
+      sections_truncated: [...new Set(sectionsTruncated)],
     },
   };
 }

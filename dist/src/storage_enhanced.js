@@ -2,7 +2,7 @@
 // Storage enhancements: in-process coordination and frozen snapshots
 // ============================================================
 import { AsyncLock, withReadLock, withWriteLock } from "./async_lock.js";
-import { captureMemorySnapshot, getMemorySnapshot, isCapturePending, markPendingCapture, releaseMemorySnapshot } from "./memory_snapshot.js";
+import { cancelPendingCapture, captureMemorySnapshot, getMemorySnapshot, isCapturePending, markPendingCapture, memorySnapshotFingerprints, releaseMemorySnapshot, } from "./memory_snapshot.js";
 import { getRawMemoryStores, memoryBoardRead as _memoryBoardRead, memoryBoardWrite as _memoryBoardWrite, memoryBoardBatchWrite as _memoryBoardBatchWrite, userProfileRead as _userProfileRead, userProfileWrite as _userProfileWrite, userProfileBatchWrite as _userProfileBatchWrite, } from "../storage.js";
 /**
  * Global locks for storage operations.
@@ -22,10 +22,17 @@ export async function memoryBoardReadEnhanced(sessionId, snapshotMode = false) {
             const snapshot = getMemorySnapshot(sessionId);
             if (!snapshot)
                 throw new Error(`No active snapshot found for session ${sessionId}`);
+            const live = await getRawMemoryStores();
+            const liveFingerprints = memorySnapshotFingerprints(live.memory_board, live.user_profile);
             return {
                 content: snapshot.memory_board,
                 source: "snapshot",
                 captured_at: new Date(snapshot.captured_at).toISOString(),
+                captured_fingerprint: snapshot.fingerprints.memory_board,
+                live_fingerprint: liveFingerprints.memory_board,
+                captured_combined_fingerprint: snapshot.fingerprints.combined,
+                live_combined_fingerprint: liveFingerprints.combined,
+                live_changed_since_capture: snapshot.fingerprints.combined !== liveFingerprints.combined,
             };
         }
         // Live mode: return current state
@@ -47,10 +54,17 @@ export async function userProfileReadEnhanced(sessionId, snapshotMode = false) {
             const snapshot = getMemorySnapshot(sessionId);
             if (!snapshot)
                 throw new Error(`No active snapshot found for session ${sessionId}`);
+            const live = await getRawMemoryStores();
+            const liveFingerprints = memorySnapshotFingerprints(live.memory_board, live.user_profile);
             return {
                 content: snapshot.user_profile,
                 source: "snapshot",
                 captured_at: new Date(snapshot.captured_at).toISOString(),
+                captured_fingerprint: snapshot.fingerprints.user_profile,
+                live_fingerprint: liveFingerprints.user_profile,
+                captured_combined_fingerprint: snapshot.fingerprints.combined,
+                live_combined_fingerprint: liveFingerprints.combined,
+                live_changed_since_capture: snapshot.fingerprints.combined !== liveFingerprints.combined,
             };
         }
         const liveContent = await _userProfileRead();
@@ -98,17 +112,24 @@ export async function userProfileBatchWriteEnhanced(operations, operationName) {
 export async function captureSessionSnapshot(sessionId) {
     return withReadLock(storageLock, async () => {
         markPendingCapture(sessionId);
-        const raw = await getRawMemoryStores();
-        const snapshot = captureMemorySnapshot(sessionId, raw.memory_board, raw.user_profile);
-        return {
-            success: true,
-            message: `Snapshot captured for session ${sessionId}`,
-            snapshot_info: {
-                memory_board_chars: raw.memory_board.used_chars,
-                user_profile_chars: raw.user_profile.used_chars,
-                captured_at: new Date(snapshot.captured_at).toISOString(),
-            },
-        };
+        try {
+            const raw = await getRawMemoryStores();
+            const snapshot = captureMemorySnapshot(sessionId, raw.memory_board, raw.user_profile);
+            return {
+                success: true,
+                message: `Snapshot captured for session ${sessionId}`,
+                snapshot_info: {
+                    memory_board_chars: raw.memory_board.used_chars,
+                    user_profile_chars: raw.user_profile.used_chars,
+                    captured_at: new Date(snapshot.captured_at).toISOString(),
+                    fingerprints: { ...snapshot.fingerprints },
+                },
+            };
+        }
+        catch (error) {
+            cancelPendingCapture(sessionId);
+            throw error;
+        }
     });
 }
 /**

@@ -1,6 +1,6 @@
 {
   "name": "hermes-reflection-mcp",
-  "version": "19.2.0",
+  "version": "19.3.0",
   "description": "Hermes-inspired local reflection, heuristic, memory, and session MCP server",
   "type": "module",
   "main": "dist/index.js",
@@ -13,13 +13,17 @@
     "scripts/smoke.mjs",
     "scripts/concurrency-test.mjs",
     "scripts/cross-process-concurrency-test.mjs",
+    "scripts/regression-test.mjs",
+    "scripts/v19.3-regression-test.mjs",
+    "scripts/v19.3-integration-test.mjs",
+    "scripts/background-worker-child.mjs",
     "index.ts",
     "storage.ts",
     "session_storage.ts",
     "types.ts",
     "tsconfig.json",
     "README.md",
-    "README.en.md",
+    "README.zh-CN.md",
     "readmecn.md",
     "readmeen.md",
     "CHANGELOG.md",
@@ -33,7 +37,9 @@
     "build": "tsc",
     "smoke": "npm run build && node scripts/smoke.mjs",
     "test": "npm run smoke",
+    "test:regressions": "npm run build && node scripts/regression-test.mjs",
     "test:concurrency": "node scripts/concurrency-test.mjs && node scripts/cross-process-concurrency-test.mjs",
+    "test:v19.3": "npm run build && node scripts/v19.3-regression-test.mjs && node scripts/v19.3-integration-test.mjs",
     "start": "node dist/index.js"
   },
   "dependencies": {
@@ -45,5 +51,8 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20.0.0",
     "typescript": "^5.0.0"
+  },
+  "overrides": {
+    "@hono/node-server": "2.0.11"
   }
 }

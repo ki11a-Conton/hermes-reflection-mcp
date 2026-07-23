@@ -1,6 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { withFileLock } from "../dist/src/file_lock.js";
@@ -66,15 +66,54 @@ async function runStaleOwnershipRegression(home) {
   assert(!rootFiles.some((name) => name.startsWith("stale-owner-probe.json.lock")), "ownership probe left a lock artifact");
 }
 
+async function runLiveOwnerMetadataRegression(home) {
+  const target = join(home, "live-owner-probe.json");
+  const lockPath = `${target}.lock`;
+  await writeFile(lockPath, JSON.stringify({
+    pid: process.pid,
+    token: "live-owner-probe",
+    created_at: new Date(Date.now() - 60_000).toISOString(),
+  }), "utf8");
+  const old = new Date(Date.now() - 60_000);
+  await utimes(lockPath, old, old);
+
+  let acquired = false;
+  let timedOut = false;
+  try {
+    await withFileLock(target, () => {
+      acquired = true;
+    }, {
+      timeout_ms: 50,
+      retry_ms: 5,
+      stale_ms: 10,
+    });
+  } catch (error) {
+    timedOut = error instanceof Error && error.message.includes("Timed out waiting for storage lock");
+  } finally {
+    await rm(lockPath, { force: true });
+  }
+
+  assert(!acquired && timedOut, "an old lock file owned by a live PID must not be quarantined");
+}
+
 const home = await mkdtemp(join(tmpdir(), "hermes-cross-process-"));
 const peers = [];
 
 try {
   await runStaleOwnershipRegression(home);
+  await runLiveOwnerMetadataRegression(home);
 
   const a = await connect("cross-process-a", home);
   const b = await connect("cross-process-b", home);
   peers.push(a, b);
+
+  await Promise.all(Array.from({ length: 20 }, (_, index) =>
+    call(index % 2 === 0 ? a.client : b.client, "append_session_turn", {
+      session_id: "cross-process-shared-session",
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `shared session turn ${index}`,
+    })
+  ));
 
   for (let index = 0; index < 20; index++) {
     await Promise.all([
@@ -130,6 +169,18 @@ try {
     heuristics.length === 40 && reflections.length === 40,
     `expected 40 heuristics and 40 reflections, got ${heuristics.length} and ${reflections.length}; `
       + `write_count=${rawStore.metadata?.write_count}; missing heuristics: ${missingHeuristics.join(", ")}`,
+  );
+  const sharedWindow = JSON.parse(text(await call(verifier.client, "scroll_session_context", {
+    session_id: "cross-process-shared-session",
+    around_turn_index: 10,
+    window: 50,
+  })));
+  const sharedIndexes = sharedWindow.turns.map((turn) => turn.turn_index);
+  assert(
+    sharedIndexes.length === 20
+      && new Set(sharedIndexes).size === 20
+      && sharedIndexes.every((turnIndex, index) => turnIndex === index),
+    `expected 20 unique contiguous shared-session turns, got ${sharedIndexes.join(", ")}`,
   );
 
   const storeFiles = await readdir(join(home, ".hermes-reflection"));

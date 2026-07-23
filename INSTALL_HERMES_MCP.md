@@ -1,4 +1,4 @@
-# Installing Hermes Reflection MCP v19.2.0
+# Installing Hermes Reflection MCP v19.3.0
 
 This guide installs the local stdio server without copying user memory or machine-specific dependencies. Node.js 20 or newer is required.
 
@@ -63,9 +63,10 @@ From the installed code directory, run:
 node scripts\smoke.mjs
 node scripts\concurrency-test.mjs
 node scripts\cross-process-concurrency-test.mjs
+npm run test:v19.3
 ~~~
 
-The direct smoke works with production dependencies because it runs the compiled <code>dist</code> entrypoint. Expected: version 19.2.0, exactly 28 public tools, and passing single/cross-process concurrency checks.
+Expected: version 19.3.0, exactly 28 public tools, and passing v19.3 lifecycle/LLM mock, shutdown, and single/cross-process concurrency checks.
 
 For a source checkout with development dependencies, also run:
 
@@ -85,16 +86,32 @@ Installation alone does not record Codex conversations or create snapshots. The 
 
 The compaction handoff is reference only and does not control Codex's host context.
 
+## Optional LLM and background lifecycle
+
+Both features are disabled by default. Set MCP environment variables only if you want them:
+
+~~~text
+HERMES_REFLECTION_LLM_ENABLED=true
+HERMES_REFLECTION_LLM_BASE_URL=https://provider.example/v1
+HERMES_REFLECTION_LLM_MODEL=your-model
+HERMES_REFLECTION_LLM_API_KEY=<dedicated provider key>
+HERMES_REFLECTION_BACKGROUND_ENABLED=true
+HERMES_REFLECTION_BACKGROUND_REVIEW_MODE=auto
+HERMES_REFLECTION_BACKGROUND_AUTO_APPLY=false
+~~~
+
+Use a dedicated provider credential; this MCP does not and must not reuse Codex Desktop authentication. Automatic apply is a separate opt-in and remains blocked when write approval is enabled. Restart Codex Desktop after changing environment configuration.
+
 ## Upgrade
 
 1. Stop or restart the MCP client so the old server process releases its files.
 2. Back up the installed code directory to a separate sibling directory.
 3. Keep <code>~/.hermes-reflection</code> in place. It is runtime user data, not release code.
-4. Extract v19.2.0 into a new clean directory.
+4. Extract v19.3.0 into a new clean directory.
 5. Run <code>npm ci --omit=dev</code> there.
 6. Run the installed validation commands.
 7. Replace the configured code path or move the validated directory into the stable install location.
-8. Restart Codex Desktop and confirm the server reports v19.2.0.
+8. Restart Codex Desktop and confirm the server reports v19.3.0.
 
 Never copy old node_modules into the new installation, and never copy <code>~/.hermes-reflection</code> into the code directory. Existing v19.1.0 stores remain readable.
 

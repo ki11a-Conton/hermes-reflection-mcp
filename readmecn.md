@@ -1,4 +1,4 @@
-# Hermes Reflection MCP v19.2.0 中文使用指南
+# Hermes Reflection MCP v19.3.0 中文使用指南
 
 Hermes Reflection MCP 是一个本地 stdio MCP 服务，提供 28 个公开工具，用于持久化任务反思、heuristic、有界 Memory Board/User Profile 与可搜索会话。它不上传用户数据。
 
@@ -24,7 +24,7 @@ command = 'node'
 args = ['C:\Users\<YOU>\.codex\mcp\hermes-reflection-mcp\dist\index.js']
 ~~~
 
-5. 重启 Codex Desktop，使新 MCP 进程加载 v19.2.0。
+5. 重启 Codex Desktop，使新 MCP 进程加载 v19.3.0。
 
 安装本 MCP 不会让 Codex Desktop 自动调用 session_lifecycle_hook 或 append_session_turn。生命周期、快照和会话 turn 都必须由客户端显式调用。
 
@@ -36,9 +36,10 @@ args = ['C:\Users\<YOU>\.codex\mcp\hermes-reflection-mcp\dist\index.js']
 node scripts\smoke.mjs
 node scripts\concurrency-test.mjs
 node scripts\cross-process-concurrency-test.mjs
+npm run test:v19.3
 ~~~
 
-预期：smoke 报告 v19.2.0 和 28 个公开工具；单进程并发测试通过；跨进程测试完整保留 40 条 heuristic 与 40 条 reflection。测试使用临时用户目录，不会写入真实 <code>~/.hermes-reflection</code>。
+预期：smoke 报告 v19.3.0 和 28 个公开工具；新版生命周期/LLM mock/停机测试与单进程、跨进程并发测试全部通过。测试使用临时用户目录，不会写入真实 <code>~/.hermes-reflection</code>。
 
 如需修改源码，再安装开发依赖并执行：
 
@@ -56,8 +57,12 @@ npm run build
 4. 读取冻结记忆时，向 memory_board_read 或 user_profile_read 同时传入 <code>mode:"snapshot"</code> 与同一 <code>session_id</code>；不存在的快照会报错，不会退回实时内容。
 5. 压缩或交接前调用 <code>compact_session_context</code> 获取仅供历史参考的摘要。它不控制 Codex 的真实上下文窗口。
 6. 任务结束后调用 <code>reflect_on_task</code>，如需复盘候选再调用 <code>trigger_background_review</code>。
-7. 后台复盘默认只预览；它不调用模型、不写技能，只生成已保存 reflection 中的 heuristic 候选。
+7. 后台复盘默认只预览且使用确定性模式；可显式配置独立 OpenAI 兼容模型，或启用带跨进程 fencing 的后台调度器。
 8. 写审批开启时，使用 <code>list_pending_mutations</code> 查看脱敏预览，再用 <code>approve_pending_mutation</code> 批准或拒绝。
+
+## 自动 LLM 复盘与后台生命周期
+
+两者默认关闭。LLM 模式需要单独设置 `HERMES_REFLECTION_LLM_ENABLED`、`HERMES_REFLECTION_LLM_BASE_URL`、`HERMES_REFLECTION_LLM_MODEL`、`HERMES_REFLECTION_LLM_API_KEY`。后台调度需要 `HERMES_REFLECTION_BACKGROUND_ENABLED=true`；自动写入还需单独设置 `HERMES_REFLECTION_BACKGROUND_AUTO_APPLY=true`。请只通过进程环境提供专用密钥，不要把密钥写入文档或反思数据。
 
 ## 数据与隐私
 

@@ -5,6 +5,13 @@
 
 import type { MemoryBoard } from "../types.js";
 import { safeHeuristicText } from "../storage.js";
+import { createHash } from "node:crypto";
+
+export interface MemorySnapshotFingerprints {
+  memory_board: string;
+  user_profile: string;
+  combined: string;
+}
 
 /**
  * Memory snapshot captured at session start.
@@ -15,6 +22,7 @@ export interface MemorySnapshot {
   user_profile: string;
   captured_at: number;
   session_id: string;
+  fingerprints: MemorySnapshotFingerprints;
 }
 
 /**
@@ -22,9 +30,52 @@ export interface MemorySnapshot {
  * Thread-safe map for concurrent session support.
  */
 const activeSnapshots = new Map<string, MemorySnapshot>();
-// J4-fix: track sessions with in-progress captures and pending releases
-const pendingCaptures = new Set<string>();
+// Track the number of concurrent captures per session. A Set loses count and
+// lets the last of two late captures revive a snapshot after session end.
+const pendingCaptures = new Map<string, number>();
 const pendingReleases = new Set<string>();
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+/**
+ * Hash only fields that affect the rendered persistent-memory reference.
+ * Entry order is intentional: it carries recency/curation meaning and is
+ * preserved in the prompt snapshot.
+ */
+export function memoryBoardFingerprint(board: MemoryBoard): string {
+  return sha256(JSON.stringify({
+    version: 1,
+    char_limit: board.char_limit,
+    used_chars: board.used_chars,
+    entries: board.entries.map((entry) => ({ id: entry.id, content: entry.content })),
+  }));
+}
+
+export function memorySnapshotFingerprints(
+  memoryBoard: MemoryBoard,
+  userProfile: MemoryBoard,
+): MemorySnapshotFingerprints {
+  const memory_board = memoryBoardFingerprint(memoryBoard);
+  const user_profile = memoryBoardFingerprint(userProfile);
+  return {
+    memory_board,
+    user_profile,
+    combined: sha256(`v1\0${memory_board}\0${user_profile}`),
+  };
+}
+
+function finishPendingCapture(sessionId: string): number {
+  const current = pendingCaptures.get(sessionId) ?? 0;
+  if (current <= 1) {
+    pendingCaptures.delete(sessionId);
+    return 0;
+  }
+  const remaining = current - 1;
+  pendingCaptures.set(sessionId, remaining);
+  return remaining;
+}
 
 /**
  * Format a memory board as reference-only prompt context.
@@ -60,11 +111,15 @@ export function captureMemorySnapshot(
     user_profile: formatBoardForPrompt(userProfile, "# User Profile"),
     captured_at: Date.now(),
     session_id: sessionId,
+    fingerprints: memorySnapshotFingerprints(memoryBoard, userProfile),
   };
 
   activeSnapshots.set(sessionId, snapshot);
-  pendingCaptures.delete(sessionId);
-  if (pendingReleases.delete(sessionId)) activeSnapshots.delete(sessionId);
+  const remainingCaptures = finishPendingCapture(sessionId);
+  if (pendingReleases.has(sessionId)) {
+    activeSnapshots.delete(sessionId);
+    if (remainingCaptures === 0) pendingReleases.delete(sessionId);
+  }
   return snapshot;
 }
 
@@ -73,14 +128,20 @@ export function captureMemorySnapshot(
  * This allows releaseMemorySnapshot to detect captures that haven't completed yet.
  */
 export function markPendingCapture(sessionId: string): void {
-  pendingCaptures.add(sessionId);
+  pendingCaptures.set(sessionId, (pendingCaptures.get(sessionId) ?? 0) + 1);
+}
+
+/** Finish a capture that failed before captureMemorySnapshot could commit it. */
+export function cancelPendingCapture(sessionId: string): void {
+  const remainingCaptures = finishPendingCapture(sessionId);
+  if (remainingCaptures === 0) pendingReleases.delete(sessionId);
 }
 
 /**
  * J4-fix: Check if a capture is in progress for a session.
  */
 export function isCapturePending(sessionId: string): boolean {
-  return pendingCaptures.has(sessionId);
+  return (pendingCaptures.get(sessionId) ?? 0) > 0;
 }
 
 /**
@@ -102,11 +163,13 @@ export function getMemorySnapshot(sessionId: string): MemorySnapshot | null {
  */
 export function releaseMemorySnapshot(sessionId: string): void {
   // J4-fix: if capture is still in progress, defer the release
-  if (pendingCaptures.has(sessionId)) {
+  if (isCapturePending(sessionId)) {
+    activeSnapshots.delete(sessionId);
     pendingReleases.add(sessionId);
     return;
   }
   activeSnapshots.delete(sessionId);
+  pendingReleases.delete(sessionId);
 }
 
 /**
@@ -123,6 +186,8 @@ export function getActiveSessionIds(): string[] {
  */
 export function clearAllSnapshots(): void {
   activeSnapshots.clear();
+  pendingCaptures.clear();
+  pendingReleases.clear();
 }
 
 /**

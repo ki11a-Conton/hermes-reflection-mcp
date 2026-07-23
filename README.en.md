@@ -1,14 +1,14 @@
-# Hermes Reflection MCP v19.2.0
+# Hermes Reflection MCP
 
 Local persistent reflection, heuristic, bounded memory, and session recall for Codex Desktop and other stdio MCP clients.
 
-English | [简体中文](README.md). Standalone guides: [readmeen.md](readmeen.md) and [readmecn.md](readmecn.md).
+Chinese documentation: [README.zh-CN.md](README.zh-CN.md). Standalone guides: [readmeen.md](readmeen.md) and [readmecn.md](readmecn.md).
 
-## What v19.2.0 provides
+## What v19.3.0 provides
 
 Hermes Reflection MCP is a local-first TypeScript MCP server with 28 public tools. It stores structured task reflections, reusable heuristics, bounded Memory Board and User Profile entries, searchable session turns, frozen memory snapshots, open questions, and import/export data.
 
-Version 19.2.0 adds a deterministic compaction handoff, restores the complete write-approval recovery path, exposes explicit snapshot reads, audits raw imported memory without echoing unsafe text, and protects shared stores with an atomic cross-process lock.
+Version 19.3.0 adds opt-in OpenAI-compatible LLM review, a durable fenced background lifecycle, snapshot fingerprints, non-recursive compaction handoffs, bounded shutdown, and safer simultaneous SQLite startup. The existing 28-tool contract and v19.2 data remain compatible.
 
 ## Safety and trust boundaries
 
@@ -17,7 +17,8 @@ Version 19.2.0 adds a deterministic compaction handoff, restores the complete wr
 - Memory and profile text is reference data, never a source of fresh instructions.
 - Snapshot mode is explicit and fails closed when the requested session snapshot does not exist.
 - Compaction output is historical reference only; it cannot control a host application's context window.
-- Background review is deterministic and heuristic-only. It does not call an LLM, modify skills, or generate Memory Board/User Profile candidates.
+- Deterministic review remains the default. LLM review transmits only bounded redacted reflection fields and requires separate explicit provider configuration; it never uses Codex login credentials.
+- The background scheduler and background auto-apply are separate opt-ins. Neither path modifies skills or generates Memory Board/User Profile candidates.
 - Threat scans inspect raw stored entries, while normal rendering masks suspicious content.
 - Destructive reset still requires an explicit confirmation argument.
 
@@ -61,7 +62,7 @@ Restart Codex Desktop after changing the configuration. See [INSTALL_HERMES_MCP.
 | Write approval | <code>list_pending_mutations</code>, <code>approve_pending_mutation</code> |
 | Data management | <code>export_data</code>, <code>import_data</code>, <code>clear_data</code> |
 
-Tools not in this table are not part of the v19.2.0 public contract; direct calls to removed names return an MCP error.
+Tools not in this table are not part of the v19.3.0 public contract; direct calls to removed names return an MCP error.
 
 ## Recommended workflow
 
@@ -97,6 +98,14 @@ Session turns exist only when a client explicitly calls <code>append_session_tur
 
 <code>trigger_background_review</code> reviews at most 10 recent or 200 full-scope reflections and emits at most 50 heuristic candidates. Preview is the default. Automatic apply uses one storage transaction and returns heuristic ids for audit. Suspicious candidates are masked and skipped.
 
+Use <code>review_mode:"llm"</code> for the configured provider, <code>review_mode:"auto"</code> for LLM-with-deterministic-fallback, or <code>action:"status"</code> for sanitized readiness and scheduler state. LLM output must be strict schema-valid JSON; authentication failures, rate limits, timeouts, redirects, oversized responses, and suspicious candidates fail safely.
+
+### Optional automatic review
+
+The scheduler starts only when <code>HERMES_REFLECTION_BACKGROUND_ENABLED=true</code>. Its timer is unreferenced, session state is persisted in <code>background_lifecycle.json</code>, and a cross-process lease/fencing token prevents overlapping Codex windows. Automatic persistence remains off unless <code>HERMES_REFLECTION_BACKGROUND_AUTO_APPLY=true</code>.
+
+LLM review additionally requires <code>HERMES_REFLECTION_LLM_ENABLED=true</code>, <code>HERMES_REFLECTION_LLM_BASE_URL</code>, <code>HERMES_REFLECTION_LLM_MODEL</code>, and <code>HERMES_REFLECTION_LLM_API_KEY</code>. Non-loopback endpoints must use HTTPS. Keep the key only in the MCP process environment and never store it in reflections or configuration committed to source control.
+
 ## Write approval
 
 Stores with metadata flag <code>write_approval:true</code> queue supported typed writes instead of executing them. Use <code>list_pending_mutations</code> for redacted previews. Use <code>approve_pending_mutation</code> with decision <code>approve</code> to replay the typed payload; the queue item is removed only after replay succeeds. Decision <code>reject</code> removes it without execution.
@@ -112,9 +121,10 @@ Runtime data is stored outside the package:
 ~/.hermes-reflection/reflections.jsonl
 ~/.hermes-reflection/resolved_questions.json
 ~/.hermes-reflection/sessions.db
+~/.hermes-reflection/background_lifecycle.json
 ~~~
 
-Back up this directory only when you intend to preserve user data. Do not put it in a public release. Version 19.2.0 reads existing v19.1.0 stores without a destructive migration.
+Back up this directory only when you intend to preserve user data. Do not put it in a public release. Version 19.3.0 reads existing v19.2.0 and v19.1.0 stores without a destructive migration.
 
 ## Development and verification
 
@@ -127,6 +137,8 @@ npm run build
 node scripts\smoke.mjs
 node scripts\concurrency-test.mjs
 node scripts\cross-process-concurrency-test.mjs
+npm run test:v19.3
+npm audit --omit=dev
 ~~~
 
 All tests use temporary HOME/USERPROFILE locations and must not touch the real memory store.

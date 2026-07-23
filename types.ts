@@ -125,6 +125,9 @@ export interface PendingMutation {
   preview: string;
   payload?: Record<string, unknown>;
   payload_hash?: string;
+  state?: "pending" | "processing";
+  claim_token?: string;
+  claimed_at?: string;
 }
 
 export interface MemoryEntry {

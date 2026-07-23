@@ -1,4 +1,4 @@
-# Hermes Reflection MCP v19.2.0 English Guide
+# Hermes Reflection MCP v19.3.0 English Guide
 
 Hermes Reflection MCP is a local stdio MCP server with 28 public tools for persistent task reflections, heuristics, bounded Memory Board/User Profile data, and searchable sessions. It does not upload user data.
 
@@ -24,7 +24,7 @@ command = 'node'
 args = ['C:\Users\<YOU>\.codex\mcp\hermes-reflection-mcp\dist\index.js']
 ~~~
 
-5. Restart Codex Desktop so a new MCP process loads v19.2.0.
+5. Restart Codex Desktop so a new MCP process loads v19.3.0.
 
 Installing this MCP does not make Codex Desktop call session_lifecycle_hook or append_session_turn automatically. Lifecycle, snapshot, and session-turn capture require explicit client calls.
 
@@ -36,9 +36,10 @@ After installing production dependencies, run these commands from the project di
 node scripts\smoke.mjs
 node scripts\concurrency-test.mjs
 node scripts\cross-process-concurrency-test.mjs
+npm run test:v19.3
 ~~~
 
-Expected results: smoke reports v19.2.0 and 28 public tools; the single-process test passes; the cross-process test preserves exactly 40 heuristics and 40 reflections. Tests use temporary user profiles and do not write to the real <code>~/.hermes-reflection</code> directory.
+Expected results: smoke reports v19.3.0 and 28 public tools; lifecycle/LLM mock/shutdown and single/cross-process concurrency tests pass. Tests use temporary user profiles and do not write to the real <code>~/.hermes-reflection</code> directory.
 
 For source development, install development dependencies and run:
 

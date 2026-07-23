@@ -1,5 +1,26 @@
 # Changelog
 
+## 19.3.0 - 2026-07-22
+
+### Added
+
+- Added opt-in OpenAI-compatible LLM reflection review with bounded redacted requests, strict output validation, safe retry classes, and local mock coverage.
+- Added an opt-in durable background scheduler with dirty-session tracking, unreferenced timers, cross-process leases, fencing tokens, unchanged-source skipping, and bounded shutdown.
+- Added snapshot content fingerprints and live-change diagnostics.
+
+### Fixed
+
+- Prevented context handoffs from recursively selecting earlier assistant/user handoff blocks as current anchors.
+- Preserved newest-first bounded reflection ordering and the legacy deterministic review source label.
+- Fixed simultaneous Codex processes racing on first SQLite WAL/schema initialization.
+- Closed the lease validation/apply TOCTOU window by holding the lifecycle state lock through automatic heuristic upsert.
+
+### Security and compatibility
+
+- Preserved exactly 28 public tools and existing v19.2 storage formats.
+- LLM and background features are disabled by default; background auto-apply is a separate opt-in.
+- Production dependency audit reports zero known vulnerabilities; the stdio-only package pins the patched Hono Node adapter through an override.
+
 ## 19.2.0 - 2026-07-10
 
 ### Added

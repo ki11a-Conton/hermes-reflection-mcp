@@ -37,9 +37,16 @@ async function getDb(): Promise<Database.Database | null> {
       mkdirSync(STORE_DIR, { recursive: true });
       // J1-fix: don't assign _db if closeSessionStorage was called during await
       if (_closed) return null;
-      _db = new DatabaseCtor(DB_PATH);
-      _db.pragma("journal_mode = WAL");
-      _db.exec(`
+      let candidate: Database.Database | null = null;
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        try {
+          candidate = new DatabaseCtor(DB_PATH, { timeout: 5_000 });
+          // Configure waiting before WAL/schema pragmas because simultaneous
+          // Codex Desktop processes can race during their first open.
+          candidate.pragma("busy_timeout = 5000");
+          candidate.pragma("journal_mode = WAL");
+          candidate.exec(`
       CREATE TABLE IF NOT EXISTS session_meta (
         session_id TEXT PRIMARY KEY,
         started_at TEXT NOT NULL,
@@ -55,7 +62,25 @@ async function getDb(): Promise<Database.Database | null> {
         tokenize = "unicode61"
       );
     `);
-      return _db;
+          break;
+        } catch (error) {
+          lastError = error;
+          candidate?.close();
+          candidate = null;
+          const code = error && typeof error === "object" && "code" in error
+            ? String((error as { code?: unknown }).code)
+            : "";
+          if (!/^SQLITE_(?:BUSY|LOCKED)$/.test(code) || attempt === 5) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+        }
+      }
+      if (!candidate) throw lastError ?? new Error("SQLite initialization failed");
+      if (_closed) {
+        candidate.close();
+        return null;
+      }
+      _db = candidate;
+      return candidate;
     } catch (error) {
       _loadFailed = true;
       _lastFailureTime = Date.now();
@@ -79,7 +104,11 @@ export async function appendSessionTurn(
 ): Promise<boolean> {
   const db = await getDb();
   if (!db) return false;
-  const ts = timestamp ?? new Date().toISOString();
+  const timestampDate = timestamp ? new Date(timestamp) : new Date();
+  if (Number.isNaN(timestampDate.getTime())) {
+    throw new Error("timestamp must be a valid ISO-8601 date string");
+  }
+  const ts = timestampDate.toISOString();
 
   // G4-fix: wrap SELECT + INSERT/UPDATE + INSERT in a transaction for atomicity
   const tx = db.transaction(() => {
@@ -95,8 +124,12 @@ export async function appendSessionTurn(
       ).run(sessionId, ts, ts);
     } else {
       db.prepare(
-        "UPDATE session_meta SET turn_count = turn_count + 1, last_turn_at = ? WHERE session_id = ?"
-      ).run(ts, sessionId);
+        `UPDATE session_meta
+         SET turn_count = turn_count + 1,
+             started_at = CASE WHEN ? < started_at THEN ? ELSE started_at END,
+             last_turn_at = CASE WHEN last_turn_at IS NULL OR ? > last_turn_at THEN ? ELSE last_turn_at END
+         WHERE session_id = ?`
+      ).run(ts, ts, ts, ts, sessionId);
     }
 
     db.prepare(
