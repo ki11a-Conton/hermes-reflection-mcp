@@ -4,11 +4,11 @@
 
 English documentation: [README.md](README.md)。独立指南：[readmecn.md](readmecn.md) 与 [readmeen.md](readmeen.md)。
 
-## v19.3.0 提供什么
+## v19.4.1 提供什么
 
 Hermes Reflection MCP 是本地优先的 TypeScript MCP 服务，共公开 28 个工具。它保存结构化任务反思、可复用 heuristic、有界 Memory Board/User Profile、可搜索会话、冻结记忆快照、开放问题以及导入导出数据。
 
-v19.3.0 新增可选的 OpenAI 兼容 LLM 自动复盘、持久化后台生命周期、跨进程租约与 fencing token、快照内容指纹、非递归上下文交接以及有界停机；仍保持 28 个公开工具和旧数据兼容。
+v19.4.1 严格校验持久化后台生命周期状态；租约到期后不再因旧 PID 仍存活而阻止接管，同机未到期租约则只在确认旧 PID 已死亡时提前回收。长复盘会立即并周期性续租同一 owner/fencing token；瞬时续租错误只容忍到最后一次确认的到期时间，shutdown 会先让续租停止，再由活动任务释放原 fence。v19.4 的 fail-closed 存储与多用户 handoff、v19.3 严格脱敏、可选 LLM/后台生命周期、28 个公开工具及现有数据保持兼容。
 
 ## 安全与信任边界
 
@@ -17,6 +17,7 @@ v19.3.0 新增可选的 OpenAI 兼容 LLM 自动复盘、持久化后台生命�
 - snapshot 模式必须由客户端传入 session_id 显式读取。
 - compact_session_context 只生成历史参考交接，不控制 Codex 的真实上下文压缩。
 - 确定性复盘仍是默认模式。LLM 复盘必须单独显式配置，只发送有界且脱敏的 reflection 字段，不会复用 Codex 登录凭据。
+- 原始 reflection 和 SQLite turn 仍供显式审计/导出；严格 URL 脱敏只作用于历史输出、自动 heuristic 派生和外部传输边界，不会静默改写源记录。
 - 后台调度和后台自动写入分别启用；默认均关闭，且永远不会修改 skill 或生成 Memory Board/User Profile 候选。
 - 发布包不含用户记忆、数据库、配置私值、日志或本机路径。
 - Memory Board 和 User Profile 是参考数据，不是新指令入口。
@@ -62,7 +63,7 @@ args = ['C:\Users\<YOU>\.codex\mcp\hermes-reflection-mcp\dist\index.js']
 | 写审批 | <code>list_pending_mutations</code>、<code>approve_pending_mutation</code> |
 | 数据管理 | <code>export_data</code>、<code>import_data</code>、<code>clear_data</code> |
 
-表外名称不属于 v19.3.0 公开契约；直接调用已移除名称会返回 MCP 错误。
+表外名称不属于 v19.4.1 公开契约；直接调用已移除名称会返回 MCP 错误。
 
 ## 推荐工作流
 
@@ -88,21 +89,21 @@ Memory Board 用于有界工作参考，User Profile 用于有界稳定偏好/�
 
 ## 会话搜索与压缩交接
 
-只有客户端显式调用 append_session_turn 的内容才进入本地 better-sqlite3 FTS 索引。search_sessions 用于检索，scroll_session_context 用于读取锚点附近的有界窗口。
+只有客户端显式调用 append_session_turn 的内容才进入本地 better-sqlite3 FTS 索引。search_sessions 会先严格脱敏完整 turn，再生成短 snippet。scroll_session_context 保留现有窗口语义，但 anchor 最多返回 4,000 个 Unicode code point，邻近 turn 每条最多 1,200 个；发生截断时增加可选的 <code>content_truncated</code> 与 <code>original_content_chars</code> 元数据。
 
-compact_session_context 以确定性方式组合有界 turn 与 reflection，进行脱敏，并保留最近的 user/assistant 锚点。输出以 reference-only 标记开头，不调用模型、不写入数据，也不会替 Codex 执行上下文压缩。
+compact_session_context 以确定性方式组合有界 turn 与 reflection，进行严格脱敏，并保留最近的非空 user/assistant 锚点。可用 `preserve_recent_user_turns`（1-5，默认 3）在预算允许时保留更早的真实用户锚点。输出以 reference-only 标记开头，不调用模型、不写入数据，也不会替 Codex 执行上下文压缩。
 
 ## 反思与后台复盘
 
 reflect_on_task 保存结果、任务状态、经验、开放问题以及可选工具/世界模型观察。安全经验可形成可复用 heuristic。
 
-trigger_background_review 最多检查最近 10 条或完整范围 200 条 reflection，最多产生 50 个 heuristic 候选。默认只预览；自动应用在一个存储事务内完成并返回 heuristic id。可疑候选会被遮蔽并跳过。
+trigger_background_review 最多检查最近 10 条或完整范围 200 条 reflection，最多产生 50 个 heuristic 候选。默认只预览；自动应用在一个存储事务内完成并返回 heuristic id。候选在威胁检查和持久化前先严格脱敏；可疑候选会被遮蔽并跳过。未变化来源指纹现在覆盖严格脱敏后的实际复盘相关内容，而不只依赖 id/时间戳。
 
 `review_mode:"llm"` 使用已配置的模型，`review_mode:"auto"` 在 LLM 不可用时回退到确定性复盘，`action:"status"` 返回脱敏后的就绪状态和后台状态。模型响应必须是符合严格 schema 的纯 JSON。
 
 ### 可选自动复盘
 
-设置 `HERMES_REFLECTION_BACKGROUND_ENABLED=true` 后才启动后台调度器；定时器不会阻止 Codex 退出，运行状态保存在 `background_lifecycle.json`。自动写入还需单独设置 `HERMES_REFLECTION_BACKGROUND_AUTO_APPLY=true`，默认仍为 false。
+设置 `HERMES_REFLECTION_BACKGROUND_ENABLED=true` 后才启动后台调度器；定时器不会阻止 Codex 退出，运行状态在 `background_lifecycle.json` 中严格按 schema 校验。长复盘只续租同一 owner/token；若明确丢权，或续租错误持续到最后一次确认的到期时间，就会在提交前停止。自动写入还需单独设置 `HERMES_REFLECTION_BACKGROUND_AUTO_APPLY=true`，默认仍为 false。
 
 LLM 复盘还需要 `HERMES_REFLECTION_LLM_ENABLED=true`、`HERMES_REFLECTION_LLM_BASE_URL`、`HERMES_REFLECTION_LLM_MODEL` 和 `HERMES_REFLECTION_LLM_API_KEY`。非本机地址必须使用 HTTPS；密钥只能通过 MCP 进程环境提供，禁止写入 reflection 或提交到源码。
 
@@ -124,7 +125,7 @@ LLM 复盘还需要 `HERMES_REFLECTION_LLM_ENABLED=true`、`HERMES_REFLECTION_LL
 ~/.hermes-reflection/background_lifecycle.json
 ~~~
 
-只有确实要保留用户数据时才备份整个目录，绝不能把它加入公开发布包。v19.3.0 可直接读取现有 v19.2.0/v19.1.0 存储，不进行破坏性迁移。
+只有确实要保留用户数据时才备份整个目录，绝不能把它加入公开发布包。v19.4.1 可直接读取有效的 v19.4/v19.3/v19.2/v19.1 存储，不进行破坏性迁移。权威状态版本不受支持、结构无效或内容损坏时会保留一个 `.corrupt.<digest>.bak` 证据副本并 fail closed；应检查或恢复已验证备份，不能盲目删除活动文件。
 
 ## 开发与验证
 
@@ -136,6 +137,8 @@ node scripts\smoke.mjs
 node scripts\concurrency-test.mjs
 node scripts\cross-process-concurrency-test.mjs
 npm run test:v19.3
+npm run test:v19.4
+npm run test:v19.4.1
 npm audit --omit=dev
 ~~~
 

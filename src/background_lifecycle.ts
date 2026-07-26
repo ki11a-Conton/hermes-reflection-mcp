@@ -57,6 +57,109 @@ function reviewMode(value: string | undefined): ReviewMode {
   return value === "deterministic" || value === "llm" || value === "auto" ? value : "auto";
 }
 
+interface BackgroundLeaseRefresherOptions {
+  store: BackgroundStateStore;
+  ownerId: string;
+  fencingToken: number;
+  leaseMs: number;
+  initialExpiresAt: string;
+  onLost: () => void;
+}
+
+class BackgroundLeaseRefresher {
+  private readonly intervalMs: number;
+  private lastConfirmedExpiry: number;
+  private runPromise: Promise<void> | undefined;
+  private timer: NodeJS.Timeout | undefined;
+  private wake: (() => void) | undefined;
+  private stopped = false;
+  private lost = false;
+
+  constructor(private readonly options: BackgroundLeaseRefresherOptions) {
+    this.intervalMs = Math.max(100, Math.min(30_000, Math.floor(options.leaseMs / 3)));
+    const parsedExpiry = Date.parse(options.initialExpiresAt);
+    this.lastConfirmedExpiry = Number.isFinite(parsedExpiry)
+      ? parsedExpiry
+      : Date.now() + options.leaseMs;
+  }
+
+  async start(): Promise<boolean> {
+    if (this.stopped || this.lost) return false;
+    if (this.runPromise) return true;
+    const current = await this.refreshNow();
+    if (!current || this.stopped) return false;
+    this.runPromise = this.run();
+    return true;
+  }
+
+  async refreshNow(): Promise<boolean> {
+    if (this.stopped || this.lost) return false;
+    try {
+      const result = await this.options.store.renewLease(
+        this.options.ownerId,
+        this.options.fencingToken,
+        this.options.leaseMs,
+      );
+      if (this.stopped) return false;
+      if (!result.renewed) {
+        this.markLost();
+        return false;
+      }
+      const parsedExpiry = result.expires_at ? Date.parse(result.expires_at) : Number.NaN;
+      this.lastConfirmedExpiry = Number.isFinite(parsedExpiry)
+        ? parsedExpiry
+        : Date.now() + this.options.leaseMs;
+      return true;
+    } catch {
+      if (this.stopped) return false;
+      if (Date.now() >= this.lastConfirmedExpiry) {
+        this.markLost();
+        return false;
+      }
+      return true;
+    }
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    this.wake?.();
+    await this.runPromise?.catch(() => undefined);
+  }
+
+  private markLost(): void {
+    if (this.lost || this.stopped) return;
+    this.lost = true;
+    this.options.onLost();
+  }
+
+  private async run(): Promise<void> {
+    while (!this.stopped && !this.lost) {
+      if (!await this.wait()) break;
+      if (!await this.refreshNow()) break;
+    }
+  }
+
+  private wait(): Promise<boolean> {
+    if (this.stopped) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (continueRunning: boolean): void => {
+        if (settled) return;
+        settled = true;
+        this.timer = undefined;
+        this.wake = undefined;
+        resolve(continueRunning);
+      };
+      this.timer = setTimeout(() => finish(true), this.intervalMs);
+      this.timer.unref();
+      this.wake = () => {
+        if (this.timer) clearTimeout(this.timer);
+        finish(false);
+      };
+    });
+  }
+}
+
 export function backgroundOptionsFromEnv(): BackgroundLifecycleOptions {
   const intervalMs = boundedInt(process.env.HERMES_REFLECTION_BACKGROUND_INTERVAL_MS, 15 * 60_000, 60_000, 24 * 60 * 60_000);
   return {
@@ -158,14 +261,22 @@ export class BackgroundLifecycle {
     const lease = await this.options.store.acquireLease(this.ownerId, this.options.lease_ms);
     if (!lease.acquired) return;
     this.activeFence = lease.fencing_token;
-    if (this.stopping) {
-      await this.options.store.releaseLease(this.ownerId, lease.fencing_token);
-      this.activeFence = undefined;
-      return;
-    }
     const controller = new AbortController();
     this.activeController = controller;
+    const refresher = new BackgroundLeaseRefresher({
+      store: this.options.store,
+      ownerId: this.ownerId,
+      fencingToken: lease.fencing_token,
+      leaseMs: this.options.lease_ms,
+      initialExpiresAt: lease.expires_at
+        ?? new Date(Date.now() + this.options.lease_ms).toISOString(),
+      onLost: () => controller.abort(new Error("background_lease_lost")),
+    });
+    const stopRefresher = (): void => { void refresher.stop(); };
+    controller.signal.addEventListener("abort", stopRefresher, { once: true });
     try {
+      if (this.stopping) controller.abort(new Error("background_shutdown"));
+      if (controller.signal.aborted || !await refresher.start()) return;
       const dirty = await this.options.store.dirtySessions();
       const cutoff = Date.now() - Math.max(0, this.options.idle_ms);
       const eligible = dirty
@@ -174,8 +285,7 @@ export class BackgroundLifecycle {
         .slice(0, Math.max(1, this.options.max_sessions_per_run));
       for (const item of eligible) {
         if (controller.signal.aborted) break;
-        const renewed = await this.options.store.acquireLease(this.ownerId, this.options.lease_ms);
-        if (!renewed.acquired || renewed.fencing_token !== lease.fencing_token) break;
+        if (!await refresher.refreshNow()) break;
         const current = await this.sourceState(item.session_id);
         if (current.reflection_count === 0 || current.source_fingerprint === item.last_reviewed_fingerprint) {
           await this.options.store.commitSession(
@@ -213,7 +323,9 @@ export class BackgroundLifecycle {
         );
       }
     } finally {
+      controller.signal.removeEventListener("abort", stopRefresher);
       this.activeController = undefined;
+      await refresher.stop();
       await this.options.store.releaseLease(this.ownerId, lease.fencing_token);
       if (this.activeFence === lease.fencing_token) this.activeFence = undefined;
     }
@@ -238,14 +350,18 @@ export class BackgroundLifecycle {
       this.activeController?.abort();
       const active = this.activeRun;
       if (active) {
-        await Promise.race([
-          active.catch(() => undefined),
-          new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, timeoutMs))),
-        ]);
-      }
-      if (this.activeFence !== undefined) {
-        await this.options.store.releaseLease(this.ownerId, this.activeFence).catch(() => undefined);
-        this.activeFence = undefined;
+        let drainTimer: NodeJS.Timeout | undefined;
+        try {
+          await Promise.race([
+            active.catch(() => undefined),
+            new Promise<void>((resolve) => {
+              drainTimer = setTimeout(resolve, Math.max(0, timeoutMs));
+              drainTimer.unref();
+            }),
+          ]);
+        } finally {
+          if (drainTimer) clearTimeout(drainTimer);
+        }
       }
     })();
     return this.shutdownRun;

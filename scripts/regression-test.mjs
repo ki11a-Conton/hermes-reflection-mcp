@@ -1,7 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -570,14 +570,15 @@ async function runMalformedResolvedIndexRegression() {
   let peer;
   try {
     await mkdir(storeDir, { recursive: true });
-    await writeFile(join(storeDir, "resolved_questions.json"), "[]", "utf8");
+    const resolvedPath = join(storeDir, "resolved_questions.json");
+    await writeFile(resolvedPath, "[]", "utf8");
     peer = await connect("resolved-shape-writer", home);
     await call(peer.client, "reflect_on_task", {
       session_id: "resolved-shape",
       task_goal: "persist resolution across restart",
       task_outcome: "success",
       failure_mode: "success",
-      summary: "A malformed but valid JSON overlay must be normalized before mutation.",
+      summary: "A malformed but valid JSON overlay must block derived reads and writes.",
       auto_extract_heuristics: false,
       open_questions: [{
         question: "Will this resolution survive restart?",
@@ -585,20 +586,16 @@ async function runMalformedResolvedIndexRegression() {
         requires_environment_interaction: false,
       }],
     });
-    const before = JSON.parse(text(await call(peer.client, "export_data", { collection: "all" })));
-    const reflection = before.reflections.find((item) => item.task_goal === "persist resolution across restart");
-    await call(peer.client, "resolve_open_question", {
-      reflection_id: reflection.id,
-      question_index: 0,
-    });
-    await peer.client.close();
-    peer = await connect("resolved-shape-reader", home);
-    const afterRestart = JSON.parse(text(await call(peer.client, "export_data", { collection: "all" })));
-    const restored = afterRestart.reflections.find((item) => item.id === reflection.id);
+    const first = await peer.client.callTool({ name: "export_data", arguments: { collection: "all" } });
     assert(
-      restored.open_questions[0].resolved === true,
-      "resolved-question writes must survive restart when the existing overlay has a malformed JSON shape",
+      first.isError === true && /Refusing to continue/.test(text(first)),
+      "a malformed resolved-question overlay must fail closed instead of being normalized to empty",
     );
+    assert(await readFile(resolvedPath, "utf8") === "[]", "fail-closed overlay handling must preserve exact active bytes");
+    const second = await peer.client.callTool({ name: "export_data", arguments: { collection: "all" } });
+    assert(second.isError === true, "repeated malformed-overlay reads must keep failing closed");
+    const backups = (await readdir(storeDir)).filter((name) => /^resolved_questions\.json\.corrupt\.[a-f0-9]{16}\.bak$/.test(name));
+    assert(backups.length === 1, `malformed overlay must create one idempotent evidence backup, found ${backups.length}`);
   } finally {
     await peer?.client.close().catch(() => undefined);
     await rm(home, { recursive: true, force: true });

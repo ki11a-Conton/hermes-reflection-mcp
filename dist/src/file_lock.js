@@ -7,6 +7,10 @@ function errorCode(error) {
         ? String(error.code)
         : undefined;
 }
+export function isRetryableLockContention(code, platform = process.platform) {
+    return code === "EEXIST"
+        || (platform === "win32" && (code === "EACCES" || code === "EPERM"));
+}
 function isProcessAlive(pid) {
     if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0)
         return false;
@@ -81,7 +85,7 @@ export async function withFileLock(filePath, fn, options = {}) {
             }
         }
         catch (error) {
-            if (errorCode(error) !== "EEXIST")
+            if (!isRetryableLockContention(errorCode(error)))
                 throw error;
             if (await quarantineStaleLock(lockPath, staleMs))
                 continue;

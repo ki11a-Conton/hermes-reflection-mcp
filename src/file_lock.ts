@@ -16,6 +16,14 @@ function errorCode(error: unknown): string | undefined {
     : undefined;
 }
 
+export function isRetryableLockContention(
+  code: string | undefined,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return code === "EEXIST"
+    || (platform === "win32" && (code === "EACCES" || code === "EPERM"));
+}
+
 function isProcessAlive(pid: unknown): boolean {
   if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -93,7 +101,7 @@ export async function withFileLock<T>(
         throw error;
       }
     } catch (error) {
-      if (errorCode(error) !== "EEXIST") throw error;
+      if (!isRetryableLockContention(errorCode(error))) throw error;
       if (await quarantineStaleLock(lockPath, staleMs)) continue;
       if (Date.now() >= deadline) {
         let owner = "unknown";

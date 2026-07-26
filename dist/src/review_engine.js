@@ -1,18 +1,22 @@
 import { createHash } from "node:crypto";
 import { exportData, safeHeuristicText, scanHeuristicThreats, upsertHeuristicsBatch, } from "../storage.js";
 import { getLlmReviewReadiness, runLlmReview } from "./llm_review.js";
+import { redactSensitiveText } from "./redaction.js";
 export const MAX_RECENT_REFLECTIONS = 10;
 export const MAX_FULL_REFLECTIONS = 200;
 export const MAX_REVIEW_CANDIDATES = 50;
 export function normalizeCandidateText(text) {
     return text.trim().replace(/\s+/g, " ").toLowerCase();
 }
+function strictDerivedText(value) {
+    return redactSensitiveText(value, { strictHistorical: true }).trim();
+}
 export function buildDeterministicReviewCandidates(reflections, existingHeuristics) {
     const seen = new Set(existingHeuristics);
     const candidates = [];
     for (const reflection of reflections) {
         for (const lesson of reflection.lessons_learned) {
-            const heuristic = lesson.trim();
+            const heuristic = strictDerivedText(lesson);
             if (!heuristic)
                 continue;
             const normalized = normalizeCandidateText(heuristic);
@@ -33,24 +37,46 @@ export function buildDeterministicReviewCandidates(reflections, existingHeuristi
     }
     return candidates;
 }
-function sourceFingerprint(reflections) {
-    const source = reflections.map((item) => `${item.id}\0${item.timestamp}`).join("\n");
-    return createHash("sha256").update(source, "utf8").digest("hex");
+export function reviewSourceFingerprint(reflections) {
+    const source = reflections.map((item) => ({
+        id: item.id,
+        timestamp: item.timestamp,
+        domain: item.domain,
+        task_goal: strictDerivedText(item.task_goal),
+        outcome: item.task_outcome,
+        summary: strictDerivedText(item.task_state.summary),
+        summary_sections: (item.task_state.summary_sections ?? []).map((section) => ({
+            title: strictDerivedText(section.title),
+            content: strictDerivedText(section.content),
+        })),
+        blockers: item.task_state.immediate_blockers.map(strictDerivedText),
+        lessons: item.lessons_learned.map(strictDerivedText),
+        open_questions: item.open_questions
+            .filter((question) => !question.resolved)
+            .map((question) => strictDerivedText(question.question)),
+    }));
+    return createHash("sha256").update(JSON.stringify(source), "utf8").digest("hex");
 }
 function llmCandidates(llm, existingHeuristics, fallbackSourceId) {
     const seen = new Set(existingHeuristics);
     const candidates = [];
     for (const item of llm.candidates) {
-        const normalized = normalizeCandidateText(item.heuristic);
+        const heuristic = strictDerivedText(item.heuristic);
+        if (!heuristic)
+            continue;
+        const normalized = normalizeCandidateText(heuristic);
         if (seen.has(normalized))
             continue;
         seen.add(normalized);
+        const threatPatterns = scanHeuristicThreats(heuristic, "strict");
         candidates.push({
-            heuristic: item.heuristic,
+            heuristic: threatPatterns.length > 0 ? safeHeuristicText(heuristic) : heuristic,
             source_reflection_id: llm.source_reflection_ids[0] ?? fallbackSourceId,
             domain: item.domain,
             confidence: item.confidence,
             tags: [...new Set([...item.tags, "background-review"])],
+            skipped_reason: threatPatterns.length > 0 ? "threat_pattern_detected" : undefined,
+            threat_patterns: threatPatterns.length > 0 ? threatPatterns : undefined,
         });
     }
     return candidates;
@@ -70,7 +96,7 @@ export async function runReview(options) {
     const existingHeuristics = new Set(store.heuristics
         .filter((heuristic) => !heuristic.superseded_by)
         .map((heuristic) => normalizeCandidateText(heuristic.heuristic)));
-    const fingerprint = sourceFingerprint(reviewedReflections);
+    const fingerprint = reviewSourceFingerprint(reviewedReflections);
     let modeUsed = "deterministic";
     let fallbackReason;
     let llmResult;
@@ -206,7 +232,7 @@ export async function getReviewSourceState(sessionId, reviewScope = "recent") {
     const reviewed = reviewScope === "recent"
         ? allSessionReflections.slice(-MAX_RECENT_REFLECTIONS)
         : allSessionReflections.slice(-MAX_FULL_REFLECTIONS);
-    return { source_fingerprint: sourceFingerprint(reviewed), reflection_count: reviewed.length };
+    return { source_fingerprint: reviewSourceFingerprint(reviewed), reflection_count: reviewed.length };
 }
 export function getReviewReadinessStatus() {
     return getLlmReviewReadiness();

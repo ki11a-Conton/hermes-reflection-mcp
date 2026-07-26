@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { dirname } from "node:path";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { withFileLock } from "./file_lock.js";
+import { AuthoritativeStateError, preserveCorruptUtf8, readAuthoritativeJson } from "./authoritative_state.js";
 
 const SCHEMA_VERSION = 1 as const;
 const MAX_DIRTY_SESSIONS = 100;
@@ -46,6 +47,11 @@ export interface LeaseResult {
   owner_active?: boolean;
 }
 
+export interface LeaseRenewalResult {
+  renewed: boolean;
+  expires_at?: string;
+}
+
 export interface BackgroundStatus {
   schema_version: number;
   dirty_session_count: number;
@@ -85,76 +91,203 @@ function safeText(value: unknown, max = 200): string | undefined {
   return clean ? clean.slice(0, max) : undefined;
 }
 
-function normalizeState(value: unknown): BackgroundState {
+class BackgroundStateValidationError extends Error {}
+
+function plainRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new BackgroundStateValidationError(`${label} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function requireExactKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[],
+  label: string,
+): void {
+  const allowed = new Set([...required, ...optional]);
+  for (const key of required) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) {
+      throw new BackgroundStateValidationError(`${label}.${key} is required`);
+    }
+  }
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) throw new BackgroundStateValidationError(`${label}.${key} is unsupported`);
+  }
+}
+
+function requirePositiveSafeInteger(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) <= 0) {
+    throw new BackgroundStateValidationError(`${label} must be a positive safe integer`);
+  }
+  return Number(value);
+}
+
+function requireTimestamp(value: unknown, label: string): string {
+  const parsed = safeIso(value);
+  if (!parsed) throw new BackgroundStateValidationError(`${label} must be a parseable timestamp`);
+  return parsed;
+}
+
+function requireText(value: unknown, max: number, label: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > max || /[\r\n\0]/.test(value)) {
+    throw new BackgroundStateValidationError(`${label} must contain 1-${max} safe characters`);
+  }
+  return value;
+}
+
+function requireSessionId(value: string, label: string): string {
+  if (value.length === 0 || value.length > 200) {
+    throw new BackgroundStateValidationError(`${label} must contain 1-200 characters`);
+  }
+  return value;
+}
+
+function safeFingerprint(value: unknown): string | undefined {
+  return typeof value === "string" && value.length === 64 && !/[\r\n\0]/.test(value)
+    ? value
+    : undefined;
+}
+
+function optionalFingerprint(value: unknown, label: string): string | undefined {
+  if (value === undefined) return undefined;
+  const fingerprint = safeFingerprint(value);
+  if (!fingerprint) {
+    throw new BackgroundStateValidationError(`${label} must be a safe 64-character fingerprint`);
+  }
+  return fingerprint;
+}
+
+function optionalTimestamp(value: unknown, label: string): string | undefined {
+  return value === undefined ? undefined : requireTimestamp(value, label);
+}
+
+function decodeState(value: unknown): BackgroundState {
+  const raw = plainRecord(value, "background lifecycle state");
+  requireExactKeys(
+    raw,
+    ["schema_version", "next_fencing_token", "dirty_sessions", "reviewed_sessions", "recent_runs"],
+    ["lease"],
+    "background lifecycle state",
+  );
+  if (raw.schema_version !== SCHEMA_VERSION) {
+    throw new BackgroundStateValidationError(`schema_version must equal ${SCHEMA_VERSION}`);
+  }
+
   const state = initialState();
-  if (!value || typeof value !== "object" || Array.isArray(value)) return state;
-  const raw = value as Record<string, unknown>;
-  if (Number.isSafeInteger(raw.next_fencing_token) && Number(raw.next_fencing_token) > 0) {
-    state.next_fencing_token = Number(raw.next_fencing_token);
+  state.next_fencing_token = requirePositiveSafeInteger(raw.next_fencing_token, "next_fencing_token");
+
+  const dirty = plainRecord(raw.dirty_sessions, "dirty_sessions");
+  const dirtyEntries = Object.entries(dirty);
+  if (dirtyEntries.length > MAX_DIRTY_SESSIONS) {
+    throw new BackgroundStateValidationError(`dirty_sessions exceeds ${MAX_DIRTY_SESSIONS} entries`);
+  }
+  for (const [sessionId, item] of dirtyEntries) {
+    requireSessionId(sessionId, "dirty_sessions session id");
+    const data = plainRecord(item, `dirty_sessions.${sessionId}`);
+    requireExactKeys(
+      data,
+      ["dirty_at"],
+      ["last_reviewed_fingerprint", "last_reviewed_at", "retry_after"],
+      `dirty_sessions.${sessionId}`,
+    );
+    const decoded: DirtySessionState = {
+      dirty_at: requireTimestamp(data.dirty_at, `dirty_sessions.${sessionId}.dirty_at`),
+    };
+    const fingerprint = optionalFingerprint(
+      data.last_reviewed_fingerprint,
+      `dirty_sessions.${sessionId}.last_reviewed_fingerprint`,
+    );
+    const reviewedAt = optionalTimestamp(data.last_reviewed_at, `dirty_sessions.${sessionId}.last_reviewed_at`);
+    const retryAfter = optionalTimestamp(data.retry_after, `dirty_sessions.${sessionId}.retry_after`);
+    if (fingerprint !== undefined) decoded.last_reviewed_fingerprint = fingerprint;
+    if (reviewedAt !== undefined) decoded.last_reviewed_at = reviewedAt;
+    if (retryAfter !== undefined) decoded.retry_after = retryAfter;
+    state.dirty_sessions[sessionId] = decoded;
   }
 
-  if (raw.dirty_sessions && typeof raw.dirty_sessions === "object" && !Array.isArray(raw.dirty_sessions)) {
-    const entries = Object.entries(raw.dirty_sessions as Record<string, unknown>).slice(-MAX_DIRTY_SESSIONS);
-    for (const [sessionId, item] of entries) {
-      if (!sessionId || sessionId.length > 200 || !item || typeof item !== "object" || Array.isArray(item)) continue;
-      const data = item as Record<string, unknown>;
-      const dirtyAt = safeIso(data.dirty_at);
-      if (!dirtyAt) continue;
-      state.dirty_sessions[sessionId] = {
-        dirty_at: dirtyAt,
-        last_reviewed_fingerprint: safeText(data.last_reviewed_fingerprint, 64),
-        last_reviewed_at: safeIso(data.last_reviewed_at),
-        retry_after: safeIso(data.retry_after),
-      };
+  const reviewed = plainRecord(raw.reviewed_sessions, "reviewed_sessions");
+  const reviewedEntries = Object.entries(reviewed);
+  if (reviewedEntries.length > MAX_DIRTY_SESSIONS) {
+    throw new BackgroundStateValidationError(`reviewed_sessions exceeds ${MAX_DIRTY_SESSIONS} entries`);
+  }
+  for (const [sessionId, item] of reviewedEntries) {
+    requireSessionId(sessionId, "reviewed_sessions session id");
+    const data = plainRecord(item, `reviewed_sessions.${sessionId}`);
+    requireExactKeys(
+      data,
+      ["last_reviewed_fingerprint", "last_reviewed_at"],
+      [],
+      `reviewed_sessions.${sessionId}`,
+    );
+    state.reviewed_sessions[sessionId] = {
+      last_reviewed_fingerprint: optionalFingerprint(
+        data.last_reviewed_fingerprint,
+        `reviewed_sessions.${sessionId}.last_reviewed_fingerprint`,
+      ),
+      last_reviewed_at: requireTimestamp(
+        data.last_reviewed_at,
+        `reviewed_sessions.${sessionId}.last_reviewed_at`,
+      ),
+    };
+  }
+
+  if (raw.lease !== undefined) {
+    const lease = plainRecord(raw.lease, "lease");
+    requireExactKeys(
+      lease,
+      ["owner_id", "pid", "host", "acquired_at", "expires_at", "fencing_token"],
+      [],
+      "lease",
+    );
+    const token = requirePositiveSafeInteger(lease.fencing_token, "lease.fencing_token");
+    state.lease = {
+      owner_id: requireText(lease.owner_id, 200, "lease.owner_id"),
+      pid: requirePositiveSafeInteger(lease.pid, "lease.pid"),
+      host: requireText(lease.host, 200, "lease.host"),
+      acquired_at: requireTimestamp(lease.acquired_at, "lease.acquired_at"),
+      expires_at: requireTimestamp(lease.expires_at, "lease.expires_at"),
+      fencing_token: token,
+    };
+    if (state.next_fencing_token <= token) {
+      throw new BackgroundStateValidationError("next_fencing_token must exceed lease.fencing_token");
     }
   }
 
-  if (raw.reviewed_sessions && typeof raw.reviewed_sessions === "object" && !Array.isArray(raw.reviewed_sessions)) {
-    for (const [sessionId, item] of Object.entries(raw.reviewed_sessions as Record<string, unknown>).slice(-MAX_DIRTY_SESSIONS)) {
-      if (!sessionId || sessionId.length > 200 || !item || typeof item !== "object" || Array.isArray(item)) continue;
-      const data = item as Record<string, unknown>;
-      state.reviewed_sessions[sessionId] = {
-        last_reviewed_fingerprint: safeText(data.last_reviewed_fingerprint, 64),
-        last_reviewed_at: safeIso(data.last_reviewed_at),
-      };
-    }
+  if (!Array.isArray(raw.recent_runs)) {
+    throw new BackgroundStateValidationError("recent_runs must be an array");
+  }
+  if (raw.recent_runs.length > MAX_RECENT_RUNS) {
+    throw new BackgroundStateValidationError(`recent_runs exceeds ${MAX_RECENT_RUNS} entries`);
+  }
+  for (const [index, item] of raw.recent_runs.entries()) {
+    const run = plainRecord(item, `recent_runs[${index}]`);
+    requireExactKeys(run, ["session_id", "finished_at", "outcome_class"], [], `recent_runs[${index}]`);
+    state.recent_runs.push({
+      session_id: requireText(run.session_id, 200, `recent_runs[${index}].session_id`),
+      finished_at: requireTimestamp(run.finished_at, `recent_runs[${index}].finished_at`),
+      outcome_class: requireText(run.outcome_class, 80, `recent_runs[${index}].outcome_class`),
+    });
   }
 
-  if (raw.lease && typeof raw.lease === "object" && !Array.isArray(raw.lease)) {
-    const lease = raw.lease as Record<string, unknown>;
-    const ownerId = safeText(lease.owner_id, 200);
-    const host = safeText(lease.host, 200);
-    const acquiredAt = safeIso(lease.acquired_at);
-    const expiresAt = safeIso(lease.expires_at);
-    const pid = Number(lease.pid);
-    const token = Number(lease.fencing_token);
-    if (ownerId && host && acquiredAt && expiresAt && Number.isInteger(pid) && pid > 0 && Number.isSafeInteger(token) && token > 0) {
-      state.lease = { owner_id: ownerId, host, acquired_at: acquiredAt, expires_at: expiresAt, pid, fencing_token: token };
-      state.next_fencing_token = Math.max(state.next_fencing_token, token + 1);
-    }
-  }
-
-  if (Array.isArray(raw.recent_runs)) {
-    for (const item of raw.recent_runs.slice(-MAX_RECENT_RUNS)) {
-      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
-      const run = item as Record<string, unknown>;
-      const sessionId = safeText(run.session_id, 200);
-      const finishedAt = safeIso(run.finished_at);
-      const outcomeClass = safeText(run.outcome_class, 80);
-      if (sessionId && finishedAt && outcomeClass) {
-        state.recent_runs.push({ session_id: sessionId, finished_at: finishedAt, outcome_class: outcomeClass });
-      }
-    }
-  }
   return state;
 }
 
-function isProcessAlive(pid: number): boolean {
+function errorCode(error: unknown): string | undefined {
+  return error && typeof error === "object" && "code" in error
+    ? String((error as { code?: unknown }).code)
+    : undefined;
+}
+
+type ProcessLiveness = "alive" | "dead" | "unknown";
+
+function processLiveness(pid: number): ProcessLiveness {
   try {
     process.kill(pid, 0);
-    return true;
+    return "alive";
   } catch (error) {
-    return Boolean(error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "EPERM");
+    return errorCode(error) === "EPERM" ? "unknown" : "dead";
   }
 }
 
@@ -162,18 +295,17 @@ export class BackgroundStateStore {
   constructor(readonly path: string) {}
 
   private async readUnlocked(): Promise<{ state: BackgroundState; recovered: boolean }> {
+    const loaded = await readAuthoritativeJson<unknown>(this.path, "Hermes background lifecycle state");
+    if (!loaded.exists) return { state: initialState(), recovered: true };
     try {
-      const raw = await readFile(this.path, "utf8");
-      return { state: normalizeState(JSON.parse(raw)), recovered: false };
+      return { state: decodeState(loaded.value), recovered: false };
     } catch (error) {
-      const code = error && typeof error === "object" && "code" in error ? String((error as { code?: unknown }).code) : undefined;
-      if (code === "ENOENT") return { state: initialState(), recovered: true };
-      if (error instanceof SyntaxError) {
-        const corruptPath = `${this.path}.corrupt.${Date.now()}.${randomUUID()}`;
-        await rename(this.path, corruptPath).catch(() => undefined);
-        return { state: initialState(), recovered: true };
-      }
-      throw error;
+      const backup = await preserveCorruptUtf8(this.path, loaded.raw);
+      const reason = error instanceof Error ? error.message : "invalid background lifecycle state";
+      throw new AuthoritativeStateError(
+        `Refusing to continue: background_lifecycle.json is invalid (${reason}). `
+        + `Evidence backup: ${backup}. Nothing was changed.`,
+      );
     }
   }
 
@@ -216,13 +348,25 @@ export class BackgroundStateStore {
     return this.mutate((state) => {
       const now = Date.now();
       const current = state.lease;
-      if (current?.owner_id === ownerId && current.pid === process.pid) {
-        current.expires_at = new Date(now + duration).toISOString();
-        return { acquired: true, fencing_token: current.fencing_token, expires_at: current.expires_at };
+      if (current) {
+        const expired = Date.parse(current.expires_at) <= now;
+        if (current.owner_id === ownerId && current.pid === process.pid && !expired) {
+          return { acquired: true, fencing_token: current.fencing_token, expires_at: current.expires_at };
+        }
+        const confirmedDead = !expired
+          && current.host === hostname()
+          && processLiveness(current.pid) === "dead";
+        if (!expired && !confirmedDead) {
+          return {
+            acquired: false,
+            fencing_token: current.fencing_token,
+            expires_at: current.expires_at,
+            owner_active: true,
+          };
+        }
       }
-      const currentAlive = current?.host === hostname() && isProcessAlive(current.pid);
-      if (current && (Date.parse(current.expires_at) > now || currentAlive)) {
-        return { acquired: false, fencing_token: current.fencing_token, expires_at: current.expires_at, owner_active: true };
+      if (state.next_fencing_token >= Number.MAX_SAFE_INTEGER) {
+        throw new Error("Background fencing token space is exhausted");
       }
       const token = state.next_fencing_token;
       state.next_fencing_token += 1;
@@ -235,6 +379,18 @@ export class BackgroundStateStore {
         fencing_token: token,
       };
       return { acquired: true, fencing_token: token, expires_at: state.lease.expires_at };
+    });
+  }
+
+  async renewLease(ownerId: string, fencingToken: number, leaseMs: number): Promise<LeaseRenewalResult> {
+    const duration = Math.max(1_000, Math.min(24 * 60 * 60 * 1_000, Math.floor(leaseMs)));
+    return this.mutate((state) => {
+      const lease = state.lease;
+      if (!lease || lease.owner_id !== ownerId || lease.fencing_token !== fencingToken) {
+        return { renewed: false };
+      }
+      lease.expires_at = new Date(Date.now() + duration).toISOString();
+      return { renewed: true, expires_at: lease.expires_at };
     });
   }
 
@@ -279,12 +435,21 @@ export class BackgroundStateStore {
       if (state.lease?.owner_id !== ownerId || state.lease.fencing_token !== fencingToken || Date.parse(state.lease.expires_at) <= Date.now()) {
         return false;
       }
+      const completedReview = !retryAfterMs || retryAfterMs <= 0;
+      const reviewedFingerprint = safeFingerprint(fingerprint);
+      if (completedReview && !reviewedFingerprint) return false;
       const finishedAt = new Date().toISOString();
-      if (!retryAfterMs || retryAfterMs <= 0) {
+      if (completedReview) {
         state.reviewed_sessions[sessionId] = {
-          last_reviewed_fingerprint: safeText(fingerprint, 64),
+          last_reviewed_fingerprint: reviewedFingerprint,
           last_reviewed_at: finishedAt,
         };
+        const reviewed = Object.entries(state.reviewed_sessions)
+          .sort((a, b) => (a[1].last_reviewed_at ?? "").localeCompare(b[1].last_reviewed_at ?? ""));
+        while (reviewed.length > MAX_DIRTY_SESSIONS) {
+          const [oldest] = reviewed.shift()!;
+          delete state.reviewed_sessions[oldest];
+        }
       }
       const dirtyUnchanged = !expectedDirtyAt || state.dirty_sessions[sessionId]?.dirty_at === expectedDirtyAt;
       if (dirtyUnchanged && retryAfterMs && retryAfterMs > 0 && state.dirty_sessions[sessionId]) {

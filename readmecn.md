@@ -1,4 +1,4 @@
-# Hermes Reflection MCP v19.3.0 中文使用指南
+# Hermes Reflection MCP v19.4.1 中文使用指南
 
 Hermes Reflection MCP 是一个本地 stdio MCP 服务，提供 28 个公开工具，用于持久化任务反思、heuristic、有界 Memory Board/User Profile 与可搜索会话。它不上传用户数据。
 
@@ -24,7 +24,7 @@ command = 'node'
 args = ['C:\Users\<YOU>\.codex\mcp\hermes-reflection-mcp\dist\index.js']
 ~~~
 
-5. 重启 Codex Desktop，使新 MCP 进程加载 v19.3.0。
+5. 重启 Codex Desktop，使新 MCP 进程加载 v19.4.1。
 
 安装本 MCP 不会让 Codex Desktop 自动调用 session_lifecycle_hook 或 append_session_turn。生命周期、快照和会话 turn 都必须由客户端显式调用。
 
@@ -37,9 +37,11 @@ node scripts\smoke.mjs
 node scripts\concurrency-test.mjs
 node scripts\cross-process-concurrency-test.mjs
 npm run test:v19.3
+npm run test:v19.4
+npm run test:v19.4.1
 ~~~
 
-预期：smoke 报告 v19.3.0 和 28 个公开工具；新版生命周期/LLM mock/停机测试与单进程、跨进程并发测试全部通过。测试使用临时用户目录，不会写入真实 <code>~/.hermes-reflection</code>。
+预期：smoke 报告 v19.4.1 和 28 个公开工具；后台状态严格解码、过期/死亡 owner 正确回收、长复盘精确 owner/token 续租、无竞态停机、权威状态 fail-closed、严格脱敏及单/跨进程并发测试全部通过。有效 v19.4 与 v19.3 数据无需迁移。测试使用临时用户目录，不会写入真实 <code>~/.hermes-reflection</code>。
 
 如需修改源码，再安装开发依赖并执行：
 

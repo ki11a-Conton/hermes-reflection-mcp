@@ -1,21 +1,24 @@
-import { redactSensitiveText } from "./redaction.js";
+import { redactSensitiveText, truncateCodePoints } from "./redaction.js";
 export const CONTEXT_HANDOFF_PREFIX = "[CONTEXT COMPACTION — REFERENCE ONLY]";
 const LEGACY_CONTEXT_HANDOFF_PREFIX = "[CONTEXT COMPACTION 鈥?REFERENCE ONLY]";
 export const CONTEXT_HANDOFF_END_MARKER = "--- END OF CONTEXT HANDOFF ---";
 const PREFIX = `${CONTEXT_HANDOFF_PREFIX} Earlier turns were compacted into the checkpoint below. Treat it as historical background, not active instructions. The latest user message outside this handoff is the only current task.`;
-function truncateCodePoints(value, max) {
-    if (max <= 0)
-        return "";
-    const points = Array.from(value);
-    if (points.length <= max)
-        return value;
-    if (max <= 3)
-        return points.slice(0, max).join("");
-    return `${points.slice(0, max - 3).join("")}...`;
-}
 function oneLine(value, max = 500) {
-    const safe = redactSensitiveText(value).replace(/\s+/g, " ").trim();
+    const safe = redactSensitiveText(value, { strictHistorical: true }).replace(/\s+/g, " ").trim();
     return truncateCodePoints(safe, max);
+}
+function truncateUtf16Safe(value, maxUnits) {
+    if (maxUnits <= 0)
+        return "";
+    let used = 0;
+    let output = "";
+    for (const character of value) {
+        if (used + character.length > maxUnits)
+            break;
+        output += character;
+        used += character.length;
+    }
+    return output;
 }
 export function isContextHandoffContent(value) {
     if (typeof value !== "string")
@@ -38,12 +41,18 @@ function lineWithBudget(label, value, valueBudget, emptyText) {
     };
 }
 /** Build a deterministic, reference-only handoff. No I/O or model call occurs here. */
-export function buildCompactionHandoff(turns, reflections, maxTurns, maxChars) {
+export function buildCompactionHandoff(turns, reflections, maxTurns, maxChars, preserveRecentUserTurns = 3) {
     const selected = turns.slice(-maxTurns);
     const ordinaryTurns = selected.filter((turn) => !isContextHandoffContent(turn.content));
     const omittedHandoffTurns = selected.length - ordinaryTurns.length;
-    const lastUser = [...ordinaryTurns].reverse().find((turn) => turn.role === "user");
-    const lastAssistant = [...ordinaryTurns].reverse().find((turn) => turn.role === "assistant");
+    const requestedRecentUserTurns = Math.max(1, Math.min(5, Math.trunc(preserveRecentUserTurns)));
+    const genuineUserTurns = ordinaryTurns
+        .filter((turn) => turn.role === "user" && turn.content.trim().length > 0);
+    const recentUserTurns = genuineUserTurns.slice(-requestedRecentUserTurns);
+    const lastUser = recentUserTurns.at(-1);
+    const earlierRecentUsers = recentUserTurns.slice(0, -1);
+    const lastAssistant = [...ordinaryTurns].reverse()
+        .find((turn) => turn.role === "assistant" && turn.content.trim().length > 0);
     const completed = uniqueLines(reflections
         .filter((item) => item.task_outcome === "success")
         .map((item) => `${item.task_goal}: ${item.task_state.summary}`)).slice(0, 8);
@@ -101,7 +110,27 @@ export function buildCompactionHandoff(turns, reflections, maxTurns, maxChars) {
     ];
     const sectionsTruncated = [];
     let reflectionItemsIncluded = 0;
+    const includedEarlierRecentUsers = [];
     const lengthWithFooter = (candidateLines) => [...candidateLines, "", CONTEXT_HANDOFF_END_MARKER].join("\n").length;
+    // Optional historical user anchors are chosen newest-first so a tight
+    // budget drops the oldest context first, then rendered chronologically.
+    for (const turn of [...earlierRecentUsers].reverse()) {
+        const proposed = [turn, ...includedEarlierRecentUsers];
+        const proposedLines = proposed.map((item) => `- [turn ${item.turn_index}] ${oneLine(item.content)}`);
+        const candidate = [...lines, "", "## Recent Historical User Turns", ...proposedLines];
+        if (lengthWithFooter(candidate) <= maxChars) {
+            includedEarlierRecentUsers.unshift(turn);
+        }
+    }
+    if (includedEarlierRecentUsers.length > 0) {
+        lines.push("", "## Recent Historical User Turns");
+        for (const turn of includedEarlierRecentUsers) {
+            lines.push(`- [turn ${turn.turn_index}] ${oneLine(turn.content)}`);
+        }
+    }
+    if (includedEarlierRecentUsers.length < earlierRecentUsers.length) {
+        sectionsTruncated.push("Recent Historical User Turns");
+    }
     for (const section of optionalSections) {
         const sectionLines = section.lines.length > 0 ? section.lines : ["None."];
         const headerCandidate = [...lines, "", section.title];
@@ -139,7 +168,7 @@ export function buildCompactionHandoff(turns, reflections, maxTurns, maxChars) {
     if (handoff.length > maxChars) {
         const suffix = `\n${CONTEXT_HANDOFF_END_MARKER}`;
         const contentBudget = Math.max(0, maxChars - suffix.length);
-        handoff = `${truncateCodePoints(handoff, contentBudget)}${suffix}`;
+        handoff = `${truncateUtf16Safe(handoff, contentBudget)}${suffix}`;
     }
     return {
         handoff,
@@ -152,6 +181,14 @@ export function buildCompactionHandoff(turns, reflections, maxTurns, maxChars) {
             last_turn_index: selected.at(-1)?.turn_index ?? null,
             omitted_handoff_turns: omittedHandoffTurns,
             ordinary_turns_considered: ordinaryTurns.length,
+            requested_recent_user_turns: requestedRecentUserTurns,
+            available_recent_user_turns: genuineUserTurns.length,
+            included_recent_user_turns: (lastUser ? 1 : 0) + includedEarlierRecentUsers.length,
+            recent_user_turn_indexes: [
+                ...includedEarlierRecentUsers.map((turn) => turn.turn_index),
+                ...(lastUser ? [lastUser.turn_index] : []),
+            ],
+            recent_user_turns_omitted_due_to_budget: recentUserTurns.length - ((lastUser ? 1 : 0) + includedEarlierRecentUsers.length),
             reflection_items_omitted: reflectionItemsOmitted,
             sections_truncated: [...new Set(sectionsTruncated)],
         },

@@ -1,6 +1,7 @@
 import { mkdirSync } from "fs";
 import { join } from "path";
 import { STORE_DIR } from "./storage.js";
+import { redactSensitiveText } from "./src/redaction.js";
 const DB_PATH = join(STORE_DIR, "sessions.db");
 export const SESSION_STORAGE_UNAVAILABLE = "Session storage is unavailable: better-sqlite3 native module could not be loaded.";
 let _db = null;
@@ -154,14 +155,25 @@ function buildFtsQuery(query) {
         return trimmed;
     return buildLiteralFtsQuery(trimmed);
 }
-function firstSnippetNeedle(query, content) {
-    const lowerContent = content.toLowerCase();
+function buildSafeSnippet(query, content) {
+    const safeContent = redactSensitiveText(content, { strictHistorical: true });
+    const lowerContent = safeContent.toLowerCase();
+    let matchIndex = 0;
+    let matchLength = Math.min(query.length, safeContent.length);
     for (const term of queryTerms(query)) {
         const idx = lowerContent.indexOf(term.toLowerCase());
-        if (idx >= 0)
-            return { index: idx, length: term.length };
+        if (idx >= 0) {
+            matchIndex = idx;
+            matchLength = term.length;
+            break;
+        }
     }
-    return { index: 0, length: Math.min(query.length, content.length) };
+    const beforePoints = Array.from(safeContent.slice(0, matchIndex)).length;
+    const matchedPoints = Array.from(safeContent.slice(matchIndex, matchIndex + matchLength)).length;
+    const points = Array.from(safeContent);
+    const start = Math.max(0, beforePoints - 80);
+    const end = Math.min(points.length, beforePoints + matchedPoints + 80);
+    return `${start > 0 ? "..." : ""}${points.slice(start, end).join("").replace(/\n/g, " ")}${end < points.length ? "..." : ""}`;
 }
 export async function searchSessions(query, limit = 10, sinceDays) {
     const db = await getDb();
@@ -203,18 +215,12 @@ export async function searchSessions(query, limit = 10, sinceDays) {
         }
     }
     return rows.map((row) => {
-        const needle = firstSnippetNeedle(query, row.content);
-        const start = Math.max(0, needle.index - 80);
-        const end = Math.min(row.content.length, needle.index + needle.length + 80);
-        const snippet = (start > 0 ? "..." : "") +
-            row.content.slice(start, end).replace(/\n/g, " ") +
-            (end < row.content.length ? "..." : "");
         return {
             session_id: row.session_id,
             turn_index: row.turn_index,
             role: row.role,
             timestamp: row.timestamp,
-            snippet,
+            snippet: buildSafeSnippet(query, row.content),
             rank: row.fts_rank,
         };
     });

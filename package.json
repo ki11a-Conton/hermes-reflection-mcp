@@ -1,6 +1,6 @@
 {
   "name": "hermes-reflection-mcp",
-  "version": "19.3.0",
+  "version": "19.4.1",
   "description": "Hermes-inspired local reflection, heuristic, memory, and session MCP server",
   "type": "module",
   "main": "dist/index.js",
@@ -16,6 +16,8 @@
     "scripts/regression-test.mjs",
     "scripts/v19.3-regression-test.mjs",
     "scripts/v19.3-integration-test.mjs",
+    "scripts/v19.4-regression-test.mjs",
+    "scripts/v19.4.1-regression-test.mjs",
     "scripts/background-worker-child.mjs",
     "index.ts",
     "storage.ts",
@@ -40,6 +42,8 @@
     "test:regressions": "npm run build && node scripts/regression-test.mjs",
     "test:concurrency": "node scripts/concurrency-test.mjs && node scripts/cross-process-concurrency-test.mjs",
     "test:v19.3": "npm run build && node scripts/v19.3-regression-test.mjs && node scripts/v19.3-integration-test.mjs",
+    "test:v19.4": "npm run build && node scripts/v19.4-regression-test.mjs",
+    "test:v19.4.1": "npm run build && node scripts/v19.4.1-regression-test.mjs",
     "start": "node dist/index.js"
   },
   "dependencies": {

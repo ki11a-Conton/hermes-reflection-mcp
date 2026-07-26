@@ -16,6 +16,19 @@ async function callJson(client, name, args) {
   return JSON.parse(resultText(result));
 }
 
+function assertNoLoneSurrogates(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      assert.ok(next >= 0xdc00 && next <= 0xdfff, `lone high surrogate at ${index}`);
+      index += 1;
+    } else {
+      assert.ok(!(code >= 0xdc00 && code <= 0xdfff), `lone low surrogate at ${index}`);
+    }
+  }
+}
+
 async function testMcpIntegration() {
   const home = await mkdtemp(join(tmpdir(), "hermes-v19.3-integration-"));
   const transport = new StdioClientTransport({
@@ -82,6 +95,38 @@ async function testMcpIntegration() {
     });
     assert.equal(ended.event, "end");
     assert.equal(ended.background_lifecycle.enabled, true);
+
+    const neighbor = `neighbor needleword https://example.test/?code=neighbor-code&state=public ${"🙂".repeat(1_500)}`;
+    const anchor = `anchor https://token-user@example.test/path?signature=anchor-signature&state=public ${"界".repeat(5_000)}`;
+    for (const [role, content] of [["user", neighbor], ["assistant", anchor], ["user", neighbor]]) {
+      const appended = await client.callTool({
+        name: "append_session_turn",
+        arguments: { session_id: "bounded-session", role, content },
+      });
+      assert.equal(appended.isError, undefined, resultText(appended));
+    }
+
+    const bounded = await callJson(client, "scroll_session_context", {
+      session_id: "bounded-session",
+      around_turn_index: 1,
+      window: 1,
+    });
+    assert.ok(Array.from(bounded.turns[0].content).length <= 1_200);
+    assert.ok(Array.from(bounded.turns[1].content).length <= 4_000);
+    assert.ok(Array.from(bounded.turns[2].content).length <= 1_200);
+    assert.equal(bounded.turns[1].content_truncated, true);
+    assert.ok(bounded.turns[1].original_content_chars > 5_000);
+    assert.doesNotMatch(JSON.stringify(bounded), /neighbor-code|token-user|anchor-signature/);
+    assert.match(JSON.stringify(bounded), /state=public/);
+    bounded.turns.forEach((item) => assertNoLoneSurrogates(item.content));
+
+    const searched = await client.callTool({
+      name: "search_sessions",
+      arguments: { query: "needleword", limit: 10 },
+    });
+    assert.equal(searched.isError, undefined, resultText(searched));
+    assert.doesNotMatch(resultText(searched), /neighbor-code/);
+    assert.match(resultText(searched), /state=public/);
   } finally {
     await client.close().catch(() => undefined);
     await transport.close().catch(() => undefined);

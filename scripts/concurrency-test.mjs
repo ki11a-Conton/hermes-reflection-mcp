@@ -31,8 +31,12 @@ const transport = new StdioClientTransport({
   command: "node",
   args: ["dist/index.js"],
   env: { ...process.env, HOME: tempHome, USERPROFILE: tempHome },
+  stderr: "pipe",
 });
 const client = new Client({ name: "hermes-concurrency", version: "1.0.0" });
+let serverStderr = "";
+transport.stderr?.setEncoding("utf8");
+transport.stderr?.on("data", (chunk) => { serverStderr += chunk; });
 
 try {
   await client.connect(transport);
@@ -80,6 +84,10 @@ try {
     (item) => item.session_id === "concurrency-session"
   ).length;
   assert(reflectionCount === 5, `expected 5 concurrent reflections, got ${reflectionCount}`);
+  assert(
+    !/background lifecycle notification failed|background_lifecycle\.json\.lock.*(?:EPERM|EACCES)/i.test(serverStderr),
+    `background lifecycle lock contention must not escape as an error:\n${serverStderr}`,
+  );
 
   console.log(`Hermes concurrency test passed with temporary HOME: ${tempHome}`);
 } finally {

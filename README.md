@@ -4,11 +4,11 @@ Local persistent reflection, heuristic, bounded memory, and session recall for C
 
 Chinese documentation: [README.zh-CN.md](README.zh-CN.md). Standalone guides: [readmeen.md](readmeen.md) and [readmecn.md](readmecn.md).
 
-## What v19.3.0 provides
+## What v19.4.1 provides
 
 Hermes Reflection MCP is a local-first TypeScript MCP server with 28 public tools. It stores structured task reflections, reusable heuristics, bounded Memory Board and User Profile entries, searchable session turns, frozen memory snapshots, open questions, and import/export data.
 
-Version 19.3.0 adds opt-in OpenAI-compatible LLM review, a durable fenced background lifecycle, snapshot fingerprints, non-recursive compaction handoffs, bounded shutdown, and safer simultaneous SQLite startup. The existing 28-tool contract and v19.2 data remain compatible.
+Version 19.4.1 strictly validates persisted background lifecycle state, reclaims expired leases regardless of a live old PID, and may reclaim an unexpired same-host lease only when its PID is confirmed dead. Long reviews immediately and periodically renew the exact owner/fencing-token row; transient renewal errors are bounded by the last confirmed expiry, and shutdown lets the active run quiesce before releasing that original fence. The v19.4 fail-closed stores and multi-user handoff, v19.3 strict redaction, opt-in LLM/background lifecycle, 28-tool contract, and existing data remain compatible.
 
 ## Safety and trust boundaries
 
@@ -18,6 +18,7 @@ Version 19.3.0 adds opt-in OpenAI-compatible LLM review, a durable fenced backgr
 - Snapshot mode is explicit and fails closed when the requested session snapshot does not exist.
 - Compaction output is historical reference only; it cannot control a host application's context window.
 - Deterministic review remains the default. LLM review transmits only bounded redacted reflection fields and requires separate explicit provider configuration; it never uses Codex login credentials.
+- Raw reflections and SQLite turns remain available for explicit audit/export. Strict URL redaction is applied to historical output, automatic heuristic derivation, and provider-bound text rather than silently rewriting source records.
 - The background scheduler and background auto-apply are separate opt-ins. Neither path modifies skills or generates Memory Board/User Profile candidates.
 - Threat scans inspect raw stored entries, while normal rendering masks suspicious content.
 - Destructive reset still requires an explicit confirmation argument.
@@ -62,7 +63,7 @@ Restart Codex Desktop after changing the configuration. See [INSTALL_HERMES_MCP.
 | Write approval | <code>list_pending_mutations</code>, <code>approve_pending_mutation</code> |
 | Data management | <code>export_data</code>, <code>import_data</code>, <code>clear_data</code> |
 
-Tools not in this table are not part of the v19.3.0 public contract; direct calls to removed names return an MCP error.
+Tools not in this table are not part of the v19.4.1 public contract; direct calls to removed names return an MCP error.
 
 ## Recommended workflow
 
@@ -88,21 +89,21 @@ To read a snapshot, call the relevant read tool with <code>mode:"snapshot"</code
 
 ## Session search and compaction handoff
 
-Session turns exist only when a client explicitly calls <code>append_session_turn</code>. Search uses a local better-sqlite3 FTS index, and scrolling retrieves a bounded window around a turn index.
+Session turns exist only when a client explicitly calls <code>append_session_turn</code>. Search uses a local better-sqlite3 FTS index. Historical search snippets are strictly redacted before slicing. Scroll keeps the existing window semantics while returning at most 4,000 Unicode code points for the anchor and 1,200 for each neighboring turn; truncated turns report optional <code>content_truncated</code> and <code>original_content_chars</code> metadata.
 
-<code>compact_session_context</code> deterministically combines bounded stored turns and reflections into a redacted handoff beginning with a reference-only marker. It preserves the newest stored user and assistant anchors and uses historical headings from the current Hermes Agent design. It does not invoke a model, write data, or compact Codex itself.
+<code>compact_session_context</code> deterministically combines bounded stored turns and reflections into a strictly redacted handoff beginning with a reference-only marker. It preserves the newest nonblank stored user and assistant anchors and, with <code>preserve_recent_user_turns</code> (1-5, default 3), retains earlier genuine user anchors when the character budget permits. It does not invoke a model, write data, or compact Codex itself.
 
 ## Reflection and background review
 
 <code>reflect_on_task</code> stores structured outcomes, task state, lessons, open questions, and optional tool/world-model observations. Safe lessons may become reusable heuristics.
 
-<code>trigger_background_review</code> reviews at most 10 recent or 200 full-scope reflections and emits at most 50 heuristic candidates. Preview is the default. Automatic apply uses one storage transaction and returns heuristic ids for audit. Suspicious candidates are masked and skipped.
+<code>trigger_background_review</code> reviews at most 10 recent or 200 full-scope reflections and emits at most 50 heuristic candidates. Preview is the default. Automatic apply uses one storage transaction and returns heuristic ids for audit. Candidates are strictly credential-redacted before threat checks and persistence; suspicious candidates are masked and skipped. Its unchanged-source fingerprint covers stable, redacted review-relevant content rather than only ids and timestamps.
 
 Use <code>review_mode:"llm"</code> for the configured provider, <code>review_mode:"auto"</code> for LLM-with-deterministic-fallback, or <code>action:"status"</code> for sanitized readiness and scheduler state. LLM output must be strict schema-valid JSON; authentication failures, rate limits, timeouts, redirects, oversized responses, and suspicious candidates fail safely.
 
 ### Optional automatic review
 
-The scheduler starts only when <code>HERMES_REFLECTION_BACKGROUND_ENABLED=true</code>. Its timer is unreferenced, session state is persisted in <code>background_lifecycle.json</code>, and a cross-process lease/fencing token prevents overlapping Codex windows. Automatic persistence remains off unless <code>HERMES_REFLECTION_BACKGROUND_AUTO_APPLY=true</code>.
+The scheduler starts only when <code>HERMES_REFLECTION_BACKGROUND_ENABLED=true</code>. Its timers are unreferenced, session state is strictly schema-validated in <code>background_lifecycle.json</code>, and a cross-process lease/fencing token prevents overlapping Codex windows. Long reviews renew only their exact owner/token lease; they stop before commit if ownership is lost or renewal cannot be confirmed before expiry. Automatic persistence remains off unless <code>HERMES_REFLECTION_BACKGROUND_AUTO_APPLY=true</code>.
 
 LLM review additionally requires <code>HERMES_REFLECTION_LLM_ENABLED=true</code>, <code>HERMES_REFLECTION_LLM_BASE_URL</code>, <code>HERMES_REFLECTION_LLM_MODEL</code>, and <code>HERMES_REFLECTION_LLM_API_KEY</code>. Non-loopback endpoints must use HTTPS. Keep the key only in the MCP process environment and never store it in reflections or configuration committed to source control.
 
@@ -124,7 +125,7 @@ Runtime data is stored outside the package:
 ~/.hermes-reflection/background_lifecycle.json
 ~~~
 
-Back up this directory only when you intend to preserve user data. Do not put it in a public release. Version 19.3.0 reads existing v19.2.0 and v19.1.0 stores without a destructive migration.
+Back up this directory only when you intend to preserve user data. Do not put it in a public release. Version 19.4.1 reads valid v19.4/v19.3/v19.2/v19.1 stores without a destructive migration. Unsupported, structurally invalid, or corrupt authoritative state is preserved with one <code>.corrupt.&lt;digest&gt;.bak</code> evidence copy and the operation fails closed; inspect or restore a verified backup instead of deleting the active file blindly.
 
 ## Development and verification
 
@@ -138,6 +139,8 @@ node scripts\smoke.mjs
 node scripts\concurrency-test.mjs
 node scripts\cross-process-concurrency-test.mjs
 npm run test:v19.3
+npm run test:v19.4
+npm run test:v19.4.1
 npm audit --omit=dev
 ~~~
 

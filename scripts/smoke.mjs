@@ -111,7 +111,7 @@ async function runWriteApprovalRegression() {
       }],
       affordance_gaps: [],
       heuristics: [],
-      version: "19.3.0",
+      version: "19.4.1",
       memory_board: { entries: [], char_limit: 2200, used_chars: 0 },
       user_profile: { entries: [], char_limit: 1800, used_chars: 0 },
       metadata: {
@@ -241,11 +241,12 @@ try {
   await client.connect(transport);
 
   const serverVersion = client.getServerVersion();
-  assert(serverVersion?.version === "19.3.0", `Expected server version 19.3.0, got ${JSON.stringify(serverVersion)}.`);
+  assert(serverVersion?.version === "19.4.1", `Expected server version 19.4.1, got ${JSON.stringify(serverVersion)}.`);
 
   const { tools } = await client.listTools();
   const toolNames = tools.map((tool) => tool.name);
   const toolNameSet = new Set(toolNames);
+  assert(expectedTools.length === 28, `Expected the public allowlist to contain 28 tools, got ${expectedTools.length}.`);
   assert(tools.length === expectedTools.length, `Expected ${expectedTools.length} tools, got ${tools.length}: ${toolNames.join(", ")}`);
   for (const name of expectedTools) {
     assert(toolNameSet.has(name), `Missing expected tool: ${name}`);
@@ -651,7 +652,7 @@ try {
   assertIncludes(text(await call(client, "clear_data", { collection: "all", confirm: true })), "Cleared", "clear_data(all) should clear the store.");
   assertIncludes(text(await call(client, "memory_board_read")), "(empty)", "memory_board_read should be empty after clear_data(all).");
 
-  console.log("Smoke passed for hermes-reflection-mcp v19.3.0 core tool surface.");
+  console.log("Smoke passed for hermes-reflection-mcp v19.4.1 core tool surface.");
 } finally {
   await client.close().catch(() => {});
   process.env.HOME = originalHome;

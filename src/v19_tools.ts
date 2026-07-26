@@ -17,10 +17,11 @@ import {
   scanHeuristicThreats,
 } from "../storage.js";
 import { listSessionTurns, listSessionTurnsAround, SESSION_STORAGE_UNAVAILABLE } from "../session_storage.js";
-import type { ReflectionFrame } from "../types.js";
+import type { ReflectionFrame, SessionTurn } from "../types.js";
 import { buildCompactionHandoff } from "./compaction_handoff.js";
 import { getReviewReadinessStatus, runReview } from "./review_engine.js";
 import { backgroundLifecycle } from "./background_lifecycle.js";
+import { codePointLength, redactSensitiveText, truncateCodePoints } from "./redaction.js";
 
 // ============================================================
 // Schemas
@@ -63,6 +64,7 @@ export const CompactSessionContextSchema = z.object({
   session_id: z.string().min(1).max(200),
   max_turns: z.number().int().min(1).max(200).default(40),
   max_chars: z.number().int().min(500).max(20000).default(6000),
+  preserve_recent_user_turns: z.number().int().min(1).max(5).default(3),
 });
 
 // ============================================================
@@ -199,6 +201,18 @@ export async function handleScanMemoryThreats(args: unknown): Promise<string> {
 /**
  * scroll_session_context - Scroll session messages around anchor
  */
+function boundedHistoricalTurn(turn: SessionTurn, maxChars: number): SessionTurn {
+  const originalLength = codePointLength(turn.content);
+  const safe = redactSensitiveText(turn.content, { strictHistorical: true });
+  if (codePointLength(safe) <= maxChars) return { ...turn, content: safe };
+  return {
+    ...turn,
+    content: truncateCodePoints(safe, maxChars),
+    content_truncated: true,
+    original_content_chars: originalLength,
+  };
+}
+
 export async function handleScrollSessionContext(args: any): Promise<string> {
   const { session_id, around_turn_index, window } = ScrollSessionContextSchema.parse(args);
 
@@ -212,16 +226,19 @@ export async function handleScrollSessionContext(args: any): Promise<string> {
     }, null, 2);
   }
 
+  const boundedTurns = windowResult.turns.map((turn) =>
+    boundedHistoricalTurn(turn, turn.turn_index === around_turn_index ? 4_000 : 1_200));
+
   return JSON.stringify({
     success: true,
     session_id,
     anchor_turn_index: around_turn_index,
     window,
-    turns: windowResult.turns,
+    turns: boundedTurns,
     has_before: windowResult.has_before,
     has_after: windowResult.has_after,
     available_range: windowResult.available_range,
-    message: windowResult.turns.length === 0 ? "No turns found for session." : undefined,
+    message: boundedTurns.length === 0 ? "No turns found for session." : undefined,
   }, null, 2);
 }
 
@@ -230,7 +247,7 @@ export async function handleScrollSessionContext(args: any): Promise<string> {
  * client integration. It does not control Codex's actual context window.
  */
 export async function handleCompactSessionContext(args: unknown): Promise<string> {
-  const { session_id, max_turns, max_chars } = CompactSessionContextSchema.parse(args);
+  const { session_id, max_turns, max_chars, preserve_recent_user_turns } = CompactSessionContextSchema.parse(args);
   // Load the bounded session-tool maximum so the builder can report how many
   // loaded turns were omitted by the caller's smaller max_turns window.
   const turns = await listSessionTurns(session_id, 200);
@@ -238,7 +255,13 @@ export async function handleCompactSessionContext(args: unknown): Promise<string
     return JSON.stringify({ success: false, error: SESSION_STORAGE_UNAVAILABLE, session_id }, null, 2);
   }
   const reflections = await getSessionReflections(session_id, 50);
-  const result = buildCompactionHandoff(turns, reflections, max_turns, max_chars);
+  const result = buildCompactionHandoff(
+    turns,
+    reflections,
+    max_turns,
+    max_chars,
+    preserve_recent_user_turns,
+  );
   return JSON.stringify({
     success: true,
     session_id,

@@ -1,4 +1,4 @@
-# Hermes Reflection MCP v19.3.0 for Codex Desktop.
+# Hermes Reflection MCP v19.3.1 for Codex Desktop.
 # Local stdio server exposing 28 implemented tools. Lifecycle hooks and
 # session-turn capture require explicit client calls; they are not automatic.
 # The server emits instructions during MCP initialize, so the config-level

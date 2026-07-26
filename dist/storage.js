@@ -1,19 +1,21 @@
 // ============================================================
 // Hermes Reflection MCP persistent storage
 // ============================================================
-import { appendFile, copyFile, open, readFile, rename, writeFile, mkdir, rm, stat } from "fs/promises";
+import { appendFile, copyFile, open, rename, writeFile, mkdir, rm, stat } from "fs/promises";
 import { existsSync } from "fs";
 import { randomUUID } from "crypto";
 import { homedir } from "os";
 import { join } from "path";
 import { scanForThreats, firstThreatMessage, containsInvisibleChars, MAX_SCAN_CHARS } from "./src/threat_patterns.js";
 import { withFileLock } from "./src/file_lock.js";
+import { redactSensitiveText } from "./src/redaction.js";
+import { AuthoritativeStateError, preserveCorruptUtf8, readAuthoritativeJson, readAuthoritativeUtf8, } from "./src/authoritative_state.js";
 const WINDOWS_RENAME_RETRIES = 5;
 export const STORE_DIR = join(homedir(), ".hermes-reflection");
 const STORE_PATH = join(STORE_DIR, "store.json");
 const REFLECTIONS_PATH = join(STORE_DIR, "reflections.jsonl");
 const RESOLVED_QUESTIONS_PATH = join(STORE_DIR, "resolved_questions.json");
-export const VERSION = "19.3.0";
+export const VERSION = "19.4.0";
 export const HEURISTIC_DEDUP_THRESHOLD = 0.75;
 const WORLD_FACT_DEDUP_THRESHOLD = 0.65;
 export const HEURISTIC_MAX_COUNT = 500;
@@ -349,50 +351,51 @@ async function ensureStoreDir() {
 }
 export async function loadStore() {
     await ensureStoreDir();
-    if (!existsSync(STORE_PATH)) {
+    const loaded = await readAuthoritativeJson(STORE_PATH, "Hermes Reflection main store");
+    if (!loaded.exists) {
         const store = emptyStore();
         store.reflections = await loadReflections();
         reconcileSessionCounters(store, true);
         return store;
     }
-    try {
-        const raw = await readFile(STORE_PATH, "utf-8");
-        const parsed = JSON.parse(raw);
-        const legacyReflections = asArray(parsed.reflections).map((reflection) => normalizeReflectionFrame(reflection));
-        if (legacyReflections.length > 0) {
-            if (!existsSync(REFLECTIONS_PATH)) {
-                await replaceReflectionsFile(legacyReflections);
-            }
-            await writeStoreIndex({
-                sessions: normalizeSessionsRecord(recordValue(parsed.sessions)),
-                reflections: [],
-                affordance_gaps: asArray(parsed.affordance_gaps)
-                    .map((gap) => normalizeAffordanceGapRecord(gap)),
-                heuristics: asArray(parsed.heuristics).map(normalizeHeuristicRecord),
-                version: typeof parsed.version === "string" ? parsed.version : VERSION,
-                memory_board: normalizeMemoryBoard(parsed.memory_board),
-                user_profile: normalizeMemoryBoard(parsed.user_profile, 1800),
-                metadata: normalizeStoreMetadata(parsed.metadata),
-            }, false);
+    if (loaded.value === null || typeof loaded.value !== "object" || Array.isArray(loaded.value)) {
+        const backup = await preserveCorruptUtf8(STORE_PATH, loaded.raw);
+        throw new AuthoritativeStateError(`Refusing to continue: Hermes Reflection main store store.json must contain an object. Evidence backup: ${backup}. Nothing was changed.`);
+    }
+    const parsed = loaded.value;
+    const legacyReflections = asArray(parsed.reflections).map((reflection) => normalizeReflectionFrame(reflection));
+    // Validate the authoritative JSONL snapshot before any legacy migration
+    // writes. A corrupt sidecar must not cause store.json to be cleared first.
+    const reflections = await loadReflections(legacyReflections);
+    if (legacyReflections.length > 0) {
+        if (!existsSync(REFLECTIONS_PATH)) {
+            await replaceReflectionsFile(legacyReflections);
         }
-        const store = {
+        await writeStoreIndex({
             sessions: normalizeSessionsRecord(recordValue(parsed.sessions)),
-            reflections: await loadReflections(legacyReflections),
-            affordance_gaps: uniqueById(asArray(parsed.affordance_gaps)
-                .map((gap) => normalizeAffordanceGapRecord(gap))),
-            heuristics: uniqueById(asArray(parsed.heuristics).map(normalizeHeuristicRecord)),
+            reflections: [],
+            affordance_gaps: asArray(parsed.affordance_gaps)
+                .map((gap) => normalizeAffordanceGapRecord(gap)),
+            heuristics: asArray(parsed.heuristics).map(normalizeHeuristicRecord),
             version: typeof parsed.version === "string" ? parsed.version : VERSION,
             memory_board: normalizeMemoryBoard(parsed.memory_board),
             user_profile: normalizeMemoryBoard(parsed.user_profile, 1800),
             metadata: normalizeStoreMetadata(parsed.metadata),
-        };
-        reconcileSessionCounters(store, false);
-        return store;
+        }, false);
     }
-    catch (error) {
-        await preserveCorruptStore(error);
-        return emptyStore();
-    }
+    const store = {
+        sessions: normalizeSessionsRecord(recordValue(parsed.sessions)),
+        reflections,
+        affordance_gaps: uniqueById(asArray(parsed.affordance_gaps)
+            .map((gap) => normalizeAffordanceGapRecord(gap))),
+        heuristics: uniqueById(asArray(parsed.heuristics).map(normalizeHeuristicRecord)),
+        version: typeof parsed.version === "string" ? parsed.version : VERSION,
+        memory_board: normalizeMemoryBoard(parsed.memory_board),
+        user_profile: normalizeMemoryBoard(parsed.user_profile, 1800),
+        metadata: normalizeStoreMetadata(parsed.metadata),
+    };
+    reconcileSessionCounters(store, false);
+    return store;
 }
 function emptyStore() {
     const now = new Date().toISOString();
@@ -729,35 +732,8 @@ async function replaceFileAtomically(tmpPath, targetPath) {
             }
         }
     }
-    // Phase 2: if still failing with retryable Windows errors, delete target
-    // first, then retry the rename up to WINDOWS_RENAME_RETRIES times.
-    if (isWindowsRenameRetryable(lastError)) {
-        let targetRemoved = false;
-        try {
-            await rm(targetPath, { force: true });
-            targetRemoved = true;
-        }
-        catch (error) {
-            lastError = error;
-        }
-        if (targetRemoved) {
-            for (let attempt = 0; attempt < WINDOWS_RENAME_RETRIES; attempt++) {
-                try {
-                    await rename(tmpPath, targetPath);
-                    return;
-                }
-                catch (error) {
-                    lastError = error;
-                    if (!isWindowsRenameRetryable(error))
-                        break;
-                    if (attempt < WINDOWS_RENAME_RETRIES - 1) {
-                        await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1)));
-                    }
-                }
-            }
-        }
-    }
-    // Cleanup: delete temp file only; never remove a valid target
+    // Cleanup: delete the temp file only. A failed replacement must never
+    // delete the last known-good target before the new file is durable.
     try {
         await rm(tmpPath, { force: true });
     }
@@ -768,6 +744,10 @@ async function replaceFileAtomically(tmpPath, targetPath) {
     const detail = lastError instanceof Error ? lastError.message : String(lastError);
     throw new Error(`${ctx}: ${detail}`);
 }
+/** Narrow module-level test seam; this is not exposed as an MCP tool. */
+export async function replaceFileAtomicallyForTest(tmpPath, targetPath) {
+    return replaceFileAtomically(tmpPath, targetPath);
+}
 function isWindowsRenameRetryable(error) {
     if (!(error instanceof Error))
         return false;
@@ -776,44 +756,32 @@ function isWindowsRenameRetryable(error) {
 }
 async function loadReflections(fallback = []) {
     const normalizedFallback = fallback.map((reflection) => normalizeReflectionFrame(reflection));
-    if (!existsSync(REFLECTIONS_PATH))
+    const loaded = await readAuthoritativeUtf8(REFLECTIONS_PATH);
+    if (!loaded.exists)
         return normalizedFallback;
-    const raw = await readFile(REFLECTIONS_PATH, "utf-8");
-    const lines = raw
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean);
     const results = [];
-    let skipped = 0;
-    for (const line of lines) {
+    for (const [index, line] of loaded.raw.split(/\r?\n/).entries()) {
+        if (!line.trim())
+            continue;
         try {
             results.push(normalizeReflectionFrame(JSON.parse(line)));
         }
-        catch {
-            skipped++;
-            console.error(`[hermes] skipped corrupt reflection line (${skipped} total)`);
+        catch (error) {
+            const backup = await preserveCorruptUtf8(REFLECTIONS_PATH, loaded.raw);
+            throw new AuthoritativeStateError(`Refusing to continue: reflections.jsonl line ${index + 1} cannot be parsed. Evidence backup: ${backup}. Nothing was changed.`, { cause: error });
         }
-    }
-    if (skipped > 0) {
-        await preservePartialReflectionsFile();
-        console.error(`[hermes] loadReflections: ${results.length} ok, ${skipped} corrupt lines skipped.`);
     }
     return results.length > 0 ? uniqueById(results) : uniqueById(normalizedFallback);
 }
 function parseReflectionLines(lines) {
     const results = [];
-    let skipped = 0;
     for (const line of lines) {
         try {
             results.push(normalizeReflectionFrame(JSON.parse(line)));
         }
-        catch {
-            skipped++;
-            console.error(`[hermes] skipped corrupt reflection line (${skipped} total)`);
+        catch (error) {
+            throw new AuthoritativeStateError("Recent reflection chunk contains invalid JSON; validating the full authoritative file.", { cause: error });
         }
-    }
-    if (skipped > 0) {
-        console.error(`[hermes] parseReflectionLines: ${results.length} ok, ${skipped} corrupt lines skipped.`);
     }
     return uniqueById(results);
 }
@@ -825,7 +793,15 @@ async function loadRecentReflections(limit) {
         return [];
     let chunkSize = Math.max(limit * 2048, 8192);
     while (chunkSize < fileStat.size) {
-        const parsed = await readRecentReflectionChunk(fileStat.size, chunkSize);
+        let parsed;
+        try {
+            parsed = await readRecentReflectionChunk(fileStat.size, chunkSize);
+        }
+        catch {
+            // A fast-path parse failure must not be skipped. Re-read the complete
+            // authoritative file so the exact corrupt line is backed up and reported.
+            return (await loadReflections()).slice(-limit).reverse();
+        }
         if (parsed.length >= limit)
             return parsed.slice(-limit).reverse();
         chunkSize *= 2;
@@ -874,37 +850,6 @@ async function persistStoreAfterMutation(store, reflectionHint, previousReflecti
         await appendReflectionsFile(store.reflections.slice(previousReflectionCount));
     }
     await writeStoreIndex(store, true);
-}
-async function preserveCorruptStore(error) {
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const suffix = `corrupt.${stamp}.${randomUUID()}`;
-    const storeBackupPath = join(STORE_DIR, `store.json.${suffix}`);
-    const reflectionsBackupPath = join(STORE_DIR, `reflections.jsonl.${suffix}`);
-    try {
-        await copyFile(STORE_PATH, storeBackupPath);
-    }
-    catch (copyError) {
-        console.error("Hermes Reflection store was invalid JSON and could not be copied.", copyError);
-    }
-    if (existsSync(REFLECTIONS_PATH)) {
-        try {
-            await copyFile(REFLECTIONS_PATH, reflectionsBackupPath);
-        }
-        catch (copyError) {
-            console.error("Hermes Reflection reflections.jsonl could not be copied during corrupt-store backup.", copyError);
-        }
-    }
-    console.error(`[hermes] corrupt store preserved with suffix .${suffix}`, error);
-}
-async function preservePartialReflectionsFile() {
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const backupPath = join(STORE_DIR, `reflections.jsonl.partial.${stamp}.${randomUUID()}`);
-    try {
-        await copyFile(REFLECTIONS_PATH, backupPath);
-    }
-    catch (copyError) {
-        console.error("[hermes] corrupt reflections.jsonl backup failed.", copyError);
-    }
 }
 async function mutateStore(mutator, reflectionHint = "none", operationName, operationPayload) {
     const run = mutationQueue.then(() => withFileLock(STORE_PATH, async () => {
@@ -1757,6 +1702,12 @@ export async function upsertHeuristicsBatch(inputs) {
         return saved.map((item) => sanitizeHeuristicForOutput(item));
     });
 }
+function safeAutomaticLesson(lesson) {
+    const redacted = redactSensitiveText(lesson, { strictHistorical: true }).trim();
+    if (!redacted || firstHeuristicThreatMessage(redacted, "strict") !== null)
+        return null;
+    return redacted;
+}
 export async function saveReflectionAndHeuristics(reflection, lessons, domain, sourceTask, confidence, tags, operationName) {
     return mutateStore((store) => {
         const session = ensureSession(store, reflection.session_id);
@@ -1767,7 +1718,9 @@ export async function saveReflectionAndHeuristics(reflection, lessons, domain, s
             if (isNew)
                 session.affordance_gap_count++;
         }
-        const safeLessons = lessons.filter((lesson) => firstHeuristicThreatMessage(lesson, "strict") === null);
+        const safeLessons = lessons
+            .map(safeAutomaticLesson)
+            .filter((lesson) => lesson !== null);
         for (const lesson of safeLessons) {
             upsertHeuristicMut(store, {
                 domain,
@@ -1796,7 +1749,9 @@ function saveReflectionAndHeuristicsMut(store, input) {
         if (isNew)
             session.affordance_gap_count++;
     }
-    const safeLessons = input.lessons.filter((lesson) => firstHeuristicThreatMessage(lesson, "strict") === null);
+    const safeLessons = input.lessons
+        .map(safeAutomaticLesson)
+        .filter((lesson) => lesson !== null);
     for (const lesson of safeLessons) {
         upsertHeuristicMut(store, {
             domain: input.domain,
@@ -3290,33 +3245,28 @@ function resolvedQuestionKey(reflectionId, questionIndex) {
     return `${reflectionId}:${questionIndex}`;
 }
 async function loadResolvedQuestions() {
-    if (!existsSync(RESOLVED_QUESTIONS_PATH))
+    const loaded = await readAuthoritativeJson(RESOLVED_QUESTIONS_PATH, "resolved-question overlay");
+    if (!loaded.exists)
         return {};
-    try {
-        const parsed = JSON.parse(await readFile(RESOLVED_QUESTIONS_PATH, "utf-8"));
-        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-            console.error("[hermes] resolved_questions.json must contain an object; ignoring malformed overlay.");
-            return {};
-        }
-        const now = new Date().toISOString();
-        const normalized = Object.create(null);
-        for (const [key, rawEntry] of Object.entries(parsed)) {
-            if (!key.includes(":"))
-                continue;
-            const entry = recordValue(rawEntry);
-            normalized[key] = {
-                resolved_at: normalizeIsoTimestamp(entry.resolved_at, now),
-                ...(typeof entry.resolved_by === "string" && entry.resolved_by
-                    ? { resolved_by: entry.resolved_by }
-                    : {}),
-            };
-        }
-        return normalized;
+    const parsed = loaded.value;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        const backup = await preserveCorruptUtf8(RESOLVED_QUESTIONS_PATH, loaded.raw);
+        throw new AuthoritativeStateError(`Refusing to continue: resolved_questions.json must contain an object. Evidence backup: ${backup}. Nothing was changed.`);
     }
-    catch (error) {
-        console.error("[hermes] resolved_questions.json is invalid; ignoring overlay.", error);
-        return {};
+    const now = new Date().toISOString();
+    const normalized = Object.create(null);
+    for (const [key, rawEntry] of Object.entries(parsed)) {
+        if (!key.includes(":"))
+            continue;
+        const entry = recordValue(rawEntry);
+        normalized[key] = {
+            resolved_at: normalizeIsoTimestamp(entry.resolved_at, now),
+            ...(typeof entry.resolved_by === "string" && entry.resolved_by
+                ? { resolved_by: entry.resolved_by }
+                : {}),
+        };
     }
+    return normalized;
 }
 async function saveResolvedQuestions(index) {
     await ensureStoreDir();

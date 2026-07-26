@@ -103,7 +103,7 @@ import {
 import { safeJsonPreview } from "./src/redaction.js";
 import { backgroundLifecycle } from "./src/background_lifecycle.js";
 
-const SERVER_VERSION = "19.3.0";
+const SERVER_VERSION = "19.4.1";
 const EXPORT_INLINE_LIMIT_BYTES = 500 * 1024;
 
 const SERVER_INSTRUCTIONS = `Hermes Reflection MCP provides persistent reflection memory with Codex Desktop integration.
@@ -119,12 +119,13 @@ Core Workflow:
 8. Use export_data / import_data to backup or transfer data. Use clear_data (requires confirm:true) to reset collections.
 9. Node.js 20 or newer is required for the supported better-sqlite3 session tools.
 
-v19.3.0 Client Integration Features:
+v19.4.1 Client Integration Features:
 - capture_memory_snapshot and session_lifecycle_hook require explicit client calls. Installing this MCP does not make Codex Desktop invoke them automatically.
 - append_session_turn is also an explicit client call; only turns submitted to it are indexed.
 - Snapshot reads require mode:"snapshot" together with the matching session_id. Missing snapshots return an error instead of falling back to live memory.
 - compact_session_context creates a deterministic reference-only historical handoff. It does not control Codex's actual context window or compaction.
 - trigger_background_review defaults to local deterministic preview. Explicitly configured LLM review and an opt-in fenced background scheduler are available; neither writes skills nor generates Memory Board/User Profile candidates.
+- Background lifecycle state is schema-validated fail-closed. Long reviews renew the exact owner/token lease, and shutdown never creates or releases a replacement fence.
 - When write approval is enabled, use list_pending_mutations and approve_pending_mutation to inspect, approve/replay, or reject queued writes.
 - scan_memory_threats: Audit memory board or user profile for injection/exfiltration patterns. Use scope='strict' for comprehensive security audit.
 - scroll_session_context: Navigate session history around anchor points with pagination.
@@ -1596,6 +1597,7 @@ Optional context_notes is stored but not used for heuristic extraction or search
         session_id: { type: "string", minLength: 1, maxLength: 200 },
         max_turns: { type: "number", integer: true, minimum: 1, maximum: 200, default: 40 },
         max_chars: { type: "number", integer: true, minimum: 500, maximum: 20000, default: 6000 },
+        preserve_recent_user_turns: { type: "number", integer: true, minimum: 1, maximum: 5, default: 3 },
       },
     },
   },

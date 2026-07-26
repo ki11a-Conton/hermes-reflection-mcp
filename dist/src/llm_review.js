@@ -96,15 +96,19 @@ function readConfig() {
 export function getLlmReviewReadiness() {
     return readConfig().readiness;
 }
-function outboundText(value, max) {
-    let safe = redactSensitiveText(value)
+function strictBoundedText(value, max) {
+    const safe = redactSensitiveText(value, { strictHistorical: true })
         .replace(/\b[A-Za-z]:\\+Users\\+<USER>\\+[^\s"'<>]+/g, "[REDACTED PATH]")
         .replace(/\b[A-Za-z]:\\[^\s"'<>]+/g, "[REDACTED PATH]")
         .replace(/(?:^|\s)\/(?:home|Users)\/[^\s"'<>]+/g, " [REDACTED PATH]");
-    if (scanForThreats(safe, "strict").length > 0)
-        safe = "[BLOCKED: unsafe reflection text omitted]";
     const points = Array.from(safe);
     return points.length > max ? `${points.slice(0, Math.max(0, max - 3)).join("")}...` : safe;
+}
+function outboundText(value, max) {
+    let safe = strictBoundedText(value, max);
+    if (scanForThreats(safe, "strict").length > 0)
+        safe = "[BLOCKED: unsafe reflection text omitted]";
+    return safe;
 }
 function reflectionForReview(reflection) {
     return {
@@ -282,19 +286,27 @@ export async function runLlmReview(reflections, options = {}) {
                 let skippedCandidates = 0;
                 const seen = new Set();
                 for (const item of output.candidates) {
-                    const normalized = item.heuristic.toLowerCase().replace(/\s+/g, " ").trim();
-                    if (seen.has(normalized) || scanForThreats(item.heuristic, "strict").length > 0) {
+                    const heuristic = strictBoundedText(item.heuristic, 1_000);
+                    const normalized = heuristic.toLowerCase().replace(/\s+/g, " ").trim();
+                    if (!normalized || seen.has(normalized) || scanForThreats(heuristic, "strict").length > 0) {
                         skippedCandidates += 1;
                         continue;
                     }
                     seen.add(normalized);
                     candidates.push({
-                        heuristic: item.heuristic,
-                        domain: item.domain,
+                        heuristic,
+                        domain: strictBoundedText(item.domain, 120),
                         confidence: item.confidence,
-                        tags: [...new Set([...item.tags, "llm-review"])],
+                        tags: [...new Set([
+                                ...item.tags.map((tag) => strictBoundedText(tag, 80)).filter(Boolean),
+                                "llm-review",
+                            ])],
                     });
                 }
+                const summary = outboundText(output.summary, 2_000);
+                const openQuestions = output.open_questions
+                    .map((question) => outboundText(question, 500))
+                    .filter(Boolean);
                 return {
                     success: true,
                     configured: true,
@@ -304,9 +316,9 @@ export async function runLlmReview(reflections, options = {}) {
                     source_reflection_ids: request.sourceIds,
                     source_fingerprint: request.fingerprint,
                     duration_ms: Date.now() - startedAt,
-                    summary: output.summary,
+                    summary,
                     candidates,
-                    open_questions: output.open_questions,
+                    open_questions: openQuestions,
                     skipped_candidates: skippedCandidates,
                 };
             }

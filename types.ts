@@ -159,6 +159,8 @@ export interface SessionTurn {
   role: "user" | "assistant";
   content: string;
   timestamp: string;
+  content_truncated?: boolean;
+  original_content_chars?: number;
 }
 
 export interface SessionMeta {
