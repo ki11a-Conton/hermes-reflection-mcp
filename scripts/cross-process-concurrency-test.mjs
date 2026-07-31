@@ -4,6 +4,7 @@ import { mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { withFileLock } from "../dist/src/file_lock.js";
+import { withSqliteContentionRetry } from "../dist/session_storage.js";
 
 const clientHomes = new WeakMap();
 
@@ -115,10 +116,37 @@ async function runLiveOwnerMetadataRegression(home) {
   assert(!acquired && timedOut, "an old lock file owned by a live PID must not be quarantined");
 }
 
+async function runSqliteContentionRetryRegression() {
+  let attempts = 0;
+  const result = await withSqliteContentionRetry(() => {
+    attempts += 1;
+    if (attempts < 3) {
+      const error = new Error("database is locked");
+      error.code = attempts === 1 ? "SQLITE_LOCKED" : "SQLITE_BUSY";
+      throw error;
+    }
+    return "committed";
+  }, { attempts: 4, base_delay_ms: 0, max_delay_ms: 0 });
+  assert(result === "committed" && attempts === 3, "SQLite lock contention must retry and eventually commit");
+
+  let fatalAttempts = 0;
+  let fatalPreserved = false;
+  try {
+    await withSqliteContentionRetry(() => {
+      fatalAttempts += 1;
+      throw new Error("not retryable");
+    }, { attempts: 4, base_delay_ms: 0, max_delay_ms: 0 });
+  } catch (error) {
+    fatalPreserved = error instanceof Error && error.message === "not retryable";
+  }
+  assert(fatalPreserved && fatalAttempts === 1, "non-lock SQLite failures must not be retried or rewritten");
+}
+
 const home = await mkdtemp(join(tmpdir(), "hermes-cross-process-"));
 const peers = [];
 
 try {
+  await runSqliteContentionRetryRegression();
   await runStaleOwnershipRegression(home);
   await runLiveOwnerMetadataRegression(home);
 

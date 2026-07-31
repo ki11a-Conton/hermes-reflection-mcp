@@ -30,6 +30,41 @@ let _closed = false;  // J1-fix: track explicit close to prevent leaked connecti
 const configuredRetryIntervalMs = Number.parseInt(process.env.HERMES_SESSION_RETRY_MS ?? "", 10);
 const RETRY_INTERVAL_MS = configuredRetryIntervalMs > 0 ? configuredRetryIntervalMs : 60_000;
 
+export interface SqliteContentionRetryOptions {
+  attempts?: number;
+  base_delay_ms?: number;
+  max_delay_ms?: number;
+}
+
+function sqliteErrorCode(error: unknown): string | undefined {
+  return error && typeof error === "object" && "code" in error
+    ? String((error as { code?: unknown }).code)
+    : undefined;
+}
+
+/** Retry a complete, rollback-safe SQLite transaction on cross-process lock contention. */
+export async function withSqliteContentionRetry<T>(
+  operation: () => T,
+  options: SqliteContentionRetryOptions = {},
+): Promise<T> {
+  const attempts = Math.max(1, Math.min(20, Math.trunc(options.attempts ?? 8)));
+  const baseDelayMs = Math.max(0, Math.min(1_000, Math.trunc(options.base_delay_ms ?? 15)));
+  const maxDelayMs = Math.max(baseDelayMs, Math.min(5_000, Math.trunc(options.max_delay_ms ?? 250)));
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return operation();
+    } catch (error) {
+      const retryable = /^SQLITE_(?:BUSY|LOCKED)$/.test(sqliteErrorCode(error) ?? "");
+      if (!retryable || attempt === attempts - 1) throw error;
+      const backoff = Math.min(maxDelayMs, baseDelayMs * (2 ** attempt));
+      const jitter = baseDelayMs === 0 ? 0 : (process.pid + attempt) % Math.max(2, baseDelayMs);
+      await new Promise((resolve) => setTimeout(resolve, backoff + jitter));
+    }
+  }
+  throw new Error("SQLite contention retry exhausted without a result");
+}
+
 async function getDb(): Promise<Database.Database | null> {
   if (_db) return _db;
   // J1-fix: if closeSessionStorage was called, don't create new connections
@@ -151,7 +186,7 @@ export async function appendSessionTurn(
       "INSERT INTO sessions_fts (session_id, turn_index, role, content, timestamp) VALUES (?, ?, ?, ?, ?)"
     ).run(sessionId, turnIndex, role, content, ts);
   });
-  tx();
+  await withSqliteContentionRetry(() => tx());
   return true;
 }
 

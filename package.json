@@ -73,7 +73,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "better-sqlite3": "^12.11.1",
+    "better-sqlite3": "12.9.0",
     "zod": "^3.22.0",
     "zod-to-json-schema": "3.25.2"
   },
