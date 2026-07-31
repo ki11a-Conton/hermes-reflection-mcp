@@ -142,6 +142,55 @@ async function runSqliteContentionRetryRegression() {
   assert(fatalPreserved && fatalAttempts === 1, "non-lock SQLite failures must not be retried or rewritten");
 }
 
+async function runSessionWriteLockRegression(home, client) {
+  // Warm the native module and schema first so this probe isolates the write
+  // serialization contract rather than measuring first-open initialization.
+  await call(client, "append_session_turn", {
+    session_id: "session-write-lock-warmup",
+    role: "user",
+    content: "warmup",
+  });
+
+  const sessionDb = join(home, ".hermes-reflection", "sessions.db");
+  let signalAcquired;
+  let releaseOwner;
+  const acquired = new Promise((resolve) => {
+    signalAcquired = resolve;
+  });
+  const release = new Promise((resolve) => {
+    releaseOwner = resolve;
+  });
+  const owner = withFileLock(sessionDb, async () => {
+    signalAcquired();
+    await release;
+  }, {
+    timeout_ms: 2_000,
+    retry_ms: 5,
+    stale_ms: 120_000,
+  });
+  await acquired;
+
+  let appendSettled = false;
+  const append = call(client, "append_session_turn", {
+    session_id: "session-write-lock-regression",
+    role: "user",
+    content: "must wait for the cross-process session write lock",
+  }).then(
+    () => ({ ok: true }),
+    (error) => ({ ok: false, error }),
+  ).finally(() => {
+    appendSettled = true;
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const bypassedLock = appendSettled;
+  releaseOwner();
+  await owner;
+  const appendResult = await append;
+  if (!appendResult.ok) throw appendResult.error;
+  assert(!bypassedLock, "append_session_turn must wait for the cross-process sessions.db lock");
+}
+
 const home = await mkdtemp(join(tmpdir(), "hermes-cross-process-"));
 const peers = [];
 
@@ -153,6 +202,8 @@ try {
   const a = await connect("cross-process-a", home);
   const b = await connect("cross-process-b", home);
   peers.push(a, b);
+
+  await runSessionWriteLockRegression(home, a.client);
 
   await Promise.all(Array.from({ length: 20 }, (_, index) =>
     call(index % 2 === 0 ? a.client : b.client, "append_session_turn", {

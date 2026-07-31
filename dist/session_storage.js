@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { STORE_DIR } from "./storage.js";
+import { withFileLock } from "./src/file_lock.js";
 import { redactSensitiveText } from "./src/redaction.js";
 const DB_PATH = join(STORE_DIR, "sessions.db");
 const OPERATION_JOURNAL_PATH = join(STORE_DIR, "operation_journal.json");
@@ -18,6 +19,13 @@ let _lastFailureTime = null;
 let _closed = false; // J1-fix: track explicit close to prevent leaked connections
 const configuredRetryIntervalMs = Number.parseInt(process.env.HERMES_SESSION_RETRY_MS ?? "", 10);
 const RETRY_INTERVAL_MS = configuredRetryIntervalMs > 0 ? configuredRetryIntervalMs : 60_000;
+async function withSessionWriteLock(operation) {
+    return withFileLock(DB_PATH, operation, {
+        timeout_ms: 30_000,
+        retry_ms: 10,
+        stale_ms: 120_000,
+    });
+}
 function sqliteErrorCode(error) {
     return error && typeof error === "object" && "code" in error
         ? String(error.code)
@@ -137,29 +145,34 @@ export async function appendSessionTurn(sessionId, role, content, timestamp) {
     const db = await getDb();
     if (!db)
         return false;
-    const timestampDate = timestamp ? new Date(timestamp) : new Date();
-    if (Number.isNaN(timestampDate.getTime())) {
-        throw new Error("timestamp must be a valid ISO-8601 date string");
-    }
-    const ts = timestampDate.toISOString();
-    // G4-fix: wrap SELECT + INSERT/UPDATE + INSERT in a transaction for atomicity
-    const tx = db.transaction(() => {
-        const meta = db.prepare("SELECT turn_count FROM session_meta WHERE session_id = ?").get(sessionId);
-        const turnIndex = meta ? meta.turn_count : 0;
-        if (!meta) {
-            db.prepare("INSERT INTO session_meta (session_id, started_at, turn_count, last_turn_at) VALUES (?, ?, 1, ?)").run(sessionId, ts, ts);
+    return withSessionWriteLock(async () => {
+        // Recheck after acquisition. A journaled operation can begin while this
+        // writer is queued behind another process's session lock.
+        assertSessionMutationAllowed();
+        const timestampDate = timestamp ? new Date(timestamp) : new Date();
+        if (Number.isNaN(timestampDate.getTime())) {
+            throw new Error("timestamp must be a valid ISO-8601 date string");
         }
-        else {
-            db.prepare(`UPDATE session_meta
-         SET turn_count = turn_count + 1,
-             started_at = CASE WHEN ? < started_at THEN ? ELSE started_at END,
-             last_turn_at = CASE WHEN last_turn_at IS NULL OR ? > last_turn_at THEN ? ELSE last_turn_at END
-         WHERE session_id = ?`).run(ts, ts, ts, ts, sessionId);
-        }
-        db.prepare("INSERT INTO sessions_fts (session_id, turn_index, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run(sessionId, turnIndex, role, content, ts);
+        const ts = timestampDate.toISOString();
+        // G4-fix: wrap SELECT + INSERT/UPDATE + INSERT in a transaction for atomicity
+        const tx = db.transaction(() => {
+            const meta = db.prepare("SELECT turn_count FROM session_meta WHERE session_id = ?").get(sessionId);
+            const turnIndex = meta ? meta.turn_count : 0;
+            if (!meta) {
+                db.prepare("INSERT INTO session_meta (session_id, started_at, turn_count, last_turn_at) VALUES (?, ?, 1, ?)").run(sessionId, ts, ts);
+            }
+            else {
+                db.prepare(`UPDATE session_meta
+           SET turn_count = turn_count + 1,
+               started_at = CASE WHEN ? < started_at THEN ? ELSE started_at END,
+               last_turn_at = CASE WHEN last_turn_at IS NULL OR ? > last_turn_at THEN ? ELSE last_turn_at END
+           WHERE session_id = ?`).run(ts, ts, ts, ts, sessionId);
+            }
+            db.prepare("INSERT INTO sessions_fts (session_id, turn_index, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run(sessionId, turnIndex, role, content, ts);
+        });
+        await withSqliteContentionRetry(() => tx());
+        return true;
     });
-    await withSqliteContentionRetry(() => tx());
-    return true;
 }
 function quoteFtsTerm(term) {
     const cleaned = term.replace(/[\x00-\x1F\x7F]/g, "").replace(/"/g, '""');
@@ -477,14 +490,16 @@ export async function snapshotSessionStorageAfterWriteBarrier() {
     const db = await getDb();
     if (!db)
         return null;
-    const capture = db.transaction(() => {
-        const sessions = db.prepare("SELECT session_id, started_at, turn_count, last_turn_at FROM session_meta ORDER BY session_id ASC").all();
-        const turns = db.prepare(`SELECT session_id, turn_index, role, content, timestamp
-       FROM sessions_fts
-       ORDER BY session_id ASC, turn_index ASC`).all();
-        return validateSessionStorageSnapshot({ schema_version: 1, sessions, turns });
+    return withSessionWriteLock(async () => {
+        const capture = db.transaction(() => {
+            const sessions = db.prepare("SELECT session_id, started_at, turn_count, last_turn_at FROM session_meta ORDER BY session_id ASC").all();
+            const turns = db.prepare(`SELECT session_id, turn_index, role, content, timestamp
+         FROM sessions_fts
+         ORDER BY session_id ASC, turn_index ASC`).all();
+            return validateSessionStorageSnapshot({ schema_version: 1, sessions, turns });
+        });
+        return withSqliteContentionRetry(() => capture.immediate());
     });
-    return capture.immediate();
 }
 export async function replaceSessionStorageSnapshot(value) {
     assertSessionMutationAllowed();
@@ -492,17 +507,21 @@ export async function replaceSessionStorageSnapshot(value) {
     const db = await getDb();
     if (!db)
         return false;
-    db.transaction(() => {
-        db.prepare("DELETE FROM session_meta").run();
-        db.prepare("DELETE FROM sessions_fts").run();
-        const insertMeta = db.prepare("INSERT INTO session_meta (session_id, started_at, turn_count, last_turn_at) VALUES (?, ?, ?, ?)");
-        const insertTurn = db.prepare("INSERT INTO sessions_fts (session_id, turn_index, role, content, timestamp) VALUES (?, ?, ?, ?, ?)");
-        for (const session of snapshot.sessions) {
-            insertMeta.run(session.session_id, session.started_at, session.turn_count, session.last_turn_at ?? null);
-        }
-        for (const turn of snapshot.turns) {
-            insertTurn.run(turn.session_id, turn.turn_index, turn.role, turn.content, turn.timestamp);
-        }
-    })();
-    return true;
+    return withSessionWriteLock(async () => {
+        assertSessionMutationAllowed();
+        const replace = db.transaction(() => {
+            db.prepare("DELETE FROM session_meta").run();
+            db.prepare("DELETE FROM sessions_fts").run();
+            const insertMeta = db.prepare("INSERT INTO session_meta (session_id, started_at, turn_count, last_turn_at) VALUES (?, ?, ?, ?)");
+            const insertTurn = db.prepare("INSERT INTO sessions_fts (session_id, turn_index, role, content, timestamp) VALUES (?, ?, ?, ?, ?)");
+            for (const session of snapshot.sessions) {
+                insertMeta.run(session.session_id, session.started_at, session.turn_count, session.last_turn_at ?? null);
+            }
+            for (const turn of snapshot.turns) {
+                insertTurn.run(turn.session_id, turn.turn_index, turn.role, turn.content, turn.timestamp);
+            }
+        });
+        await withSqliteContentionRetry(() => replace());
+        return true;
+    });
 }
