@@ -4,7 +4,7 @@ import { dirname } from "node:path";
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { withFileLock } from "./file_lock.js";
 import { AuthoritativeStateError, preserveCorruptUtf8, readAuthoritativeJson } from "./authoritative_state.js";
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const MAX_DIRTY_SESSIONS = 100;
 const MAX_RECENT_RUNS = 20;
 function emptyRecord() {
@@ -18,6 +18,12 @@ function initialState() {
         reviewed_sessions: emptyRecord(),
         recent_runs: [],
     };
+}
+function latestStageTimestamp(state) {
+    return [state.deterministic?.completed_at, state.llm?.completed_at]
+        .filter((value) => typeof value === "string")
+        .sort()
+        .at(-1) ?? "";
 }
 function safeIso(value) {
     if (typeof value !== "string")
@@ -92,6 +98,20 @@ function optionalFingerprint(value, label) {
 function optionalTimestamp(value, label) {
     return value === undefined ? undefined : requireTimestamp(value, label);
 }
+function decodeReviewStage(value, label) {
+    if (value === undefined)
+        return undefined;
+    const raw = plainRecord(value, label);
+    requireExactKeys(raw, [], ["fingerprint", "completed_at"], label);
+    const fingerprint = optionalFingerprint(raw.fingerprint, `${label}.fingerprint`);
+    const completedAt = optionalTimestamp(raw.completed_at, `${label}.completed_at`);
+    if (!fingerprint && !completedAt)
+        throw new BackgroundStateValidationError(`${label} must not be empty`);
+    return {
+        ...(fingerprint ? { fingerprint } : {}),
+        ...(completedAt ? { completed_at: completedAt } : {}),
+    };
+}
 function decodeState(value) {
     const raw = plainRecord(value, "background lifecycle state");
     requireExactKeys(raw, ["schema_version", "next_fencing_token", "dirty_sessions", "reviewed_sessions", "recent_runs"], ["lease"], "background lifecycle state");
@@ -108,19 +128,24 @@ function decodeState(value) {
     for (const [sessionId, item] of dirtyEntries) {
         requireSessionId(sessionId, "dirty_sessions session id");
         const data = plainRecord(item, `dirty_sessions.${sessionId}`);
-        requireExactKeys(data, ["dirty_at"], ["last_reviewed_fingerprint", "last_reviewed_at", "retry_after"], `dirty_sessions.${sessionId}`);
+        requireExactKeys(data, ["dirty_at"], ["deterministic", "llm", "retry_after", "outcome_class"], `dirty_sessions.${sessionId}`);
         const decoded = {
             dirty_at: requireTimestamp(data.dirty_at, `dirty_sessions.${sessionId}.dirty_at`),
         };
-        const fingerprint = optionalFingerprint(data.last_reviewed_fingerprint, `dirty_sessions.${sessionId}.last_reviewed_fingerprint`);
-        const reviewedAt = optionalTimestamp(data.last_reviewed_at, `dirty_sessions.${sessionId}.last_reviewed_at`);
+        const deterministic = decodeReviewStage(data.deterministic, `dirty_sessions.${sessionId}.deterministic`);
+        const llm = decodeReviewStage(data.llm, `dirty_sessions.${sessionId}.llm`);
         const retryAfter = optionalTimestamp(data.retry_after, `dirty_sessions.${sessionId}.retry_after`);
-        if (fingerprint !== undefined)
-            decoded.last_reviewed_fingerprint = fingerprint;
-        if (reviewedAt !== undefined)
-            decoded.last_reviewed_at = reviewedAt;
+        const outcomeClass = data.outcome_class === undefined
+            ? undefined
+            : requireText(data.outcome_class, 80, `dirty_sessions.${sessionId}.outcome_class`);
+        if (deterministic)
+            decoded.deterministic = deterministic;
+        if (llm)
+            decoded.llm = llm;
         if (retryAfter !== undefined)
             decoded.retry_after = retryAfter;
+        if (outcomeClass !== undefined)
+            decoded.outcome_class = outcomeClass;
         state.dirty_sessions[sessionId] = decoded;
     }
     const reviewed = plainRecord(raw.reviewed_sessions, "reviewed_sessions");
@@ -131,10 +156,15 @@ function decodeState(value) {
     for (const [sessionId, item] of reviewedEntries) {
         requireSessionId(sessionId, "reviewed_sessions session id");
         const data = plainRecord(item, `reviewed_sessions.${sessionId}`);
-        requireExactKeys(data, ["last_reviewed_fingerprint", "last_reviewed_at"], [], `reviewed_sessions.${sessionId}`);
+        requireExactKeys(data, [], ["deterministic", "llm"], `reviewed_sessions.${sessionId}`);
+        const deterministic = decodeReviewStage(data.deterministic, `reviewed_sessions.${sessionId}.deterministic`);
+        const llm = decodeReviewStage(data.llm, `reviewed_sessions.${sessionId}.llm`);
+        if (!deterministic && !llm) {
+            throw new BackgroundStateValidationError(`reviewed_sessions.${sessionId} must contain a completed stage`);
+        }
         state.reviewed_sessions[sessionId] = {
-            last_reviewed_fingerprint: optionalFingerprint(data.last_reviewed_fingerprint, `reviewed_sessions.${sessionId}.last_reviewed_fingerprint`),
-            last_reviewed_at: requireTimestamp(data.last_reviewed_at, `reviewed_sessions.${sessionId}.last_reviewed_at`),
+            ...(deterministic ? { deterministic } : {}),
+            ...(llm ? { llm } : {}),
         };
     }
     if (raw.lease !== undefined) {
@@ -170,6 +200,53 @@ function decodeState(value) {
     }
     return state;
 }
+function migrateSchema1(value) {
+    const raw = plainRecord(value, "background lifecycle state");
+    requireExactKeys(raw, ["schema_version", "next_fencing_token", "dirty_sessions", "reviewed_sessions", "recent_runs"], ["lease"], "background lifecycle state");
+    if (raw.schema_version !== 1) {
+        throw new BackgroundStateValidationError(`schema_version must equal ${SCHEMA_VERSION}`);
+    }
+    const dirtyV2 = emptyRecord();
+    for (const [sessionId, item] of Object.entries(plainRecord(raw.dirty_sessions, "dirty_sessions"))) {
+        requireSessionId(sessionId, "dirty_sessions session id");
+        const data = plainRecord(item, `dirty_sessions.${sessionId}`);
+        requireExactKeys(data, ["dirty_at"], ["last_reviewed_fingerprint", "last_reviewed_at", "retry_after"], `dirty_sessions.${sessionId}`);
+        const fingerprint = optionalFingerprint(data.last_reviewed_fingerprint, `dirty_sessions.${sessionId}.last_reviewed_fingerprint`);
+        const completedAt = optionalTimestamp(data.last_reviewed_at, `dirty_sessions.${sessionId}.last_reviewed_at`);
+        dirtyV2[sessionId] = {
+            dirty_at: requireTimestamp(data.dirty_at, `dirty_sessions.${sessionId}.dirty_at`),
+            ...((fingerprint || completedAt) ? {
+                deterministic: {
+                    ...(fingerprint ? { fingerprint } : {}),
+                    ...(completedAt ? { completed_at: completedAt } : {}),
+                },
+            } : {}),
+            ...(data.retry_after === undefined ? {} : {
+                retry_after: requireTimestamp(data.retry_after, `dirty_sessions.${sessionId}.retry_after`),
+            }),
+        };
+    }
+    const reviewedV2 = emptyRecord();
+    for (const [sessionId, item] of Object.entries(plainRecord(raw.reviewed_sessions, "reviewed_sessions"))) {
+        requireSessionId(sessionId, "reviewed_sessions session id");
+        const data = plainRecord(item, `reviewed_sessions.${sessionId}`);
+        requireExactKeys(data, ["last_reviewed_fingerprint", "last_reviewed_at"], [], `reviewed_sessions.${sessionId}`);
+        reviewedV2[sessionId] = {
+            deterministic: {
+                fingerprint: optionalFingerprint(data.last_reviewed_fingerprint, `reviewed_sessions.${sessionId}.last_reviewed_fingerprint`),
+                completed_at: requireTimestamp(data.last_reviewed_at, `reviewed_sessions.${sessionId}.last_reviewed_at`),
+            },
+        };
+    }
+    return decodeState({
+        schema_version: SCHEMA_VERSION,
+        next_fencing_token: raw.next_fencing_token,
+        dirty_sessions: dirtyV2,
+        reviewed_sessions: reviewedV2,
+        recent_runs: raw.recent_runs,
+        ...(raw.lease === undefined ? {} : { lease: raw.lease }),
+    });
+}
 function errorCode(error) {
     return error && typeof error === "object" && "code" in error
         ? String(error.code)
@@ -194,7 +271,10 @@ export class BackgroundStateStore {
         if (!loaded.exists)
             return { state: initialState(), recovered: true };
         try {
-            return { state: decodeState(loaded.value), recovered: false };
+            const raw = plainRecord(loaded.value, "background lifecycle state");
+            if (raw.schema_version === 1)
+                return { state: migrateSchema1(raw), recovered: true };
+            return { state: decodeState(raw), recovered: false };
         }
         catch (error) {
             const backup = await preserveCorruptUtf8(this.path, loaded.raw);
@@ -310,7 +390,10 @@ export class BackgroundStateStore {
             return operation();
         });
     }
-    async commitSession(ownerId, fencingToken, sessionId, fingerprint, outcomeClass, expectedDirtyAt, retryAfterMs) {
+    async commitStage(ownerId, fencingToken, sessionId, stage, fingerprint, outcomeClass, candidateIds, expectedDirtyAt, retryAfterMs) {
+        if (candidateIds.length > 100 || candidateIds.some((id) => !/^[A-Za-z0-9._:-]{1,100}$/.test(id))) {
+            return false;
+        }
         return this.mutate((state) => {
             if (state.lease?.owner_id !== ownerId || state.lease.fencing_token !== fencingToken || Date.parse(state.lease.expires_at) <= Date.now()) {
                 return false;
@@ -321,12 +404,13 @@ export class BackgroundStateStore {
                 return false;
             const finishedAt = new Date().toISOString();
             if (completedReview) {
+                const previous = state.reviewed_sessions[sessionId] ?? {};
                 state.reviewed_sessions[sessionId] = {
-                    last_reviewed_fingerprint: reviewedFingerprint,
-                    last_reviewed_at: finishedAt,
+                    ...previous,
+                    [stage]: { fingerprint: reviewedFingerprint, completed_at: finishedAt },
                 };
                 const reviewed = Object.entries(state.reviewed_sessions)
-                    .sort((a, b) => (a[1].last_reviewed_at ?? "").localeCompare(b[1].last_reviewed_at ?? ""));
+                    .sort((a, b) => latestStageTimestamp(a[1]).localeCompare(latestStageTimestamp(b[1])));
                 while (reviewed.length > MAX_DIRTY_SESSIONS) {
                     const [oldest] = reviewed.shift();
                     delete state.reviewed_sessions[oldest];
@@ -335,6 +419,7 @@ export class BackgroundStateStore {
             const dirtyUnchanged = !expectedDirtyAt || state.dirty_sessions[sessionId]?.dirty_at === expectedDirtyAt;
             if (dirtyUnchanged && retryAfterMs && retryAfterMs > 0 && state.dirty_sessions[sessionId]) {
                 state.dirty_sessions[sessionId].retry_after = new Date(Date.now() + retryAfterMs).toISOString();
+                state.dirty_sessions[sessionId].outcome_class = safeText(outcomeClass, 80) ?? "unknown";
             }
             else if (dirtyUnchanged) {
                 delete state.dirty_sessions[sessionId];
@@ -347,6 +432,10 @@ export class BackgroundStateStore {
             state.recent_runs = state.recent_runs.slice(-MAX_RECENT_RUNS);
             return true;
         });
+    }
+    /** v19 compatibility wrapper; new code should commit an explicit stage. */
+    async commitSession(ownerId, fencingToken, sessionId, fingerprint, outcomeClass, expectedDirtyAt, retryAfterMs) {
+        return this.commitStage(ownerId, fencingToken, sessionId, "deterministic", fingerprint, outcomeClass, [], expectedDirtyAt, retryAfterMs);
     }
     async releaseLease(ownerId, fencingToken) {
         return this.mutate((state) => {
@@ -365,8 +454,11 @@ export class BackgroundStateStore {
                 .map(([session_id, item]) => ({
                 session_id,
                 dirty_at: item.dirty_at,
-                last_reviewed_fingerprint: item.last_reviewed_fingerprint,
+                deterministic: item.deterministic,
+                llm: item.llm,
+                last_reviewed_fingerprint: item.deterministic?.fingerprint,
                 retry_after: item.retry_after,
+                outcome_class: item.outcome_class,
             }))
                 .sort((a, b) => a.dirty_at.localeCompare(b.dirty_at));
         });
@@ -380,6 +472,8 @@ export class BackgroundStateStore {
             return {
                 schema_version: state.schema_version,
                 dirty_session_count: Object.keys(state.dirty_sessions).length,
+                retrying_session_count: Object.values(state.dirty_sessions)
+                    .filter((item) => item.retry_after && Date.parse(item.retry_after) > Date.now()).length,
                 dirty_session_ids: Object.keys(state.dirty_sessions),
                 lease: {
                     active,

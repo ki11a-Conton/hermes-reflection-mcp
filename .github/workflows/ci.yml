@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        node: [20, 22]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install exact dependencies
+        run: npm ci
+
+      - name: Strict typecheck
+        run: npm run test:strict
+
+      - name: Build
+        run: npm run build
+
+      - name: Smoke test
+        run: node scripts/smoke.mjs
+
+      - name: Base regressions
+        run: npm run test:regressions
+
+      - name: v19.3 regressions and integration
+        run: npm run test:v19.3
+
+      - name: v19.4 regressions
+        run: npm run test:v19.4
+
+      - name: v19.4.1 regressions
+        run: npm run test:v19.4.1
+
+      - name: v19.5 context budget
+        run: npm run test:v19.5
+
+      - name: Deterministic v20 suites
+        run: npm run test:v20
+
+      - name: Single and cross-process concurrency
+        run: npm run test:concurrency
+
+      - name: Grade sanitized Agent transcript
+        run: npm run test:v20:agent-fixture
+
+      - name: Verify package allow-list
+        run: npm pack --dry-run --json
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev

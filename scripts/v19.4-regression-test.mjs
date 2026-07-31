@@ -191,6 +191,7 @@ async function testRecentReflectionFastPathDoesNotHideCorruption() {
       }
       rows.push(JSON.stringify({
         id: `recent-${index}`, timestamp: "2026-07-26T00:00:00.000Z", session_id: "recent-fast-path",
+        scope: "global",
         task_goal: `recent goal ${index} ${"x".repeat(200)}`, task_outcome: "success", failure_mode: "success",
         task_state: { summary: "safe", immediate_blockers: [], active_hypotheses: [], proven_safe_paths: [], exhausted_search: [] },
         world_model_updates: [], tool_insights: [], context_forget: [], open_questions: [], lessons_learned: [], affordance_gaps: [],

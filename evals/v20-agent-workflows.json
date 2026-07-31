@@ -1,0 +1,346 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "retrieve-project-build-lesson",
+      "prompt": "Retrieve the most relevant project-scoped lesson for a failing TypeScript build and report its ID only.",
+      "allowed_tools": [
+        "retrieve_heuristics",
+        "get_memory_item"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "fixture-project-build",
+      "answer_pattern": "^fixture-project-build$",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "retrieve-global-security-lesson",
+      "prompt": "Retrieve the global lesson about scanning raw memory and report its ID only.",
+      "allowed_tools": [
+        "retrieve_heuristics"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "fixture-security-raw",
+      "answer_pattern": "^fixture-security-raw$",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "retrieve-chinese-path-lesson",
+      "prompt": "\u67e5\u627e\u5173\u4e8e Windows \u4e2d\u6587\u8def\u5f84\u5b89\u5168\u5904\u7406\u7684\u7ecf\u9a8c\uff0c\u53ea\u8fd4\u56de\u7ecf\u9a8c ID\u3002",
+      "allowed_tools": [
+        "retrieve_heuristics"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "fixture-chinese-path",
+      "answer_pattern": "^fixture-chinese-path$",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "retrieve-tagged-concurrency-lesson",
+      "prompt": "Find the highest-confidence concurrency lesson tagged `lease` and return its ID.",
+      "allowed_tools": [
+        "retrieve_heuristics"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "fixture-concurrency-lease",
+      "answer_pattern": "^fixture-concurrency-lease$",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "retrieve-lowconfidence-exclusion",
+      "prompt": "Find the relevant release lesson while excluding confidence below 0.8; return the chosen ID.",
+      "allowed_tools": [
+        "retrieve_heuristics"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "fixture-release-high",
+      "answer_pattern": "^fixture-release-high$",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "search-failed-migration-reflection",
+      "prompt": "Find the failed migration reflection and return its reflection ID.",
+      "allowed_tools": [
+        "search_reflections"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "fixture-migration-failed",
+      "answer_pattern": "^fixture-migration-failed$",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "search-successful-release-reflection",
+      "prompt": "Find the successful v19 release reflection and return its ID.",
+      "allowed_tools": [
+        "search_reflections"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "fixture-release-success",
+      "answer_pattern": "^fixture-release-success$",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "detail-heuristic-evidence",
+      "prompt": "Read heuristic `fixture-evidence-1` and return the number of independent evidence records.",
+      "allowed_tools": [
+        "get_memory_item"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "2",
+      "answer_pattern": "^2$",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "detail-reflection-lessons",
+      "prompt": "Read reflection `fixture-reflection-1` and return its first lesson.",
+      "allowed_tools": [
+        "get_memory_item"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "Use exact snapshot replacement.",
+      "answer_pattern": "^Use exact snapshot replacement\\.$",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "open-high-priority",
+      "prompt": "Return the highest-priority unresolved question and its reflection ID.",
+      "allowed_tools": [
+        "get_open_questions"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "Should migration resume or roll back? | fixture-open-high",
+      "answer_pattern": "(?=[\\s\\S]*Should migration resume or roll back\\?)(?=[\\s\\S]*fixture-open-high)",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "open-project-question",
+      "prompt": "Return the unresolved question scoped to project `fixture-project-a`.",
+      "allowed_tools": [
+        "get_open_questions"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "Which project-only build flag is required?",
+      "answer_pattern": "^Which project-only build flag is required\\?$",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "compact-session-handoff",
+      "prompt": "Produce the compact handoff for session `fixture-session-1` and return its last user anchor.",
+      "allowed_tools": [
+        "compact_session_context"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "handoff-anchor-final",
+      "answer_pattern": "^handoff-anchor-final$",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "compact-session-recent-users",
+      "prompt": "Compact session `fixture-session-2` while preserving three recent user turns; report the preserved count.",
+      "allowed_tools": [
+        "compact_session_context"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "3",
+      "answer_pattern": "^3$",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "board-read-build-facts",
+      "prompt": "Read Memory Board and return the build command entry only.",
+      "allowed_tools": [
+        "memory_board_read"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "npm run test:strict",
+      "answer_pattern": "^npm run test:strict$",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "board-read-empty",
+      "prompt": "Read an empty Memory Board and report `empty`.",
+      "allowed_tools": [
+        "memory_board_read"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "empty",
+      "answer_pattern": "^empty$",
+      "fixture_profile": "empty_board"
+    },
+    {
+      "id": "lifecycle-status-provider",
+      "prompt": "Inspect background review status and report the provider readiness state.",
+      "allowed_tools": [
+        "trigger_background_review"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "waiting_for_provider",
+      "answer_pattern": "^waiting_for_provider$",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "lifecycle-status-pending",
+      "prompt": "Inspect background review status and report the pending-candidate count.",
+      "allowed_tools": [
+        "trigger_background_review"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "1",
+      "answer_pattern": "^1$",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "reflect-dryrun-success",
+      "prompt": "Validate a successful task reflection without persisting it and return the dry-run status.",
+      "allowed_tools": [
+        "reflect_on_task"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "validated",
+      "answer_pattern": "^validated$",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "reflect-dryrun-feedback",
+      "prompt": "Validate helpful feedback for heuristic `fixture-feedback-1` in dry-run mode and report whether it is accepted.",
+      "allowed_tools": [
+        "reflect_on_task"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "accepted",
+      "answer_pattern": "^accepted$",
+      "fixture_profile": "default"
+    },
+    {
+      "id": "reflect-dryrun-project-scope",
+      "prompt": "Validate a dry-run reflection scoped to `fixture-project-a` and return its resolved scope.",
+      "allowed_tools": [
+        "reflect_on_task"
+      ],
+      "forbidden_tools": [
+        "clear_data",
+        "delete_heuristic",
+        "import_data",
+        "approve_pending_mutation"
+      ],
+      "read_only": true,
+      "expected_answer": "project:fixture-project-a",
+      "answer_pattern": "^project:fixture-project-a$",
+      "fixture_profile": "default"
+    }
+  ]
+}

@@ -5,11 +5,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { withFileLock } from "../dist/src/file_lock.js";
 
+const clientHomes = new WeakMap();
+
 function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
 function text(result) {
+  if (result.structuredContent && Object.hasOwn(result.structuredContent, "data")) {
+    return JSON.stringify(result.structuredContent.data);
+  }
+  if (result.structuredContent) return JSON.stringify(result.structuredContent);
   return result.content?.map((item) => item.text ?? "").join("\n") ?? "";
 }
 
@@ -21,12 +27,25 @@ async function connect(name, home) {
   });
   const client = new Client({ name, version: "1.0.0" });
   await client.connect(transport);
+  clientHomes.set(client, home);
   return { client, transport };
 }
 
 async function call(client, name, args = {}) {
   const result = await client.callTool({ name, arguments: args });
   assert(!result.isError, `${name} failed:\n${text(result)}`);
+  if (name === "export_data" && result.structuredContent?.file) {
+    const home = clientHomes.get(client);
+    assert(home, "missing client HOME for file-backed export");
+    const exported = JSON.parse(await readFile(join(
+      home,
+      ".hermes-reflection",
+      "transfers",
+      "exports",
+      result.structuredContent.file,
+    ), "utf8"));
+    return { ...result, structuredContent: { data: exported } };
+  }
   return result;
 }
 
@@ -175,7 +194,7 @@ try {
     around_turn_index: 10,
     window: 50,
   })));
-  const sharedIndexes = sharedWindow.turns.map((turn) => turn.turn_index);
+  const sharedIndexes = (sharedWindow.items ?? sharedWindow.turns).map((turn) => turn.turn_index);
   assert(
     sharedIndexes.length === 20
       && new Set(sharedIndexes).size === 20
@@ -183,6 +202,8 @@ try {
     `expected 20 unique contiguous shared-session turns, got ${sharedIndexes.join(", ")}`,
   );
 
+  await Promise.all(peers.map(({ client }) => client.close().catch(() => undefined)));
+  peers.length = 0;
   const storeFiles = await readdir(join(home, ".hermes-reflection"));
   assert(
     !storeFiles.some((name) => name.endsWith(".lock") || name.endsWith(".tmp")),

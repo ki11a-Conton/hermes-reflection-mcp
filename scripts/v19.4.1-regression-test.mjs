@@ -353,6 +353,7 @@ function lifecycleOptions(store, overrides = {}) {
     review_mode: "llm",
     auto_apply: false,
     store,
+    hook_inbox: { consume: async () => ({ processed: 0, skipped: 0 }) },
     source_state: async () => ({ source_fingerprint: "f".repeat(64), reflection_count: 1 }),
     ...overrides,
   };

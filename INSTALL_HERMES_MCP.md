@@ -1,148 +1,130 @@
-# Installing Hermes Reflection MCP v19.4.1
+# Installing Hermes Reflection MCP v20.0.0
 
-This guide installs the local stdio server without copying user memory or machine-specific dependencies. Node.js 20 or newer is required.
+This guide installs the local stdio MCP with the Agent-first 10-tool Codex profile. Node.js 20 or newer is required.
 
-## Clean extraction
+## Clean installation
 
-1. Verify the release ZIP SHA-256 against the publisher's value.
-2. Extract into a new empty staging directory.
-3. Confirm the archive contains public source/build/docs only. It must not contain <code>.hermes-reflection</code>, <code>node_modules</code>, an actual Codex config, logs, databases, or environment files.
-4. Install native production dependencies on the target machine:
+1. Verify the release ZIP SHA-256 shown on the GitHub release.
+2. Extract it into a new empty staging directory.
+3. Confirm it contains source, built JavaScript, tests/evals, CI, and public docs only. It must not contain `.env`, `config.json`, `.git`, `node_modules`, `mem.md`, logs, databases, indexes, caches, bytecode, or user memory.
+4. Install native dependencies on the target machine:
 
-~~~powershell
+```powershell
 npm ci --omit=dev
-~~~
+```
 
-Do not reuse node_modules from another computer, operating system, Node version, or older installation.
+The release contains `dist/`; production installation does not need TypeScript. Never reuse `node_modules` from another OS, Node version, computer, or older installation.
 
-## Install locations
+Suggested install directories:
 
-Suggested locations:
-
-| Platform | Example |
+| Platform | Path |
 |---|---|
-| Windows | <code>C:\Users\&lt;YOU&gt;\.codex\mcp\hermes-reflection-mcp</code> |
-| macOS | <code>/Users/&lt;YOU&gt;/.codex/mcp/hermes-reflection-mcp</code> |
-| Linux | <code>/home/&lt;YOU&gt;/.codex/mcp/hermes-reflection-mcp</code> |
-
-The location may be changed, but the MCP configuration must point to that installation's <code>dist/index.js</code>.
+| Windows | `C:\Users\<YOU>\.codex\mcp\hermes-reflection-mcp` |
+| macOS | `/Users/<YOU>/.codex/mcp/hermes-reflection-mcp` |
+| Linux | `/home/<YOU>/.codex/mcp/hermes-reflection-mcp` |
 
 ## Codex Desktop configuration
 
-Windows:
+Merge [`codex_config_snippet.toml`](codex_config_snippet.toml) into the Codex configuration and replace `<YOU>`. The required Agent-first settings are:
 
-~~~toml
+```toml
 [mcp_servers.hermes-reflection]
-command = 'node'
+type = "stdio"
+command = "node"
 args = ['C:\Users\<YOU>\.codex\mcp\hermes-reflection-mcp\dist\index.js']
-~~~
+enabled = true
+enabled_tools = ["retrieve_heuristics", "reflect_on_task", "search_reflections", "get_open_questions", "get_memory_item", "compact_session_context", "memory_board_read", "memory_board_write", "session_lifecycle_hook", "trigger_background_review"]
+instructions = "Use Hermes as reference memory: retrieve before substantial work and reflect afterward. Never store secrets."
+```
 
-macOS:
+Restart Codex Desktop after any code, tool-profile, instruction, or environment change. A running MCP process cannot replace its own loaded code and the client may cache tool metadata for the process lifetime.
 
-~~~toml
-[mcp_servers.hermes-reflection]
-command = 'node'
-args = ['/Users/<YOU>/.codex/mcp/hermes-reflection-mcp/dist/index.js']
-~~~
+## Optional background lifecycle
 
-Linux:
+Set MCP environment values only if you want automatic background review:
 
-~~~toml
-[mcp_servers.hermes-reflection]
-command = 'node'
-args = ['/home/<YOU>/.codex/mcp/hermes-reflection-mcp/dist/index.js']
-~~~
+```toml
+[mcp_servers.hermes-reflection.env]
+HERMES_REFLECTION_BACKGROUND_ENABLED = "true"
+HERMES_REFLECTION_BACKGROUND_REVIEW_MODE = "auto"
+HERMES_REFLECTION_BACKGROUND_AUTO_APPLY = "false"
+```
 
-Restart Codex Desktop after adding or changing the entry. A running MCP process does not replace itself when files change.
+For automatic LLM review, inject a dedicated provider key through the MCP process environment and also set:
 
-## Installed validation
-
-From the installed code directory, run:
-
-~~~powershell
-node scripts\smoke.mjs
-node scripts\concurrency-test.mjs
-node scripts\cross-process-concurrency-test.mjs
-npm run test:v19.3
-npm run test:v19.4
-npm run test:v19.4.1
-~~~
-
-Expected: version 19.4.1, exactly 28 public tools, strict background-state decoding, correct expired/dead-owner reclamation, exact owner/token renewal throughout long reviews, quiescent shutdown, fail-closed authoritative state, strict redaction, and passing concurrency checks. Valid v19.4 and v19.3 data needs no migration.
-
-For a source checkout with development dependencies, also run:
-
-~~~powershell
-npx tsc --noEmit
-npm run build
-~~~
-
-## Client-driven lifecycle and session capture
-
-Installation alone does not record Codex conversations or create snapshots. The client must explicitly:
-
-- call <code>append_session_turn</code> for each turn it wants indexed;
-- call <code>session_lifecycle_hook</code> or <code>capture_memory_snapshot</code> for a named session;
-- pass <code>mode:"snapshot"</code> and that <code>session_id</code> when reading a frozen Memory Board/User Profile;
-- call <code>compact_session_context</code> when it wants a deterministic historical handoff.
-
-The compaction handoff is reference only and does not control Codex's host context.
-
-Historical search/scroll and compaction output strictly redact URL credentials. Scroll returns at most 4,000 Unicode code points for the anchor and 1,200 for each neighboring turn. Raw reflection and SQLite records remain unchanged for explicit audit/export.
-
-## Optional LLM and background lifecycle
-
-Both features are disabled by default. Set MCP environment variables only if you want them:
-
-~~~text
+```text
 HERMES_REFLECTION_LLM_ENABLED=true
 HERMES_REFLECTION_LLM_BASE_URL=https://provider.example/v1
 HERMES_REFLECTION_LLM_MODEL=your-model
-HERMES_REFLECTION_LLM_API_KEY=<dedicated provider key>
-HERMES_REFLECTION_BACKGROUND_ENABLED=true
-HERMES_REFLECTION_BACKGROUND_REVIEW_MODE=auto
-HERMES_REFLECTION_BACKGROUND_AUTO_APPLY=false
-~~~
+HERMES_REFLECTION_LLM_API_KEY=<dedicated-provider-key>
+```
 
-Use a dedicated provider credential; this MCP does not and must not reuse Codex Desktop authentication. Automatic apply is a separate opt-in and remains blocked when write approval is enabled. Restart Codex Desktop after changing environment configuration.
+Do not commit provider keys. The MCP never obtains or reuses Codex authentication. Keep auto-apply false until deterministic and LLM preview results are reviewed. Auto-apply remains blocked when write approval is enabled.
 
-The scheduler validates `background_lifecycle.json` strictly. Unsupported or structurally invalid authoritative state fails closed with preserved evidence. A running review renews only its original owner/fencing token; transient renewal errors are tolerated only until the last confirmed expiry, and shutdown never releases or replaces that fence before the active refresher quiesces.
+## Optional Codex lifecycle hook
 
-## Upgrade
+Configure the client to pass JSON hook events to:
 
-1. Stop or restart the MCP client so the old server process releases its files.
-2. Back up the installed code directory to a separate sibling directory.
-3. Keep <code>~/.hermes-reflection</code> in place. It is runtime user data, not release code.
-4. Extract v19.4.1 into a new clean directory.
-5. Run <code>npm ci --omit=dev</code> there.
-6. Run the installed validation commands.
-7. Replace the configured code path or move the validated directory into the stable install location.
-8. Restart Codex Desktop and confirm the server reports v19.4.1.
+```text
+node <install-dir>/dist/src/codex_hook_cli.js
+```
 
-Never copy old node_modules into the new installation, and never copy <code>~/.hermes-reflection</code> into the code directory. Valid v19.4, v19.3, v19.2, and v19.1 stores remain readable without migration.
+Supported events are `SessionStart`, `Stop`, `SessionEnd`, `PreCompact`, and `PostCompact`. The hook writes a bounded durable inbox and exits promptly. The MCP process consumes those events; the hook does not control Codex execution state. Direct integrations may call `session_lifecycle_hook` instead.
 
-## Rollback
+## Validation
 
-If validation fails:
+For a source checkout or staging install with development dependencies:
 
-1. Stop the new MCP process by restarting/exiting the client.
-2. Preserve the failed code directory for diagnosis; do not delete user memory.
-3. Restore the previous installed code directory or point the configuration back to its <code>dist/index.js</code>.
-4. Run <code>npm ci --omit=dev</code> in the restored directory if its node_modules were not preserved.
-5. Restart Codex Desktop.
+```powershell
+npm ci
+npm run test:strict
+npm run build
+npm run smoke
+npm run test:regressions
+npm run test:v19.3
+npm run test:v19.4
+npm run test:v19.4.1
+npm run test:v19.5
+npm run test:v20
+npm run test:concurrency
+npm run test:v20:agent-fixture
+npm pack --dry-run --json
+npm audit --omit=dev
+```
 
-Code rollback and data rollback are separate operations. Restore a <code>~/.hermes-reflection</code> backup only when you intentionally want to revert user data.
+Expected v20 gates:
 
-## Common failures
+- exactly 29 complete public tools;
+- exact 10-tool core profile;
+- server instructions no more than 512 code points;
+- core profile schema-inclusive metadata no more than 15,000 characters;
+- compact/full hard budgets of 6,000/24 KiB and 20,000/80 KiB;
+- no destructive-tool use in the 20-case Agent evaluation;
+- no known production dependency vulnerability;
+- no stale locks, operation journals, caches, or unrelated runtime artifacts.
 
-- “Server not found”: verify the absolute path and that <code>dist/index.js</code> exists.
-- “Node not found” or unsupported syntax: install Node.js 20+ and ensure Codex sees the same PATH.
-- SQLite/session unavailable: reinstall production dependencies on the target machine and confirm better-sqlite3 supports its Node ABI.
-- Snapshot not found: capture/start the exact session id before requesting snapshot mode.
-- PENDING write: inspect the redacted queue and explicitly approve or reject the mutation.
+Run `npm run test:v20:agent` separately when the local Codex CLI and model access are available. It launches 20 isolated fresh processes, requires at least 18/20 passes, and fails on any destructive-tool call.
 
-## Privacy and licensing
+## Data, transfers, and migration
 
-The release archive must exclude user memory, databases, credentials, actual configuration, logs, caches, dependencies, internal plans, and local machine paths.
+User state remains outside the code directory at `~/.hermes-reflection`. Default transfer roots are:
 
-No project license is included or granted in this package. The upstream Hermes Agent license does not automatically license this separate implementation.
+```text
+~/.hermes-reflection/transfers/imports
+~/.hermes-reflection/transfers/exports
+```
+
+Use `HERMES_TRANSFER_IMPORT_ROOTS` and `HERMES_TRANSFER_EXPORT_ROOTS` only for explicit additional allow-listed roots. Safe export is redacted by default; raw export requires explicit sensitive confirmation.
+
+v20 migrates supported older stores to schema 2 under a lock. It fails closed on future or corrupt authoritative state and preserves evidence. Replace import and clear operations journal JSON plus logical SQLite state so startup can roll back a pre-commit interruption or complete an interrupted commit.
+
+## Upgrade and rollback
+
+1. Stop Codex Desktop and any standalone MCP process.
+2. Back up the current installed code directory to a dated sibling path.
+3. Back up `~/.hermes-reflection` separately; never put it into the release directory.
+4. Install the v20 release into a clean staging directory and run validation.
+5. Switch the stable install path or Codex configuration only after validation passes.
+6. Start a fresh Codex Desktop process and confirm the 10-tool surface.
+
+If validation or startup fails, stop Codex, restore the previous code directory and its matching `~/.hermes-reflection` backup, then restart. Do not combine a partially migrated data directory with an older executable.

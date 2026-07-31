@@ -7,13 +7,20 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+const clientHomes = new WeakMap();
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
 function text(result) {
-  return result.content?.map((item) => item.text ?? "").join("\n") ?? "";
+  const summary = result.content?.map((item) => item.text ?? "").join("\n") ?? "";
+  if (result.structuredContent && Object.hasOwn(result.structuredContent, "data")) {
+    return JSON.stringify(result.structuredContent.data);
+  }
+  return result.structuredContent
+    ? `${summary}\n${JSON.stringify(result.structuredContent)}`
+    : summary;
 }
 
 async function connect(name, home) {
@@ -24,12 +31,25 @@ async function connect(name, home) {
   });
   const client = new Client({ name, version: "1.0.0" });
   await client.connect(transport);
+  clientHomes.set(client, home);
   return { client, transport };
 }
 
 async function call(client, name, args = {}) {
   const result = await client.callTool({ name, arguments: args });
   assert(!result.isError, `${name} failed:\n${text(result)}`);
+  if (name === "export_data" && result.structuredContent?.file) {
+    const home = clientHomes.get(client);
+    assert(home, "missing client HOME for file-backed export");
+    const exported = JSON.parse(await readFile(join(
+      home,
+      ".hermes-reflection",
+      "transfers",
+      "exports",
+      result.structuredContent.file,
+    ), "utf8"));
+    return { ...result, structuredContent: { data: exported } };
+  }
   return result;
 }
 
@@ -148,7 +168,9 @@ async function runInputAndMemoryRegressions() {
   const peer = await connect("regression-input", home);
   try {
     const now = new Date().toISOString();
-    const malformedPath = join(home, "malformed-import.json");
+    const importDir = join(home, ".hermes-reflection", "transfers", "imports");
+    await mkdir(importDir, { recursive: true });
+    const malformedPath = join(importDir, "malformed-import.json");
     await writeFile(malformedPath, JSON.stringify({
       reflections: [{
         id: "malformed-sections", timestamp: "not-a-date", session_id: "regression",
@@ -256,7 +278,7 @@ async function runInputAndMemoryRegressions() {
     assert(normalizedDates.memory_board.entries.length === 1, "replace import must deduplicate Memory Board ids");
     assert(normalizedDates.user_profile.entries.length === 1, "replace import must deduplicate User Profile ids");
 
-    const partialImportPath = join(home, "partial-session-import.json");
+    const partialImportPath = join(importDir, "partial-session-import.json");
     await writeFile(partialImportPath, JSON.stringify({
       reflections: [{
         id: "partial-session-reflection",
@@ -304,7 +326,7 @@ async function runInputAndMemoryRegressions() {
       "special object-property names must be persisted as own session ids without prototype pollution",
     );
 
-    const futureSearchPath = join(home, "future-search-import.json");
+    const futureSearchPath = join(importDir, "future-search-import.json");
     await writeFile(futureSearchPath, JSON.stringify({
       reflections: [{
         id: "normal-search-time",
@@ -334,7 +356,7 @@ async function runInputAndMemoryRegressions() {
       "future reflection timestamps must not receive an unbounded recency boost",
     );
 
-    const duplicatePath = join(home, "duplicate-memory-import.json");
+    const duplicatePath = join(importDir, "duplicate-memory-import.json");
     await writeFile(duplicatePath, JSON.stringify({
       memory_board: { entries: [
         { id: "duplicate-board", content: "first board", created_at: now, updated_at: now },
@@ -374,11 +396,13 @@ async function runInputAndMemoryRegressions() {
       lessons_learned: ["Validate cache invalidation after cross process writes"],
       auto_extract_heuristics: false,
     });
-    const review = JSON.parse(text(await call(peer.client, "trigger_background_review", {
+    const reviewResult = await call(peer.client, "trigger_background_review", {
       session_id: "review-count",
       review_scope: "recent",
       auto_apply: true,
-    })));
+    });
+    const review = reviewResult.structuredContent?.items?.[0]?.metadata
+      ?? JSON.parse(text(reviewResult));
     assert(
       review.applied.heuristics_added === 0,
       "background review must not report a reinforced existing heuristic as newly added",
@@ -457,7 +481,9 @@ async function runInputAndMemoryRegressions() {
       "heuristic deduplication must not depend on whether the short or long wording was stored first",
     );
 
-    const escapeLink = join(home, "escape-link");
+    const exportDir = join(home, ".hermes-reflection", "transfers", "exports");
+    await mkdir(exportDir, { recursive: true });
+    const escapeLink = join(exportDir, "escape-link");
     const escapedExport = join(escapeLink, "escaped-export.json");
     await symlink(outsideHome, escapeLink, "junction");
     const escapedResult = await peer.client.callTool({
@@ -505,7 +531,9 @@ async function runApprovalAndClearRegressions() {
       summary: "approval concurrency", auto_extract_heuristics: false,
     } });
     assert(queued.isError === true, "write approval must queue reflection");
-    const pending = JSON.parse(text(await call(peer.client, "list_pending_mutations"))).pending;
+    const pendingResult = await call(peer.client, "list_pending_mutations");
+    const pending = pendingResult.structuredContent?.items
+      ?? JSON.parse(text(pendingResult)).pending;
     assert(pending.length === 1, "expected one queued reflection");
     const results = await Promise.all([
       peer.client.callTool({ name: "approve_pending_mutation", arguments: { mutation_id: pending[0].id, decision: "approve" } }),
@@ -518,7 +546,9 @@ async function runApprovalAndClearRegressions() {
     await call(peer.client, "append_session_turn", { session_id: "clear-approved", role: "user", content: "must disappear" });
     const clearQueued = await peer.client.callTool({ name: "clear_data", arguments: { collection: "all", confirm: true } });
     assert(clearQueued.isError === true, "clear_data must queue while approval is enabled");
-    const clearPending = JSON.parse(text(await call(peer.client, "list_pending_mutations"))).pending;
+    const clearPendingResult = await call(peer.client, "list_pending_mutations");
+    const clearPending = clearPendingResult.structuredContent?.items
+      ?? JSON.parse(text(clearPendingResult)).pending;
     await call(peer.client, "approve_pending_mutation", { mutation_id: clearPending[0].id, decision: "approve" });
     assert(text(await call(peer.client, "search_sessions", { query: "must disappear", limit: 10 })).includes("No session turns matched"), "approved clear_data(all) must also clear SQLite sessions");
   } finally {

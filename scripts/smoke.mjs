@@ -4,6 +4,8 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 
+const clientHomes = new WeakMap();
+
 function assert(condition, message) {
   if (!condition) {
     throw new Error(message);
@@ -11,12 +13,59 @@ function assert(condition, message) {
 }
 
 function text(result) {
-  return result.content?.map((item) => item.text ?? "").join("\n") ?? "";
+  const summary = result.content?.map((item) => item.text ?? "").join("\n") ?? "";
+  const structured = result.structuredContent;
+  if (structured && Object.hasOwn(structured, "data")) return JSON.stringify(structured.data);
+  if (structured?.items?.[0]?.metadata && /background review/i.test(summary)) {
+    return JSON.stringify({
+      ...structured.items[0].metadata,
+      candidate_heuristics: structured.items.filter((item) => item.kind === "candidate").map((item) => item.item),
+      skipped_items: structured.items.filter((item) => item.kind === "skipped").map((item) => item.item),
+    });
+  }
+  if (structured?.items && /pending mutation/i.test(summary)) {
+    return JSON.stringify({ success: true, pending: structured.items });
+  }
+  if (structured?.items?.[0]?.metadata && /^Scanned /i.test(summary)) {
+    return JSON.stringify({
+      ...structured.items[0].metadata,
+      details: structured.items.map(({ id: _id, metadata: _metadata, ...item }) => item),
+    });
+  }
+  if (structured?.items?.[0]?.metadata && /turn\(s\) around/i.test(summary)) {
+    return JSON.stringify({
+      ...structured.items[0].metadata,
+      turns: structured.items.map(({ id: _id, metadata: _metadata, ...item }) => item),
+    });
+  }
+  if (structured?.items?.[0]?.metadata?.payload_kind === "handoff") {
+    const { payload_kind: _payloadKind, ...metadata } = structured.items[0].metadata;
+    return JSON.stringify({
+      ...metadata,
+      handoff: structured.items.map((item) => item.content ?? "").join(""),
+    });
+  }
+  if (structured?.items && /^(?:MEMORY BOARD|USER PROFILE|source:)/i.test(summary)) {
+    return `${summary}\n${structured.items.map((item) => item.content ?? "").join("")}`;
+  }
+  return structured ? JSON.stringify(structured) : summary;
 }
 
 async function call(client, name, args = {}) {
   const result = await client.callTool({ name, arguments: args });
   assert(!result.isError, `${name} returned an error:\n${text(result)}`);
+  if (name === "export_data" && result.structuredContent?.file) {
+    const home = clientHomes.get(client);
+    assert(home, "missing client HOME for file-backed export");
+    const exported = JSON.parse(await readFile(join(
+      home,
+      ".hermes-reflection",
+      "transfers",
+      "exports",
+      result.structuredContent.file,
+    ), "utf8"));
+    return { ...result, structuredContent: { data: exported } };
+  }
   return result;
 }
 
@@ -123,6 +172,7 @@ async function runWriteApprovalRegression() {
       },
     }), "utf-8");
     await client.connect(transport);
+    clientHomes.set(client, approvalHome);
 
     const blockedReview = JSON.parse(text(await call(client, "trigger_background_review", {
       session_id: "approval-review-session",
@@ -137,7 +187,17 @@ async function runWriteApprovalRegression() {
     const blockedReviewStore = JSON.parse(text(await call(client, "export_data", { collection: "heuristics" })));
     assert(blockedReviewStore.heuristics.length === 0, "blocked background review must leave heuristics unchanged.");
     const blockedReviewPending = JSON.parse(text(await call(client, "list_pending_mutations")));
-    assert(blockedReviewPending.pending.length === 0, "blocked background review must not queue an unreplayable mutation.");
+    assert(
+      blockedReviewPending.pending.length === 1
+        && blockedReviewPending.pending[0].operation === "apply_review_candidate",
+      "blocked background review must retain exactly one replayable review candidate.",
+    );
+    await call(client, "approve_pending_mutation", {
+      mutation_id: blockedReviewPending.pending[0].id,
+      decision: "reject",
+    });
+    const pendingAfterReviewReject = JSON.parse(text(await call(client, "list_pending_mutations")));
+    assert(pendingAfterReviewReject.pending.length === 0, "rejected review candidate must leave the approval queue.");
 
     const queuedReject = await client.callTool({
       name: "memory_board_write",
@@ -195,6 +255,7 @@ const expectedTools = [
   "user_profile_write",
   "user_profile_read",
   "get_open_questions",
+  "get_memory_item",
   "resolve_open_question",
   "search_sessions",
   "append_session_turn",
@@ -239,14 +300,15 @@ const client = new Client({ name: "hermes-smoke", version: "1.0.0" });
 
 try {
   await client.connect(transport);
+  clientHomes.set(client, tempHome);
 
   const serverVersion = client.getServerVersion();
-  assert(serverVersion?.version === "19.4.1", `Expected server version 19.4.1, got ${JSON.stringify(serverVersion)}.`);
+  assert(serverVersion?.version === "20.0.0", `Expected server version 20.0.0, got ${JSON.stringify(serverVersion)}.`);
 
   const { tools } = await client.listTools();
   const toolNames = tools.map((tool) => tool.name);
   const toolNameSet = new Set(toolNames);
-  assert(expectedTools.length === 28, `Expected the public allowlist to contain 28 tools, got ${expectedTools.length}.`);
+  assert(expectedTools.length === 29, `Expected the public allowlist to contain 29 tools, got ${expectedTools.length}.`);
   assert(tools.length === expectedTools.length, `Expected ${expectedTools.length} tools, got ${tools.length}: ${toolNames.join(", ")}`);
   for (const name of expectedTools) {
     assert(toolNameSet.has(name), `Missing expected tool: ${name}`);
@@ -271,7 +333,7 @@ try {
   assert(toolByName.get("compact_session_context")?.annotations?.readOnlyHint === true, "compact_session_context should be read-only.");
   assert(toolByName.get("list_pending_mutations")?.annotations?.readOnlyHint === true, "list_pending_mutations should be read-only.");
   assert(toolByName.get("scan_memory_threats")?.annotations?.readOnlyHint === true, "scan_memory_threats should be read-only.");
-  assert(toolByName.get("retrieve_heuristics")?.annotations?.readOnlyHint === false, "retrieve_heuristics records retrieval stats and should not be read-only.");
+  assert(toolByName.get("retrieve_heuristics")?.annotations?.readOnlyHint === true, "retrieve_heuristics should be read-only.");
   assert(toolByName.get("approve_pending_mutation")?.annotations?.readOnlyHint === false, "approve_pending_mutation should be mutating.");
   assert(toolByName.get("trigger_background_review")?.annotations?.readOnlyHint === false, "trigger_background_review should be mutating.");
   assert(toolByName.get("reflect_on_task")?.annotations?.readOnlyHint === false, "reflect_on_task should be mutating.");
@@ -313,6 +375,7 @@ try {
     session_id: "compact-session",
     max_turns: 20,
     max_chars: 6000,
+    response_mode: "full",
   })));
   assert(compact.success === true, "compact_session_context should succeed.");
   assertIncludes(compact.handoff, "[CONTEXT COMPACTION — REFERENCE ONLY]", "handoff should be reference-only.");
@@ -327,6 +390,7 @@ try {
     session_id: "compact-session",
     max_turns: 2,
     max_chars: 6000,
+    response_mode: "full",
   })));
   assert(boundedCompact.source.turns_considered === 2, "bounded handoff should consider max_turns.");
   assert(boundedCompact.source.turns_omitted === 2, "bounded handoff should report omitted loaded turns.");
@@ -345,6 +409,7 @@ try {
     session_id: "compact-empty-session",
     max_turns: 20,
     max_chars: 6000,
+    response_mode: "full",
   })));
   assert(emptyCompact.success === true, "empty-session compaction should still succeed.");
   assert(emptyCompact.source.turns_considered === 0, "empty-session compaction should report zero turns.");
@@ -368,7 +433,9 @@ try {
   assert(threatScan.threats_found === 0, "scan_memory_threats should not report blocked memory writes as stored entries.");
 
   const safeStoreBeforeUnsafeImport = JSON.parse(text(await call(client, "export_data", { collection: "all" })));
-  const unsafeImportPath = join(tempHome, "unsafe-memory-import.json");
+  const unsafeImportDir = join(tempHome, ".hermes-reflection", "transfers", "imports");
+  await mkdir(unsafeImportDir, { recursive: true });
+  const unsafeImportPath = join(unsafeImportDir, "unsafe-memory-import.json");
   const now = new Date().toISOString();
   const unsafeImportedStore = {
     ...safeStoreBeforeUnsafeImport,
@@ -440,7 +507,7 @@ try {
   assert(profileAdd.success === true, "user_profile_write(add) should add an entry.");
   assertIncludes(text(await call(client, "user_profile_read")), "simplified core tools", "user_profile_read should show the entry.");
 
-  const reflectText = text(await call(client, "reflect_on_task", {
+  const reflectResult = JSON.parse(text(await call(client, "reflect_on_task", {
     session_id: "smoke-session",
     task_goal: "smoke simplified reflection task",
     task_outcome: "success",
@@ -456,8 +523,11 @@ try {
         requires_environment_interaction: false,
       },
     ],
-  }));
-  assertIncludes(reflectText, "Reflection saved", "reflect_on_task should save a reflection.");
+  })));
+  assert(
+    reflectResult.success === true && reflectResult.persisted === true && typeof reflectResult.reflection_id === "string",
+    "reflect_on_task should return a persisted v20 reflection receipt.",
+  );
 
   assertIncludes(text(await call(client, "get_recent_reflections", { limit: 5 })), "smoke simplified reflection task", "get_recent_reflections should include the reflection.");
   assertIncludes(text(await call(client, "search_reflections", { query: "simplified 20 tool", domain: "smoke" })), "smoke simplified reflection task", "search_reflections should find the reflection.");
@@ -483,13 +553,14 @@ try {
   assertIncludes(text(await call(client, "search_heuristics", { query: "unique delete target", domain: "smoke" })), manualId, "search_heuristics should find the manual heuristic.");
   assertIncludes(text(await call(client, "delete_heuristic", { id: manualId })), "Heuristic deleted", "delete_heuristic should delete the manual heuristic.");
 
-  const openQuestionsText = text(await call(client, "get_open_questions", { domain: "smoke" }));
+  const openQuestionsResult = await call(client, "get_open_questions", { domain: "smoke" });
+  const openQuestionsText = text(openQuestionsResult);
   assertIncludes(openQuestionsText, "Should the simplified smoke keep checking import/export?", "get_open_questions should show the saved question.");
-  const openMatch = openQuestionsText.match(/Reflection:\s+([0-9a-f-]{36})\s+question_index:(\d+)/i);
-  assert(openMatch, `get_open_questions should include reflection id and question index:\n${openQuestionsText}`);
+  const openQuestion = openQuestionsResult.structuredContent?.items?.[0];
+  assert(openQuestion?.reflection_id && Number.isInteger(openQuestion.question_index), `get_open_questions should include reflection id and question index:\n${openQuestionsText}`);
   assertIncludes(text(await call(client, "resolve_open_question", {
-    reflection_id: openMatch[1],
-    question_index: Number(openMatch[2]),
+    reflection_id: openQuestion.reflection_id,
+    question_index: openQuestion.question_index,
   })), "Open question resolved", "resolve_open_question should mark the question resolved.");
 
   await call(client, "append_session_turn", {
@@ -551,6 +622,7 @@ try {
   const frozenBoard = text(await call(client, "memory_board_read", {
     mode: "snapshot",
     session_id: "snapshot-smoke",
+    response_mode: "full",
   }));
   assertIncludes(frozenBoard, "source: snapshot", "snapshot read should identify its source.");
   assertIncludes(frozenBoard, "snapshot smoke entry before lifecycle start", "snapshot should preserve start-time state.");
@@ -561,6 +633,7 @@ try {
   const frozenProfile = text(await call(client, "user_profile_read", {
     mode: "snapshot",
     session_id: "snapshot-smoke",
+    response_mode: "full",
   }));
   assertIncludes(frozenProfile, "source: snapshot", "snapshot profile read should identify its source.");
   assertIncludes(frozenProfile, "snapshot profile entry before lifecycle start", "snapshot profile should preserve start-time state.");
@@ -609,18 +682,16 @@ try {
   assert(reviewPreview.source_reflection_ids.length === 1, "trigger_background_review should include the source reflection id.");
   assert(reviewPreview.candidate_heuristics.some((candidate) => candidate.heuristic === "Background review safe auto apply lesson unique."), "trigger_background_review should preview lesson-derived heuristics.");
   const previewStore = JSON.parse(text(await call(client, "export_data", { collection: "heuristics" })));
-  assert(!previewStore.heuristics.some((heuristic) => heuristic.source_task === "background_review:review-session"), "trigger_background_review preview should not mutate heuristics.");
-
-  const reviewApply = JSON.parse(text(await call(client, "trigger_background_review", {
-    session_id: "review-session",
-    review_scope: "recent",
-    auto_apply: true,
-  })));
-  assert(reviewApply.success === true, "trigger_background_review auto_apply should succeed for safe candidates.");
-  assert(reviewApply.applied.heuristics_added >= 1, "trigger_background_review auto_apply should add a safe heuristic.");
-  assert(Array.isArray(reviewApply.applied.heuristic_ids), "review apply should return auditable heuristic ids.");
+  assert(!previewStore.heuristics.some((heuristic) => heuristic.heuristic === "Background review safe auto apply lesson unique."), "trigger_background_review preview should not mutate heuristics.");
+  const reviewPending = JSON.parse(text(await call(client, "list_pending_mutations")));
+  const reviewMutation = reviewPending.pending.find((mutation) => mutation.operation === "apply_review_candidate");
+  assert(reviewMutation?.id, "background review preview should persist a replayable candidate.");
+  await call(client, "approve_pending_mutation", {
+    mutation_id: reviewMutation.id,
+    decision: "approve",
+  });
   const applyStore = JSON.parse(text(await call(client, "export_data", { collection: "heuristics" })));
-  assert(applyStore.heuristics.some((heuristic) => heuristic.source_task === "background_review:review-session" && heuristic.heuristic === "Background review safe auto apply lesson unique."), "trigger_background_review auto_apply should persist the safe candidate heuristic.");
+  assert(applyStore.heuristics.some((heuristic) => heuristic.heuristic === "Background review safe auto apply lesson unique."), "approved background review candidate should persist its heuristic.");
 
   await call(client, "reflect_on_task", {
     session_id: "review-threat-session",
@@ -645,14 +716,15 @@ try {
   const exportJson = text(await call(client, "export_data", { collection: "all" }));
   const exported = JSON.parse(exportJson);
   assert(Array.isArray(exported.reflections), "export_data(all) should include reflections.");
-  const importPath = join(tempHome, "smoke-import.json");
+  const importPath = join(unsafeImportDir, "smoke-import.json");
   await writeFile(importPath, exportJson, "utf-8");
-  assertIncludes(text(await call(client, "import_data", { input_path: importPath, mode: "replace" })), "Store totals after import", "import_data(replace) should import the exported store.");
+  const importResult = await call(client, "import_data", { input_path: importPath, mode: "replace" });
+  assert(importResult.structuredContent?.success === true && importResult.structuredContent?.mode === "replace", "import_data(replace) should import the exported store.");
 
   assertIncludes(text(await call(client, "clear_data", { collection: "all", confirm: true })), "Cleared", "clear_data(all) should clear the store.");
   assertIncludes(text(await call(client, "memory_board_read")), "(empty)", "memory_board_read should be empty after clear_data(all).");
 
-  console.log("Smoke passed for hermes-reflection-mcp v19.4.1 core tool surface.");
+  console.log("Smoke passed for hermes-reflection-mcp v20.0.0 core tool surface.");
 } finally {
   await client.close().catch(() => {});
   process.env.HOME = originalHome;

@@ -4,51 +4,17 @@
 //        scan_memory_threats, scroll_session_context, compact_session_context,
 //        trigger_background_review
 // ============================================================
-import { z } from "zod";
 import { captureSessionSnapshot, releaseSessionSnapshot, } from "./storage_enhanced.js";
 import { getSessionReflections, getRawMemoryStores, safeHeuristicText, scanHeuristicThreats, } from "../storage.js";
 import { listSessionTurns, listSessionTurnsAround, SESSION_STORAGE_UNAVAILABLE } from "../session_storage.js";
 import { buildCompactionHandoff } from "./compaction_handoff.js";
-import { getReviewReadinessStatus, runReview } from "./review_engine.js";
+import { getReviewReadinessStatus, getReviewSourceState } from "./review_engine.js";
+import { reviewQueueCounts } from "./review_queue.js";
 import { backgroundLifecycle } from "./background_lifecycle.js";
 import { codePointLength, redactSensitiveText, truncateCodePoints } from "./redaction.js";
-// ============================================================
-// Schemas
-// ============================================================
-export const CaptureMemorySnapshotSchema = z.object({
-    session_id: z.string().min(1).max(200),
-});
-export const SessionLifecycleHookSchema = z.object({
-    event: z.enum(["start", "end", "pause", "resume"]),
-    session_id: z.string().min(1).max(200),
-    metadata: z.object({
-        model: z.string().max(100).optional(),
-        platform: z.string().max(100).optional(),
-        user_id: z.string().max(100).optional(),
-    }).optional(),
-});
-export const ScanMemoryThreatsSchema = z.object({
-    target: z.enum(["memory", "user"]),
-    scope: z.enum(["all", "context", "strict"]).default("strict"),
-});
-export const ScrollSessionContextSchema = z.object({
-    session_id: z.string().min(1).max(200),
-    around_turn_index: z.number().int().min(0),
-    window: z.number().int().min(1).max(50).default(5),
-});
-export const TriggerBackgroundReviewSchema = z.object({
-    action: z.enum(["run", "status"]).default("run"),
-    session_id: z.string().min(1).max(200),
-    review_scope: z.enum(["recent", "full"]).default("recent"),
-    review_mode: z.enum(["deterministic", "llm", "auto"]).default("deterministic"),
-    auto_apply: z.boolean().default(false),
-});
-export const CompactSessionContextSchema = z.object({
-    session_id: z.string().min(1).max(200),
-    max_turns: z.number().int().min(1).max(200).default(40),
-    max_chars: z.number().int().min(500).max(20000).default(6000),
-    preserve_recent_user_turns: z.number().int().min(1).max(5).default(3),
-});
+import { isFullResponse } from "./response_mode.js";
+import { CaptureMemorySnapshotSchema, CompactSessionContextSchema, ScanMemoryThreatsSchema, ScrollSessionContextSchema, SessionLifecycleHookSchema, TriggerBackgroundReviewSchema, } from "./tool_registry.js";
+import { projectScopeRepository } from "./project_scope.js";
 // ============================================================
 // Tool Implementations
 // ============================================================
@@ -68,10 +34,19 @@ export async function handleCaptureMemorySnapshot(args) {
  * session_lifecycle_hook - Session lifecycle event handler
  */
 export async function handleSessionLifecycleHook(args) {
-    const { event, session_id } = SessionLifecycleHookSchema.parse(args);
+    const { event, session_id, project_key, metadata } = SessionLifecycleHookSchema.parse(args);
+    const resolvedProjectKey = metadata?.project_key ?? project_key;
+    const acceptedMetadata = metadata
+        ? {
+            ...(metadata.model ? { model: metadata.model } : {}),
+            ...(metadata.platform ? { platform: metadata.platform } : {}),
+            ...(metadata.user_id ? { user_id: metadata.user_id } : {}),
+        }
+        : undefined;
     const actions = [];
     switch (event) {
         case "start": {
+            const scope = await projectScopeRepository.bind(session_id, resolvedProjectKey, acceptedMetadata);
             const captureResult = await captureSessionSnapshot(session_id);
             actions.push("Captured or refreshed memory snapshot");
             const background = await backgroundLifecycle.status();
@@ -79,6 +54,8 @@ export async function handleSessionLifecycleHook(args) {
                 success: captureResult.success, // A13-fix: use actual result instead of hardcoded true
                 event,
                 session_id,
+                scope,
+                ...(acceptedMetadata ? { metadata: acceptedMetadata } : {}),
                 actions_performed: actions,
                 snapshot_info: captureResult.snapshot_info,
                 background_lifecycle: background.runtime,
@@ -93,6 +70,7 @@ export async function handleSessionLifecycleHook(args) {
             catch {
                 backgroundNotificationError = "background_state_unavailable";
             }
+            await projectScopeRepository.release(session_id);
             // J3-fix: only push "Released" actions if release actually succeeded
             if (releaseResult.success) {
                 actions.push("Released memory snapshot");
@@ -175,7 +153,7 @@ function boundedHistoricalTurn(turn, maxChars) {
     };
 }
 export async function handleScrollSessionContext(args) {
-    const { session_id, around_turn_index, window } = ScrollSessionContextSchema.parse(args);
+    const { session_id, around_turn_index, window, response_mode } = ScrollSessionContextSchema.parse(args);
     const windowResult = await listSessionTurnsAround(session_id, around_turn_index, window);
     if (windowResult === null) {
         return JSON.stringify({
@@ -185,7 +163,9 @@ export async function handleScrollSessionContext(args) {
             anchor_turn_index: around_turn_index,
         }, null, 2);
     }
-    const boundedTurns = windowResult.turns.map((turn) => boundedHistoricalTurn(turn, turn.turn_index === around_turn_index ? 4_000 : 1_200));
+    const boundedTurns = windowResult.turns.map((turn) => boundedHistoricalTurn(turn, turn.turn_index === around_turn_index
+        ? (isFullResponse(response_mode) ? 4_000 : 800)
+        : (isFullResponse(response_mode) ? 1_200 : 300)));
     return JSON.stringify({
         success: true,
         session_id,
@@ -203,7 +183,7 @@ export async function handleScrollSessionContext(args) {
  * client integration. It does not control Codex's actual context window.
  */
 export async function handleCompactSessionContext(args) {
-    const { session_id, max_turns, max_chars, preserve_recent_user_turns } = CompactSessionContextSchema.parse(args);
+    const { session_id, max_turns, max_chars, preserve_recent_user_turns, response_mode } = CompactSessionContextSchema.parse(args);
     // Load the bounded session-tool maximum so the builder can report how many
     // loaded turns were omitted by the caller's smaller max_turns window.
     const turns = await listSessionTurns(session_id, 200);
@@ -212,13 +192,29 @@ export async function handleCompactSessionContext(args) {
     }
     const reflections = await getSessionReflections(session_id, 50);
     const result = buildCompactionHandoff(turns, reflections, max_turns, max_chars, preserve_recent_user_turns);
+    const message = turns.length === 0
+        ? "No stored turns found; returned an empty historical handoff."
+        : undefined;
+    if (!isFullResponse(response_mode)) {
+        return JSON.stringify({
+            success: true,
+            session_id,
+            reference_only: true,
+            message,
+            handoff: result.handoff,
+            truncated: result.truncated,
+            continuation: {
+                first_turn_index: result.source.first_turn_index,
+                last_turn_index: result.source.last_turn_index,
+                turns_omitted: result.source.turns_omitted,
+            },
+        }, null, 2);
+    }
     return JSON.stringify({
         success: true,
         session_id,
         reference_only: true,
-        message: turns.length === 0
-            ? "No stored turns found; returned an empty historical handoff."
-            : undefined,
+        message,
         ...result,
     }, null, 2);
 }
@@ -227,109 +223,42 @@ export async function handleCompactSessionContext(args) {
  */
 export async function handleTriggerBackgroundReview(args) {
     const { action, session_id, review_scope, review_mode, auto_apply } = TriggerBackgroundReviewSchema.parse(args);
+    const scope = session_id ? await projectScopeRepository.resolve({ session_id }) : undefined;
     if (action === "status") {
         const background = await backgroundLifecycle.status();
+        const queue = await reviewQueueCounts(scope);
         return JSON.stringify({
             success: true,
             action,
             session_id,
             llm: getReviewReadinessStatus(),
+            review_queue: {
+                ...queue,
+                ...(queue.pending > 0
+                    ? { admin_hint: "Use list_pending_mutations, then approve_pending_mutation to approve or reject candidates." }
+                    : {}),
+            },
             background_lifecycle: {
                 runtime: background.runtime,
                 durable: {
                     schema_version: background.durable.schema_version,
                     dirty_session_count: background.durable.dirty_session_count,
+                    retrying_session_count: background.durable.retrying_session_count,
                     lease: background.durable.lease,
                     recent_runs: background.durable.recent_runs,
                 },
             },
         }, null, 2);
     }
-    return JSON.stringify(await runReview({
-        session_id,
+    const source = await getReviewSourceState(session_id, review_scope);
+    const readiness = getReviewReadinessStatus();
+    return JSON.stringify(await backgroundLifecycle.runNow({
+        session_id: session_id,
+        scope: scope ?? source.scope ?? "global",
+        stage: review_mode === "deterministic" ? "deterministic" : (readiness.ready ? "llm" : "deterministic"),
+        source_fingerprint: source.source_fingerprint,
         review_scope,
         review_mode,
         auto_apply,
     }), null, 2);
 }
-// ============================================================
-// Tool Metadata (for index.ts integration)
-// ============================================================
-export const NEW_TOOL_DEFINITIONS = {
-    capture_memory_snapshot: {
-        name: "capture_memory_snapshot",
-        description: "Capture a frozen, reference-only snapshot of Memory Board and User Profile for an explicit client session. Call this from a client integration at session start or when intentionally refreshing the snapshot.",
-        inputSchema: {
-            type: "object",
-            required: ["session_id"],
-            properties: {
-                session_id: { type: "string", maxLength: 200, description: "Unique session identifier" },
-            },
-        },
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
-    },
-    session_lifecycle_hook: {
-        name: "session_lifecycle_hook",
-        description: "Record an explicit client lifecycle event. Start captures or refreshes a snapshot, end releases it, and pause/resume do not control Codex execution state. Call explicitly from a client integration.",
-        inputSchema: {
-            type: "object",
-            required: ["event", "session_id"],
-            properties: {
-                event: { type: "string", enum: ["start", "end", "pause", "resume"] },
-                session_id: { type: "string", maxLength: 200 },
-                metadata: {
-                    type: "object",
-                    properties: {
-                        model: { type: "string", maxLength: 100 },
-                        platform: { type: "string", maxLength: 100 },
-                        user_id: { type: "string", maxLength: 100 },
-                    },
-                },
-            },
-        },
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
-    },
-    scan_memory_threats: {
-        name: "scan_memory_threats",
-        description: "Scan memory board or user profile for threat patterns (injection, exfiltration, backdoors). Returns detailed list of suspicious entries. Use scope='strict' for comprehensive security audit.",
-        inputSchema: {
-            type: "object",
-            required: ["target"],
-            properties: {
-                target: { type: "string", enum: ["memory", "user"], description: "Which memory target to scan" },
-                scope: { type: "string", enum: ["all", "context", "strict"], default: "strict", description: "Threat detection scope" },
-            },
-        },
-        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
-    },
-    scroll_session_context: {
-        name: "scroll_session_context",
-        description: "Retrieve session messages around a specific turn index. Returns anchor message ± window size with pagination info. Use for exploring conversation context.",
-        inputSchema: {
-            type: "object",
-            required: ["session_id", "around_turn_index"],
-            properties: {
-                session_id: { type: "string", maxLength: 200 },
-                around_turn_index: { type: "number", description: "Turn index to center the window around" },
-                window: { type: "number", default: 5, minimum: 1, maximum: 50, description: "Number of messages before and after anchor" },
-            },
-        },
-        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
-    },
-    trigger_background_review: {
-        name: "trigger_background_review",
-        description: "Review stored reflections for safe heuristic candidates. Deterministic preview remains the default; optional explicitly configured LLM review and status are available. auto_apply atomically upserts safe candidates and never modifies skills or User Profile/Memory Board entries.",
-        inputSchema: {
-            type: "object",
-            required: ["session_id"],
-            properties: {
-                action: { type: "string", enum: ["run", "status"], default: "run", description: "Run a review or inspect sanitized background/LLM readiness." },
-                session_id: { type: "string", maxLength: 200 },
-                review_scope: { type: "string", enum: ["recent", "full"], default: "recent", description: "Recent analyzes last 10 reflections, full scans entire session" },
-                review_mode: { type: "string", enum: ["deterministic", "llm", "auto"], default: "deterministic", description: "Deterministic is local; llm requires dedicated config; auto falls back to deterministic." },
-                auto_apply: { type: "boolean", default: false, description: "If true, automatically apply extracted updates" },
-            },
-        },
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
-    },
-};

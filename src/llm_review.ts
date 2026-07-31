@@ -1,20 +1,22 @@
 import { createHash } from "node:crypto";
+import { isIP } from "node:net";
 import { z } from "zod";
 import type { ReflectionFrame } from "../types.js";
 import { redactSensitiveText } from "./redaction.js";
 import { scanForThreats } from "./threat_patterns.js";
 
 const MAX_REQUEST_CHARS = 32_000;
-const MAX_RESPONSE_BYTES = 256_000;
+const MAX_RESPONSE_BYTES = 64 * 1024;
+const MAX_COMPLETION_TOKENS = 1_200;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MIN_TIMEOUT_MS = 1_000;
-const MAX_TIMEOUT_MS = 60_000;
+const MAX_TIMEOUT_MS = 30_000;
 
 const CandidateSchema = z.object({
-  heuristic: z.string().trim().min(1).max(1000),
+  heuristic: z.string().trim().min(1).max(32_000),
   domain: z.string().trim().min(1).max(100).default("general"),
   confidence: z.number().min(0).max(1).default(0.65),
-  tags: z.array(z.string().trim().min(1).max(100)).max(20).default([]),
+  tags: z.array(z.string().trim().min(1).max(100)).max(100).default([]),
 }).strict();
 
 const ReviewOutputSchema = z.object({
@@ -34,6 +36,7 @@ export interface LlmReviewCandidate {
   domain: string;
   confidence: number;
   tags: string[];
+  risk_reasons: string[];
 }
 
 export type LlmReviewErrorClass =
@@ -73,6 +76,7 @@ interface LlmConfig {
 }
 
 export interface LlmReadiness {
+  state: "ready" | "waiting_for_provider" | "configuration_error";
   enabled: boolean;
   ready: boolean;
   provider_host?: string;
@@ -87,9 +91,8 @@ function truthy(value: string | undefined): boolean {
 
 function isLoopback(hostname: string): boolean {
   const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  return normalized === "localhost"
-    || normalized === "::1"
-    || normalized.startsWith("127.");
+  if (normalized === "localhost" || normalized === "::1") return true;
+  return isIP(normalized) === 4 && normalized.split(".")[0] === "127";
 }
 
 function resolveEndpoint(baseUrl: string): URL {
@@ -111,7 +114,7 @@ function resolveEndpoint(baseUrl: string): URL {
 function readConfig(): { config?: LlmConfig; readiness: LlmReadiness } {
   const enabled = truthy(process.env.HERMES_REFLECTION_LLM_ENABLED);
   if (!enabled) {
-    return { readiness: { enabled: false, ready: false, error: "Automatic LLM review is disabled." } };
+    return { readiness: { state: "waiting_for_provider", enabled: false, ready: false, error: "Automatic LLM review is disabled." } };
   }
   const baseUrl = process.env.HERMES_REFLECTION_LLM_BASE_URL?.trim();
   const model = process.env.HERMES_REFLECTION_LLM_MODEL?.trim();
@@ -119,6 +122,7 @@ function readConfig(): { config?: LlmConfig; readiness: LlmReadiness } {
   if (!baseUrl || !model || !apiKey) {
     return {
       readiness: {
+        state: "waiting_for_provider",
         enabled: true,
         ready: false,
         error: "Set dedicated LLM base URL, model, and API key environment variables.",
@@ -126,7 +130,7 @@ function readConfig(): { config?: LlmConfig; readiness: LlmReadiness } {
     };
   }
   if (model.length > 200) {
-    return { readiness: { enabled: true, ready: false, error: "LLM model name exceeds 200 characters." } };
+    return { readiness: { state: "configuration_error", enabled: true, ready: false, error: "LLM model name exceeds 200 characters." } };
   }
   try {
     const endpoint = resolveEndpoint(baseUrl);
@@ -135,6 +139,7 @@ function readConfig(): { config?: LlmConfig; readiness: LlmReadiness } {
       ? Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Math.trunc(rawTimeout)))
       : DEFAULT_TIMEOUT_MS;
     const readiness: LlmReadiness = {
+      state: "ready",
       enabled: true,
       ready: true,
       provider_host: endpoint.host,
@@ -145,6 +150,7 @@ function readConfig(): { config?: LlmConfig; readiness: LlmReadiness } {
   } catch (error) {
     return {
       readiness: {
+        state: "configuration_error",
         enabled: true,
         ready: false,
         error: error instanceof Error ? error.message : "Invalid LLM configuration.",
@@ -211,6 +217,7 @@ function buildRequest(reflections: ReflectionFrame[], model: string): {
   const body = JSON.stringify({
     model,
     temperature: 0,
+    max_completion_tokens: MAX_COMPLETION_TOKENS,
     response_format: { type: "json_object" },
     messages: [
       {
@@ -226,6 +233,68 @@ function buildRequest(reflections: ReflectionFrame[], model: string): {
     sourceIds,
     fingerprint: createHash("sha256").update(reviewInput, "utf8").digest("hex"),
   };
+}
+
+async function retryDelay(attempt: number, signal?: AbortSignal): Promise<void> {
+  const ms = Math.min(2_000, 250 * 2 ** attempt) + Math.floor(Math.random() * 100);
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: unknown): void => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(() => finish(), ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      finish(signal?.reason ?? new Error("aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
+}
+
+function semanticRiskReasons(text: string): string[] {
+  const risks: string[] = [];
+  const checks: Array<[RegExp, string]> = [
+    [/\b(?:api[ _-]?key|token|password|secret|credential)s?\b|凭据|密钥|密码/i, "secret_or_credential"],
+    [/\b(?:delete|remove|erase|clear|drop|purge)\b|删除|清除/i, "deletion"],
+    [/\b(?:overwrite|replace existing|truncate)\b|覆盖/i, "overwrite"],
+    [/\b(?:identity|impersonat|user profile|memory board)\b|身份/i, "identity_change"],
+    [/\b(?:permission|privilege|administrator|sudo|chmod)\b|权限/i, "permission_change"],
+  ];
+  for (const [pattern, reason] of checks) if (pattern.test(text)) risks.push(reason);
+  return risks;
+}
+
+function contradictionKey(text: string): { key: string; negative: boolean } {
+  const normalized = text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const negative = /\b(?:never|not|disable|avoid|forbid|without)\b/.test(normalized);
+  const key = normalized
+    .replace(/\b(?:always|never|not|do|must|should|enable|disable|avoid|forbid|without)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return { key, negative };
+}
+
+function markContradictoryCandidates(candidates: LlmReviewCandidate[]): void {
+  const groups = new Map<string, LlmReviewCandidate[]>();
+  for (const candidate of candidates) {
+    const { key } = contradictionKey(candidate.heuristic);
+    if (!key) continue;
+    const group = groups.get(`${candidate.domain.toLowerCase()}:${key}`) ?? [];
+    group.push(candidate);
+    groups.set(`${candidate.domain.toLowerCase()}:${key}`, group);
+  }
+  for (const group of groups.values()) {
+    const polarities = new Set(group.map((candidate) => contradictionKey(candidate.heuristic).negative));
+    if (polarities.size < 2) continue;
+    for (const candidate of group) {
+      candidate.risk_reasons = [...new Set([...candidate.risk_reasons, "conflicting_candidate"])];
+    }
+  }
 }
 
 async function readResponseBody(response: Response): Promise<string> {
@@ -342,10 +411,26 @@ export async function runLlmReview(
       }
       if (response.status === 401) return failure(startedAt, readiness, request.sourceIds, "authentication", "LLM provider rejected the API credential.", request.fingerprint);
       if (response.status === 403) return failure(startedAt, readiness, request.sourceIds, "permission", "LLM provider denied this request.", request.fingerprint);
-      if (response.status === 429) return failure(startedAt, readiness, request.sourceIds, "quota", "LLM provider rate limit or quota was reached.", request.fingerprint);
-      if (response.status >= 500) {
+      if (response.status === 429 || response.status >= 500) {
         await response.body?.cancel().catch(() => undefined);
-        if (attempt === 0) continue;
+        if (attempt === 0) {
+          try {
+            await retryDelay(attempt, controller.signal);
+          } catch {
+            return failure(
+              startedAt,
+              readiness,
+              request.sourceIds,
+              externallyAborted ? "aborted" : "timeout",
+              externallyAborted ? "LLM review was cancelled during shutdown." : "LLM review timed out.",
+              request.fingerprint,
+            );
+          }
+          continue;
+        }
+        if (response.status === 429) {
+          return failure(startedAt, readiness, request.sourceIds, "quota", "LLM provider rate limit or quota remained unavailable after one retry.", request.fingerprint);
+        }
         return failure(startedAt, readiness, request.sourceIds, "provider_unavailable", "LLM provider remained unavailable after one retry.", request.fingerprint);
       }
       if (!response.ok) {
@@ -363,9 +448,22 @@ export async function runLlmReview(
         let skippedCandidates = 0;
         const seen = new Set<string>();
         for (const item of output.candidates) {
-          const heuristic = strictBoundedText(item.heuristic, 1_000);
+          const rawHeuristic = item.heuristic.trim();
+          const redactedHeuristic = strictBoundedText(rawHeuristic, 1_000);
+          const threats = scanForThreats(rawHeuristic.slice(0, 8_000), "strict");
+          const riskReasons = [
+            ...(rawHeuristic.length > 1_000 ? ["oversized_payload"] : []),
+            ...(redactedHeuristic !== rawHeuristic.slice(0, 1_000) ? ["secret_or_credential"] : []),
+            ...semanticRiskReasons(rawHeuristic),
+            ...(threats.length > 0 ? ["injection_or_threat"] : []),
+            ...threats.map((threat) => `threat:${threat}`),
+            ...(request.sourceIds.length === 0 ? ["missing_evidence"] : []),
+          ];
+          const heuristic = threats.length > 0
+            ? "[BLOCKED: unsafe LLM review candidate retained for audit only]"
+            : redactedHeuristic;
           const normalized = heuristic.toLowerCase().replace(/\s+/g, " ").trim();
-          if (!normalized || seen.has(normalized) || scanForThreats(heuristic, "strict").length > 0) {
+          if (!normalized || seen.has(normalized)) {
             skippedCandidates += 1;
             continue;
           }
@@ -378,8 +476,10 @@ export async function runLlmReview(
               ...item.tags.map((tag) => strictBoundedText(tag, 80)).filter(Boolean),
               "llm-review",
             ])],
+            risk_reasons: [...new Set(riskReasons)],
           });
         }
+        markContradictoryCandidates(candidates);
         const summary = outboundText(output.summary, 2_000);
         const openQuestions = output.open_questions
           .map((question) => outboundText(question, 500))

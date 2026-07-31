@@ -13,7 +13,7 @@ function resultText(result) {
 async function callJson(client, name, args) {
   const result = await client.callTool({ name, arguments: args });
   assert.equal(result.isError, undefined, `${name} failed: ${resultText(result)}`);
-  return JSON.parse(resultText(result));
+  return result.structuredContent ?? JSON.parse(resultText(result));
 }
 
 function assertNoLoneSurrogates(value) {
@@ -47,7 +47,8 @@ async function testMcpIntegration() {
   try {
     await client.connect(transport);
     const tools = await client.listTools();
-    assert.equal(tools.tools.length, 28, "public tool count must remain compatible");
+    assert.equal(tools.tools.length, 29, "v20 compatibility layer must expose the approved 29-tool surface");
+    assert.ok(tools.tools.some((tool) => tool.name === "get_memory_item"));
 
     const reflected = await client.callTool({
       name: "reflect_on_task",
@@ -111,14 +112,15 @@ async function testMcpIntegration() {
       around_turn_index: 1,
       window: 1,
     });
-    assert.ok(Array.from(bounded.turns[0].content).length <= 1_200);
-    assert.ok(Array.from(bounded.turns[1].content).length <= 4_000);
-    assert.ok(Array.from(bounded.turns[2].content).length <= 1_200);
-    assert.equal(bounded.turns[1].content_truncated, true);
-    assert.ok(bounded.turns[1].original_content_chars > 5_000);
+    const turns = bounded.items ?? bounded.turns;
+    assert.ok(Array.from(turns[0].content).length <= 1_200);
+    assert.ok(Array.from(turns[1].content).length <= 4_000);
+    assert.ok(Array.from(turns[2].content).length <= 1_200);
+    assert.equal(turns[1].content_truncated, true);
+    assert.ok(turns[1].original_content_chars > 5_000);
     assert.doesNotMatch(JSON.stringify(bounded), /neighbor-code|token-user|anchor-signature/);
     assert.match(JSON.stringify(bounded), /state=public/);
-    bounded.turns.forEach((item) => assertNoLoneSurrogates(item.content));
+    turns.forEach((item) => assertNoLoneSurrogates(item.content));
 
     const searched = await client.callTool({
       name: "search_sessions",

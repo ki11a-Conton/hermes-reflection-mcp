@@ -1,5 +1,50 @@
 # Changelog
 
+## 20.0.0 - 2026-07-29
+
+### Agent-first interface
+
+- Added a registry-driven 29-tool compatibility surface and an exact 10-tool core profile for Codex Desktop.
+- Added `get_memory_item` for bounded detail retrieval and moved long-result tools to strict compact/full structured budgets with opaque continuation cursors.
+- Reduced the recommended Codex configuration to the core profile and a single short reference-memory instruction.
+
+### Memory and retrieval
+
+- Added project-aware global-plus-project retrieval with locally salted HMAC project keys, deterministic ranking, heuristic feedback, and cross-process read synchronization.
+- Added schema-2 migration, review-candidate audit state, strict authoritative-state decoding, and bounded detail/continuation retrieval.
+- Added cross-store JSON/SQLite operation journaling for replace imports and clear operations, including startup rollback/commit completion and exact snapshot restoration.
+
+### Review and lifecycle
+
+- Added provider readiness, strict redacted LLM review, schema-validated candidates, single-flight requests, classified retries/failures, and guarded confidence-based auto-apply.
+- Added non-blocking Codex lifecycle hook ingestion, durable deduplication, project binding, bounded background processing, and fresh-process restart recovery.
+- Preserved deterministic review as the default and kept LLM review, scheduler startup, and automatic persistence as separate opt-ins.
+
+### Verification and release
+
+- Added Windows/Linux Node 20/22 CI, strict unused-symbol gates, v20 registry/budget/migration/retrieval/background/lifecycle/transaction suites, and compatibility coverage through v19.5.
+- Added 20 sanitized Agent workflow cases with offline fixture grading and isolated fresh-process Codex grading; the live gate requires at least 18/20 with zero destructive-tool calls.
+- Added package hygiene, production audit, install/rollback documentation, and Agent-first configuration guidance.
+
+## 19.5.0 - 2026-07-27
+
+### Added
+
+- Add optional `response_mode: "compact" | "full"` to 13 long-result tools; compact is the default and full preserves complete diagnostic detail.
+- Add an isolated stdio regression suite that enforces the 28-tool surface, metadata budgets, compact/full semantics, complete errors, deterministic output, non-duplication, and response savings.
+
+### Changed
+
+- Reduce server-wide instructions from 5,288 to 421 characters. Schema-inclusive simulated Codex metadata is 33,100 characters, within the 35,000-character budget.
+- Compact deterministic fixtures use 2,513 characters versus 4,568 in full mode, a 45.0% reduction.
+- Preserve complete Memory Board/User Profile text while omitting redundant snapshot wrapper metadata in compact mode.
+- Preserve full structured v19 error payloads, including identifiers and navigation fields, rather than returning only the top-level message.
+
+### Compatibility
+
+- Preserve exactly 28 public tools, all existing required inputs, storage formats, ranking/write behavior, lifecycle controls, and opt-in LLM/background settings.
+- No database migration, production dependency, or global Codex limit change is required. Clients that parse verbose text can request `response_mode: "full"`.
+
 ## 19.4.1 - 2026-07-26
 
 ### Fixed

@@ -2,7 +2,12 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { STORE_DIR } from "../storage.js";
 import { BackgroundStateStore } from "./background_state.js";
-import { getReviewSourceState, runReview } from "./review_engine.js";
+import { getReviewReadinessStatus, getReviewSourceState, inFlightReview, reviewSingleFlightKey, runReviewSingleFlight, } from "./review_engine.js";
+import { HermesError } from "./errors.js";
+import { durableReviewCandidateIds } from "./review_queue.js";
+import { hookInbox } from "./hook_inbox.js";
+import { projectScopeRepository } from "./project_scope.js";
+import { captureSessionSnapshot, releaseSessionSnapshot } from "./storage_enhanced.js";
 function truthy(value) {
     return /^(?:1|true|yes|on)$/i.test(value?.trim() ?? "");
 }
@@ -128,19 +133,36 @@ export class BackgroundLifecycle {
     ownerId = `${process.pid}:${randomUUID()}`;
     review;
     sourceState;
+    candidatesDurable;
+    inbox;
+    processHookEvent;
     timer;
+    deadlineTimer;
+    nextDeadlineAt;
+    deadlineBackoffUntil = 0;
+    deadlineArmGeneration = 0;
+    deadlineRearmQueue = Promise.resolve();
     activeRun;
+    activeReviewReady;
     activeController;
     activeFence;
+    fenceClaiming = false;
     shutdownRun;
+    manualRuns = new Map();
     started = false;
     stopping = false;
     constructor(options) {
         this.options = options;
         this.sourceState = options.source_state ?? ((sessionId) => getReviewSourceState(sessionId, "recent"));
-        this.review = options.review ?? (async ({ session_id, signal, before_apply, with_apply_lease }) => {
-            const result = await runReview({
+        this.candidatesDurable = options.candidates_durable ?? durableReviewCandidateIds;
+        this.inbox = options.hook_inbox ?? hookInbox;
+        this.processHookEvent = options.process_hook_event ?? ((event) => this.applyHookEvent(event));
+        this.review = options.review ?? (async ({ session_id, scope, stage, source_fingerprint, signal, before_apply, with_apply_lease }) => {
+            const result = await runReviewSingleFlight({
                 session_id,
+                scope,
+                stage,
+                source_fingerprint,
                 review_scope: "recent",
                 review_mode: options.review_mode,
                 auto_apply: options.auto_apply,
@@ -154,6 +176,8 @@ export class BackgroundLifecycle {
                 outcome_class: result.success
                     ? (result.auto_apply_blocked ? `blocked:${result.auto_apply_blocked}` : "success")
                     : (result.error_class ?? "review_failed"),
+                stage: result.review_mode_used ?? stage,
+                candidate_ids: result.candidate_heuristics.map((candidate) => candidate.id),
             };
         });
     }
@@ -162,6 +186,8 @@ export class BackgroundLifecycle {
             enabled: this.options.enabled,
             started: this.started,
             timer_unrefed: Boolean(this.timer && !this.timer.hasRef()),
+            deadline_timer_unrefed: Boolean(this.deadlineTimer && !this.deadlineTimer.hasRef()),
+            ...(this.nextDeadlineAt ? { next_deadline_at: this.nextDeadlineAt } : {}),
             running: Boolean(this.activeRun),
             stopping: this.stopping,
             interval_ms: this.options.interval_ms,
@@ -169,6 +195,13 @@ export class BackgroundLifecycle {
             review_mode: this.options.review_mode,
             auto_apply: this.options.auto_apply,
         };
+    }
+    commitStage(ownerId, fencingToken, sessionId, stage, fingerprint, outcomeClass, candidateIds, expectedDirtyAt, retryAfterMs) {
+        const store = this.options.store;
+        if (typeof store.commitStage === "function") {
+            return store.commitStage(ownerId, fencingToken, sessionId, stage, fingerprint, outcomeClass, candidateIds, expectedDirtyAt, retryAfterMs);
+        }
+        return store.commitSession(ownerId, fencingToken, sessionId, fingerprint, outcomeClass, expectedDirtyAt, retryAfterMs);
     }
     start() {
         if (!this.options.enabled || this.started || this.stopping)
@@ -180,35 +213,230 @@ export class BackgroundLifecycle {
             });
         }, Math.max(10, this.options.interval_ms));
         this.timer.unref();
+        void this.rearmDeadline().catch(() => undefined);
         return this.summary();
     }
     async notifyReflectionSaved(sessionId) {
         await this.options.store.markDirty(sessionId);
+        await this.rearmDeadline();
     }
     async notifySessionEnd(sessionId) {
         await this.options.store.markDirty(sessionId);
+        await this.rearmDeadline();
         if (this.options.enabled && !this.stopping) {
             void this.runNow().catch((error) => {
                 console.error("[hermes] background review cycle failed:", error instanceof Error ? error.message : "unknown error");
             });
         }
     }
-    runNow() {
+    runNow(request) {
+        if (request) {
+            const key = reviewSingleFlightKey(request);
+            const current = this.manualRuns.get(key);
+            if (current)
+                return current;
+            const started = this.runManualReview(request).finally(() => {
+                if (this.manualRuns.get(key) === started)
+                    this.manualRuns.delete(key);
+            });
+            this.manualRuns.set(key, started);
+            return started;
+        }
         if (!this.options.enabled || this.stopping)
             return Promise.resolve();
         if (this.activeRun)
             return this.activeRun;
+        let resolveReady;
+        const ready = {
+            promise: new Promise((resolve) => { resolveReady = resolve; }),
+            resolve: () => resolveReady(),
+        };
+        this.activeReviewReady = ready;
         const wrapped = this.runCycle().finally(() => {
+            ready.resolve();
+            if (this.activeReviewReady === ready)
+                this.activeReviewReady = undefined;
             if (this.activeRun === wrapped)
                 this.activeRun = undefined;
+            void this.rearmDeadline();
         });
         this.activeRun = wrapped;
         return wrapped;
     }
-    async runCycle() {
-        const lease = await this.options.store.acquireLease(this.ownerId, this.options.lease_ms);
-        if (!lease.acquired)
+    async applyHookEvent(event) {
+        switch (event.event) {
+            case "SessionStart":
+                await projectScopeRepository.bind(event.session_id, event.project_key);
+                await captureSessionSnapshot(event.session_id);
+                break;
+            case "Stop":
+            case "SessionEnd":
+                releaseSessionSnapshot(event.session_id);
+                await this.options.store.markDirty(event.session_id, event.occurred_at);
+                await projectScopeRepository.release(event.session_id);
+                break;
+            case "PreCompact":
+                await captureSessionSnapshot(event.session_id);
+                break;
+            case "PostCompact":
+                break;
+        }
+    }
+    async consumeInboxNow() {
+        const result = await this.inbox.consume(this.processHookEvent);
+        await this.rearmDeadline();
+        return result;
+    }
+    rearmDeadline() {
+        const run = this.deadlineRearmQueue.then(() => this.armDeadlineNow());
+        this.deadlineRearmQueue = run.catch(() => undefined);
+        return run;
+    }
+    async armDeadlineNow() {
+        const generation = ++this.deadlineArmGeneration;
+        if (this.deadlineTimer)
+            clearTimeout(this.deadlineTimer);
+        this.deadlineTimer = undefined;
+        this.nextDeadlineAt = undefined;
+        if (!this.options.enabled || this.stopping)
             return;
+        const dirty = await this.options.store.dirtySessions();
+        if (generation !== this.deadlineArmGeneration)
+            return;
+        if (dirty.length === 0)
+            return;
+        const earliest = dirty.reduce((minimum, item) => {
+            const idleAt = Date.parse(item.dirty_at) + Math.max(0, this.options.idle_ms);
+            const retryAt = item.retry_after ? Date.parse(item.retry_after) : 0;
+            return Math.min(minimum, Math.max(idleAt, retryAt));
+        }, Number.POSITIVE_INFINITY);
+        const deadline = Math.max(earliest, this.deadlineBackoffUntil);
+        if (!Number.isFinite(deadline))
+            return;
+        this.nextDeadlineAt = new Date(deadline).toISOString();
+        this.deadlineTimer = setTimeout(() => {
+            this.deadlineTimer = undefined;
+            this.nextDeadlineAt = undefined;
+            void this.runNow().catch((error) => {
+                console.error("[hermes] deadline review cycle failed:", error instanceof Error ? error.message : "unknown error");
+            });
+        }, Math.max(0, deadline - Date.now()));
+        this.deadlineTimer.unref();
+    }
+    async runManualReview(request) {
+        if (this.stopping) {
+            throw new HermesError("REVIEW_IN_PROGRESS", "Background lifecycle is shutting down.", true, "Retry in a fresh MCP process.");
+        }
+        const current = inFlightReview(request);
+        if (current)
+            return current;
+        const scheduled = this.activeRun;
+        if (scheduled) {
+            const ready = this.activeReviewReady;
+            if (ready)
+                await ready.promise;
+            const joined = inFlightReview(request);
+            if (joined)
+                return joined;
+            throw new HermesError("REVIEW_IN_PROGRESS", "A scheduled background review is already using the lifecycle lease.", true, "Retry after the scheduled review completes.");
+        }
+        if (this.activeFence !== undefined || this.fenceClaiming) {
+            throw new HermesError("REVIEW_IN_PROGRESS", "Another fenced background review is already running.", true, "Retry after the current review completes.");
+        }
+        this.fenceClaiming = true;
+        let lease;
+        try {
+            lease = await this.options.store.acquireLease(this.ownerId, this.options.lease_ms);
+        }
+        finally {
+            this.fenceClaiming = false;
+        }
+        const joined = inFlightReview(request);
+        if (joined) {
+            if (lease.acquired)
+                await this.options.store.releaseLease(this.ownerId, lease.fencing_token);
+            return joined;
+        }
+        if (!lease.acquired) {
+            throw new HermesError("REVIEW_IN_PROGRESS", "Another process owns the background review lease.", true, "Retry after the current review lease is released.");
+        }
+        const ownsLease = this.activeFence === undefined;
+        if (!ownsLease) {
+            const active = inFlightReview(request);
+            if (active)
+                return active;
+            throw new HermesError("REVIEW_IN_PROGRESS", "Another local background review started first.", true, "Retry after the current review completes.");
+        }
+        this.activeFence = lease.fencing_token;
+        const controller = new AbortController();
+        this.activeController = controller;
+        const refresher = new BackgroundLeaseRefresher({
+            store: this.options.store,
+            ownerId: this.ownerId,
+            fencingToken: lease.fencing_token,
+            leaseMs: this.options.lease_ms,
+            initialExpiresAt: lease.expires_at
+                ?? new Date(Date.now() + this.options.lease_ms).toISOString(),
+            onLost: () => controller.abort(new Error("background_lease_lost")),
+        });
+        const stopRefresher = () => { void refresher.stop(); };
+        controller.signal.addEventListener("abort", stopRefresher, { once: true });
+        try {
+            if (this.stopping)
+                controller.abort(new Error("background_shutdown"));
+            if (controller.signal.aborted || !await refresher.start()) {
+                throw new HermesError("REVIEW_IN_PROGRESS", "The manual review lease was lost before provider work started.", true, "Retry after the current review lease is available.");
+            }
+            const result = await runReviewSingleFlight({
+                ...request,
+                signal: controller.signal,
+                beforeApply: () => this.options.store.isLeaseCurrent(this.ownerId, lease.fencing_token),
+                withApplyLease: (operation) => this.options.store.withCurrentLease(this.ownerId, lease.fencing_token, operation),
+            });
+            const candidateIds = result.candidate_heuristics.map((candidate) => candidate.id);
+            if (result.success && !await this.candidatesDurable(candidateIds)) {
+                throw new Error("Review candidates were not durably persisted");
+            }
+            const dirty = (await this.options.store.dirtySessions()).find((item) => item.session_id === request.session_id);
+            const outcomeClass = result.success
+                ? (result.auto_apply_blocked ? `blocked:${result.auto_apply_blocked}` : "success")
+                : (result.error_class ?? "review_failed");
+            if (controller.signal.aborted || !await refresher.refreshNow()) {
+                throw new HermesError("REVIEW_IN_PROGRESS", "The manual review lease was lost before stage commit.", true, "Retry so the durable candidates can be reviewed under a current lease.");
+            }
+            const committed = await this.commitStage(this.ownerId, lease.fencing_token, request.session_id, result.review_mode_used ?? request.stage, result.source_fingerprint || request.source_fingerprint, outcomeClass, candidateIds, dirty?.dirty_at, result.success ? undefined : this.cooldownMs(outcomeClass));
+            if (!committed) {
+                throw new HermesError("REVIEW_IN_PROGRESS", "The manual review stage could not be committed under the current lease.", true, "Retry so the durable candidates and stage fingerprint can be reconciled.");
+            }
+            return result;
+        }
+        finally {
+            controller.signal.removeEventListener("abort", stopRefresher);
+            this.activeController = undefined;
+            await refresher.stop();
+            await this.options.store.releaseLease(this.ownerId, lease.fencing_token);
+            if (this.activeFence === lease.fencing_token)
+                this.activeFence = undefined;
+            void this.rearmDeadline();
+        }
+    }
+    async runCycle() {
+        await this.inbox.consume(this.processHookEvent);
+        if (this.activeFence !== undefined || this.fenceClaiming)
+            return;
+        this.fenceClaiming = true;
+        let lease;
+        try {
+            lease = await this.options.store.acquireLease(this.ownerId, this.options.lease_ms);
+        }
+        finally {
+            this.fenceClaiming = false;
+        }
+        if (!lease.acquired) {
+            this.deadlineBackoffUntil = Date.now() + 1_000;
+            return;
+        }
+        this.deadlineBackoffUntil = 0;
         this.activeFence = lease.fencing_token;
         const controller = new AbortController();
         this.activeController = controller;
@@ -240,28 +468,52 @@ export class BackgroundLifecycle {
                 if (!await refresher.refreshNow())
                     break;
                 const current = await this.sourceState(item.session_id);
-                if (current.reflection_count === 0 || current.source_fingerprint === item.last_reviewed_fingerprint) {
-                    await this.options.store.commitSession(this.ownerId, lease.fencing_token, item.session_id, current.source_fingerprint, current.reflection_count === 0 ? "no_reflections" : "unchanged", item.dirty_at);
+                const requestedStage = this.options.review_mode === "deterministic"
+                    ? "deterministic"
+                    : (getReviewReadinessStatus().ready ? "llm" : "deterministic");
+                const reviewedFingerprint = item[requestedStage]?.fingerprint;
+                if (current.reflection_count === 0 || current.source_fingerprint === reviewedFingerprint) {
+                    await this.commitStage(this.ownerId, lease.fencing_token, item.session_id, requestedStage, current.source_fingerprint, current.reflection_count === 0 ? "no_reflections" : "unchanged", [], item.dirty_at);
                     continue;
                 }
                 let output;
                 try {
-                    output = await this.review({
+                    const review = this.review({
                         session_id: item.session_id,
+                        scope: current.scope ?? "global",
+                        stage: requestedStage,
+                        source_fingerprint: current.source_fingerprint,
                         signal: controller.signal,
                         before_apply: () => this.options.store.isLeaseCurrent(this.ownerId, lease.fencing_token),
                         with_apply_lease: (operation) => this.options.store.withCurrentLease(this.ownerId, lease.fencing_token, operation),
                     });
+                    this.activeReviewReady?.resolve();
+                    output = await review;
                 }
                 catch {
                     if (controller.signal.aborted)
                         break;
-                    output = { success: false, source_fingerprint: current.source_fingerprint, outcome_class: "internal_error" };
+                    output = {
+                        success: false,
+                        source_fingerprint: current.source_fingerprint,
+                        outcome_class: "internal_error",
+                        stage: requestedStage,
+                        candidate_ids: [],
+                    };
                 }
                 if (controller.signal.aborted || output.outcome_class === "aborted")
                     break;
+                const candidateIds = output.candidate_ids ?? [];
+                const completedStage = output.stage ?? requestedStage;
+                if (output.success && !await this.candidatesDurable(candidateIds)) {
+                    output = {
+                        ...output,
+                        success: false,
+                        outcome_class: "candidate_persistence_unverified",
+                    };
+                }
                 const retryAfterMs = output.success ? undefined : this.cooldownMs(output.outcome_class);
-                await this.options.store.commitSession(this.ownerId, lease.fencing_token, item.session_id, output.source_fingerprint || current.source_fingerprint, output.outcome_class, item.dirty_at, retryAfterMs);
+                await this.commitStage(this.ownerId, lease.fencing_token, item.session_id, completedStage, output.source_fingerprint || current.source_fingerprint, output.outcome_class, candidateIds, item.dirty_at, retryAfterMs);
             }
         }
         finally {
@@ -291,13 +543,21 @@ export class BackgroundLifecycle {
             if (this.timer)
                 clearInterval(this.timer);
             this.timer = undefined;
+            this.deadlineArmGeneration += 1;
+            if (this.deadlineTimer)
+                clearTimeout(this.deadlineTimer);
+            this.deadlineTimer = undefined;
+            this.nextDeadlineAt = undefined;
             this.activeController?.abort();
-            const active = this.activeRun;
-            if (active) {
+            const active = [
+                ...(this.activeRun ? [this.activeRun] : []),
+                ...this.manualRuns.values(),
+            ];
+            if (active.length > 0) {
                 let drainTimer;
                 try {
                     await Promise.race([
-                        active.catch(() => undefined),
+                        Promise.allSettled(active).then(() => undefined),
                         new Promise((resolve) => {
                             drainTimer = setTimeout(resolve, Math.max(0, timeoutMs));
                             drainTimer.unref();

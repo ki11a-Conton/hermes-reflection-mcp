@@ -1,25 +1,37 @@
 // ============================================================
 // Hermes Reflection MCP persistent storage
 // ============================================================
-import { appendFile, copyFile, open, rename, writeFile, mkdir, rm, stat } from "fs/promises";
+import { appendFile, copyFile, rename, writeFile, mkdir, rm, stat } from "fs/promises";
 import { existsSync } from "fs";
-import { randomUUID } from "crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash, randomUUID } from "crypto";
 import { homedir } from "os";
 import { join } from "path";
 import { scanForThreats, firstThreatMessage, containsInvisibleChars, MAX_SCAN_CHARS } from "./src/threat_patterns.js";
 import { withFileLock } from "./src/file_lock.js";
 import { redactSensitiveText } from "./src/redaction.js";
+import { evidenceId, evidenceSignal, feedbackSignal, lessonContentHash } from "./src/evidence.js";
 import { AuthoritativeStateError, preserveCorruptUtf8, readAuthoritativeJson, readAuthoritativeUtf8, } from "./src/authoritative_state.js";
 const WINDOWS_RENAME_RETRIES = 5;
+const REVIEW_CANDIDATE_LESSON_MAX = 1_000;
+const REVIEW_CANDIDATE_TAGS_MAX = 100;
+const REVIEW_CANDIDATE_SOURCE_IDS_MAX = 50;
+const REVIEW_CANDIDATE_PENDING_PER_SCOPE_MAX = 100;
+const REVIEW_CANDIDATE_TERMINAL_PER_SCOPE_MAX = 20;
 export const STORE_DIR = join(homedir(), ".hermes-reflection");
 const STORE_PATH = join(STORE_DIR, "store.json");
 const REFLECTIONS_PATH = join(STORE_DIR, "reflections.jsonl");
 const RESOLVED_QUESTIONS_PATH = join(STORE_DIR, "resolved_questions.json");
-export const VERSION = "19.4.0";
+const OPERATION_JOURNAL_PATH = join(STORE_DIR, "operation_journal.json");
+const OPERATION_JOURNAL_LOCK_PATH = join(STORE_DIR, "operation_journal.lock");
+const operationJournalMutationContext = new AsyncLocalStorage();
+function crossStoreOperationActive() {
+    return existsSync(OPERATION_JOURNAL_PATH) || existsSync(OPERATION_JOURNAL_LOCK_PATH);
+}
+export const VERSION = "20.0.0";
 export const HEURISTIC_DEDUP_THRESHOLD = 0.75;
 const WORLD_FACT_DEDUP_THRESHOLD = 0.65;
 export const HEURISTIC_MAX_COUNT = 500;
-const HEURISTIC_PRUNE_CONFIDENCE = 0.2;
 export const REFLECTION_SOFT_LIMIT = 2000;
 const SEARCH_MIN_TEXT_SCORE = 0.05;
 const EBBINGHAUS_BASE_STABILITY_DAYS = 30;
@@ -70,6 +82,8 @@ function sanitizeHeuristicForOutput(heuristic) {
         tags: [...(heuristic.tags ?? [])],
         contradiction_notes: [...(heuristic.contradiction_notes ?? [])],
         supersedes: [...(heuristic.supersedes ?? [])],
+        evidence: (heuristic.evidence ?? []).map((item) => ({ ...item })),
+        feedback: (heuristic.feedback ?? []).map((item) => ({ ...item })),
     };
 }
 let mutationQueue = Promise.resolve();
@@ -79,7 +93,6 @@ let _mutationStore = null;
 let _storeIndexDirty = false;
 const CACHE_TTL_MS = 500;
 let _resolvedQuestionsCache = null;
-let _mutationResolvedIndex = null;
 const RESOLVED_QUESTIONS_CACHE_TTL_MS = 500;
 const PENDING_CLAIM_STALE_MS = 5 * 60_000;
 function isPendingClaimStale(mutation) {
@@ -342,52 +355,270 @@ async function getCachedResolvedQuestions() {
 }
 function invalidateResolvedQuestionsCache() {
     _resolvedQuestionsCache = null;
-    _mutationResolvedIndex = null;
 }
 async function ensureStoreDir() {
     if (!existsSync(STORE_DIR)) {
         await mkdir(STORE_DIR, { recursive: true });
     }
 }
+function requireRecord(value, label) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error(`${label} must be an object`);
+    }
+    return value;
+}
+function requireStoredScope(value, label) {
+    if (value === "global")
+        return value;
+    if (typeof value === "string" && /^project:[A-Za-z0-9._:-]{1,128}$/.test(value)) {
+        return value;
+    }
+    throw new Error(`${label}.scope is invalid`);
+}
+function requireStoredTimestamp(value, label) {
+    if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
+        throw new Error(`${label} must be an ISO timestamp`);
+    }
+    return value;
+}
+function validateLegacyReflectionRaw(value, label) {
+    const raw = requireRecord(value, label);
+    if (typeof raw.id !== "string" || raw.id.length === 0)
+        throw new Error(`${label}.id is required`);
+    requireStoredTimestamp(raw.timestamp, `${label}.timestamp`);
+    if (typeof raw.session_id !== "string" || raw.session_id.length === 0)
+        throw new Error(`${label}.session_id is required`);
+    if (typeof raw.task_goal !== "string")
+        throw new Error(`${label}.task_goal must be a string`);
+}
+function validateV20ReflectionRaw(value, label) {
+    validateLegacyReflectionRaw(value, label);
+    requireStoredScope(value.scope, label);
+}
+function validateLegacyHeuristicRaw(value, label) {
+    const raw = requireRecord(value, label);
+    if (typeof raw.id !== "string" || raw.id.length === 0)
+        throw new Error(`${label}.id is required`);
+    requireStoredTimestamp(raw.created_at, `${label}.created_at`);
+    requireStoredTimestamp(raw.updated_at, `${label}.updated_at`);
+    if (typeof raw.heuristic !== "string")
+        throw new Error(`${label}.heuristic must be a string`);
+    if (typeof raw.source_task !== "string")
+        throw new Error(`${label}.source_task must be a string`);
+}
+function validateV20HeuristicRaw(value, label) {
+    validateLegacyHeuristicRaw(value, label);
+    const raw = value;
+    requireStoredScope(raw.scope, label);
+    if (!Array.isArray(raw.evidence))
+        throw new Error(`${label}.evidence must be an array`);
+    for (const [index, unknownEvidence] of raw.evidence.entries()) {
+        const evidence = requireRecord(unknownEvidence, `${label}.evidence[${index}]`);
+        if (typeof evidence.id !== "string" || !/^[a-f0-9]{64}$/.test(evidence.id)) {
+            throw new Error(`${label}.evidence[${index}].id must be a sha256 value`);
+        }
+        if (typeof evidence.source_task !== "string")
+            throw new Error(`${label}.evidence[${index}].source_task must be a string`);
+        if (typeof evidence.content_hash !== "string" || !/^[a-f0-9]{64}$/.test(evidence.content_hash)) {
+            throw new Error(`${label}.evidence[${index}].content_hash must be a sha256 value`);
+        }
+        requireStoredTimestamp(evidence.created_at, `${label}.evidence[${index}].created_at`);
+        if (evidence.source_reflection_id !== undefined && typeof evidence.source_reflection_id !== "string") {
+            throw new Error(`${label}.evidence[${index}].source_reflection_id must be a string`);
+        }
+    }
+    if (!Array.isArray(raw.feedback))
+        throw new Error(`${label}.feedback must be an array`);
+    for (const [index, unknownFeedback] of raw.feedback.entries()) {
+        const feedback = requireRecord(unknownFeedback, `${label}.feedback[${index}]`);
+        if (typeof feedback.heuristic_id !== "string" || typeof feedback.reflection_id !== "string") {
+            throw new Error(`${label}.feedback[${index}] identifiers must be strings`);
+        }
+        if (feedback.value !== "helpful" && feedback.value !== "harmful" && feedback.value !== "irrelevant") {
+            throw new Error(`${label}.feedback[${index}].value is invalid`);
+        }
+        requireStoredTimestamp(feedback.created_at, `${label}.feedback[${index}].created_at`);
+    }
+}
+function validateLegacyStoreRaw(value) {
+    const raw = requireRecord(value, "store.json");
+    // v19 intentionally isolated malformed collection shapes: a bad optional
+    // collection normalized to empty without discarding valid neighbours.
+    asArray(raw.reflections).forEach((item, index) => validateLegacyReflectionRaw(item, `store.json.reflections[${index}]`));
+    asArray(raw.heuristics).forEach((item, index) => validateLegacyHeuristicRaw(item, `store.json.heuristics[${index}]`));
+    return raw;
+}
+function validateV20StoreRaw(value) {
+    const raw = validateLegacyStoreRaw(value);
+    for (const key of ["reflections", "affordance_gaps", "heuristics"]) {
+        if (raw[key] !== undefined && !Array.isArray(raw[key]))
+            throw new Error(`store.json.${key} must be an array`);
+    }
+    if (raw.sessions !== undefined && (!raw.sessions || typeof raw.sessions !== "object" || Array.isArray(raw.sessions))) {
+        throw new Error("store.json.sessions must be an object");
+    }
+    const metadata = requireRecord(raw.metadata, "store.json.metadata");
+    if (metadata.store_schema_version !== 2) {
+        throw new Error(`store_schema_version must be 2, got ${String(metadata.store_schema_version)}`);
+    }
+    asArray(raw.reflections).forEach((item, index) => validateV20ReflectionRaw(item, `store.json.reflections[${index}]`));
+    asArray(raw.heuristics).forEach((item, index) => validateV20HeuristicRaw(item, `store.json.heuristics[${index}]`));
+    return raw;
+}
+async function readRawReflectionSnapshot(fallback) {
+    const loaded = await readAuthoritativeUtf8(REFLECTIONS_PATH);
+    if (!loaded.exists)
+        return fallback;
+    const rows = [];
+    for (const [index, line] of loaded.raw.split(/\r?\n/).entries()) {
+        if (!line.trim())
+            continue;
+        try {
+            rows.push(JSON.parse(line));
+        }
+        catch (error) {
+            const backup = await preserveCorruptUtf8(REFLECTIONS_PATH, loaded.raw);
+            throw new AuthoritativeStateError(`Refusing to continue: reflections.jsonl line ${index + 1} cannot be parsed. Evidence backup: ${backup}. Nothing was changed.`, { cause: error });
+        }
+    }
+    return rows.length > 0 ? rows : fallback;
+}
+async function rejectInvalidStore(raw, reason) {
+    const backup = await preserveCorruptUtf8(STORE_PATH, raw);
+    throw new AuthoritativeStateError(`Refusing to continue: store.json is invalid (${reason}). Evidence backup: ${backup}. Nothing was changed.`);
+}
+export async function initializeStoreV20() {
+    await ensureStoreDir();
+    await withFileLock(STORE_PATH, async () => {
+        const loaded = await readAuthoritativeJson(STORE_PATH, "Hermes Reflection main store");
+        if (!loaded.exists)
+            return;
+        let raw;
+        try {
+            raw = requireRecord(loaded.value, "store.json");
+        }
+        catch (error) {
+            return rejectInvalidStore(loaded.raw, error instanceof Error ? error.message : "invalid root value");
+        }
+        const metadata = raw.metadata && typeof raw.metadata === "object" && !Array.isArray(raw.metadata)
+            ? raw.metadata
+            : undefined;
+        const schemaVersion = metadata?.store_schema_version;
+        if (schemaVersion !== undefined && schemaVersion !== 2) {
+            const reason = typeof schemaVersion === "number" && schemaVersion > 2
+                ? `future store_schema_version ${schemaVersion} is unsupported`
+                : `store_schema_version ${String(schemaVersion)} is invalid`;
+            await rejectInvalidStore(loaded.raw, reason);
+        }
+        const fallbackRows = asArray(raw.reflections);
+        const rawReflectionRows = await readRawReflectionSnapshot(fallbackRows);
+        if (schemaVersion === 2) {
+            try {
+                validateV20StoreRaw(raw);
+                rawReflectionRows.forEach((item, index) => validateV20ReflectionRaw(item, `reflections.jsonl[${index}]`));
+            }
+            catch (error) {
+                await rejectInvalidStore(loaded.raw, error instanceof Error ? error.message : "invalid schema-2 state");
+            }
+            return;
+        }
+        try {
+            validateLegacyStoreRaw(raw);
+            rawReflectionRows.forEach((item, index) => validateLegacyReflectionRaw(item, `reflections.jsonl[${index}]`));
+        }
+        catch (error) {
+            await rejectInvalidStore(loaded.raw, error instanceof Error ? error.message : "invalid legacy state");
+        }
+        const now = new Date().toISOString();
+        const reflections = uniqueById(rawReflectionRows.map((item) => ({
+            ...normalizeReflectionFrame(item),
+            scope: "global",
+        })));
+        const heuristics = uniqueById(asArray(raw.heuristics).map((item) => {
+            const normalized = normalizeHeuristicRecord(item);
+            return {
+                ...normalized,
+                scope: "global",
+                evidence: [{
+                        id: evidenceId(normalized.source_task, normalized.heuristic),
+                        source_task: normalized.source_task,
+                        content_hash: lessonContentHash(normalized.heuristic),
+                        created_at: normalized.created_at,
+                    }],
+                feedback: [],
+            };
+        }));
+        const normalizedMetadata = normalizeStoreMetadata(raw.metadata) ?? {
+            store_schema_version: 2,
+            created_at: now,
+            last_written_at: now,
+            write_count: 0,
+            pending_mutations: [],
+            review_candidates: [],
+        };
+        normalizedMetadata.store_schema_version = 2;
+        const migrated = {
+            sessions: normalizeSessionsRecord(recordValue(raw.sessions)),
+            reflections,
+            affordance_gaps: uniqueById(asArray(raw.affordance_gaps).map((gap) => normalizeAffordanceGapRecord(gap))),
+            heuristics,
+            version: typeof raw.version === "string" ? raw.version : VERSION,
+            memory_board: normalizeMemoryBoard(raw.memory_board),
+            user_profile: normalizeMemoryBoard(raw.user_profile, 1800),
+            metadata: normalizedMetadata,
+        };
+        reconcileSessionCounters(migrated, false);
+        const indexBytes = JSON.stringify({ ...migrated, reflections: undefined }, null, 2);
+        const reflectionBytes = reflections.map((reflection) => JSON.stringify(reflection)).join("\n");
+        const storeTemp = join(STORE_DIR, `store.json.v20.${process.pid}.${randomUUID()}.tmp`);
+        const reflectionsTemp = join(STORE_DIR, `reflections.jsonl.v20.${process.pid}.${randomUUID()}.tmp`);
+        try {
+            await writeFile(storeTemp, indexBytes, { encoding: "utf8", mode: 0o600 });
+            await writeFile(reflectionsTemp, reflectionBytes ? `${reflectionBytes}\n` : "", { encoding: "utf8", mode: 0o600 });
+            validateV20StoreRaw(JSON.parse(indexBytes));
+            reflectionBytes.split(/\r?\n/).filter(Boolean).forEach((line, index) => validateV20ReflectionRaw(JSON.parse(line), `staged reflections.jsonl[${index}]`));
+            await replaceFileAtomically(reflectionsTemp, REFLECTIONS_PATH);
+            await replaceFileAtomically(storeTemp, STORE_PATH);
+            invalidateStoreCache();
+        }
+        finally {
+            await rm(storeTemp, { force: true }).catch(() => undefined);
+            await rm(reflectionsTemp, { force: true }).catch(() => undefined);
+        }
+    });
+}
 export async function loadStore() {
     await ensureStoreDir();
     const loaded = await readAuthoritativeJson(STORE_PATH, "Hermes Reflection main store");
     if (!loaded.exists) {
         const store = emptyStore();
-        store.reflections = await loadReflections();
+        store.reflections = await loadReflections([], true);
         reconcileSessionCounters(store, true);
         return store;
     }
-    if (loaded.value === null || typeof loaded.value !== "object" || Array.isArray(loaded.value)) {
-        const backup = await preserveCorruptUtf8(STORE_PATH, loaded.raw);
-        throw new AuthoritativeStateError(`Refusing to continue: Hermes Reflection main store store.json must contain an object. Evidence backup: ${backup}. Nothing was changed.`);
+    const parsed = requireRecord(loaded.value, "store.json");
+    const metadata = recordValue(parsed.metadata);
+    if (metadata.store_schema_version !== 2) {
+        // Validate JSONL first so an existing corrupt sidecar remains the primary
+        // fail-closed diagnostic and cannot be hidden by a migration-required error.
+        await readRawReflectionSnapshot(asArray(parsed.reflections));
+        throw new AuthoritativeStateError("Refusing to continue: store.json requires initializeStoreV20() before normal reads. Nothing was changed.");
     }
-    const parsed = loaded.value;
-    const legacyReflections = asArray(parsed.reflections).map((reflection) => normalizeReflectionFrame(reflection));
-    // Validate the authoritative JSONL snapshot before any legacy migration
-    // writes. A corrupt sidecar must not cause store.json to be cleared first.
-    const reflections = await loadReflections(legacyReflections);
-    if (legacyReflections.length > 0) {
-        if (!existsSync(REFLECTIONS_PATH)) {
-            await replaceReflectionsFile(legacyReflections);
-        }
-        await writeStoreIndex({
-            sessions: normalizeSessionsRecord(recordValue(parsed.sessions)),
-            reflections: [],
-            affordance_gaps: asArray(parsed.affordance_gaps)
-                .map((gap) => normalizeAffordanceGapRecord(gap)),
-            heuristics: asArray(parsed.heuristics).map(normalizeHeuristicRecord),
-            version: typeof parsed.version === "string" ? parsed.version : VERSION,
-            memory_board: normalizeMemoryBoard(parsed.memory_board),
-            user_profile: normalizeMemoryBoard(parsed.user_profile, 1800),
-            metadata: normalizeStoreMetadata(parsed.metadata),
-        }, false);
+    let rawRows;
+    try {
+        validateV20StoreRaw(loaded.value);
+        rawRows = await readRawReflectionSnapshot(asArray(parsed.reflections));
+        rawRows.forEach((item, index) => validateV20ReflectionRaw(item, `reflections.jsonl[${index}]`));
+    }
+    catch (error) {
+        if (error instanceof AuthoritativeStateError)
+            throw error;
+        return rejectInvalidStore(loaded.raw, error instanceof Error ? error.message : "invalid schema-2 state");
     }
     const store = {
         sessions: normalizeSessionsRecord(recordValue(parsed.sessions)),
-        reflections,
-        affordance_gaps: uniqueById(asArray(parsed.affordance_gaps)
-            .map((gap) => normalizeAffordanceGapRecord(gap))),
+        reflections: uniqueById(rawRows.map((item) => normalizeReflectionFrame(item))),
+        affordance_gaps: uniqueById(asArray(parsed.affordance_gaps).map((gap) => normalizeAffordanceGapRecord(gap))),
         heuristics: uniqueById(asArray(parsed.heuristics).map(normalizeHeuristicRecord)),
         version: typeof parsed.version === "string" ? parsed.version : VERSION,
         memory_board: normalizeMemoryBoard(parsed.memory_board),
@@ -408,10 +639,12 @@ function emptyStore() {
         memory_board: { entries: [], char_limit: 2200, used_chars: 0 },
         user_profile: { entries: [], char_limit: 1800, used_chars: 0 },
         metadata: {
+            store_schema_version: 2,
             created_at: now,
             last_written_at: now,
             write_count: 0,
             pending_mutations: [],
+            review_candidates: [],
         },
     };
 }
@@ -515,6 +748,7 @@ function normalizeReflectionFrame(input) {
         id: typeof source.id === "string" && source.id ? source.id : generateId(),
         timestamp: normalizeIsoTimestamp(source.timestamp, now),
         session_id: sessionId,
+        scope: normalizeMemoryScope(source.scope),
         task_goal: typeof source.task_goal === "string" ? source.task_goal : "",
         task_outcome: normalizeTaskOutcome(source.task_outcome),
         failure_mode: normalizeFailureMode(source.failure_mode),
@@ -547,6 +781,9 @@ function normalizeHeuristicRecord(h) {
         heuristic: typeof h.heuristic === "string" ? h.heuristic : "",
         source_task: typeof h.source_task === "string" ? h.source_task : "",
         session_id: typeof h.session_id === "string" ? h.session_id : undefined,
+        scope: normalizeMemoryScope(h.scope),
+        evidence: normalizeHeuristicEvidence(h.evidence),
+        feedback: normalizeHeuristicFeedback(h.feedback),
         reinforcement_count: normalizeNonNegativeInteger(h.reinforcement_count, 1, 1),
         contradiction_count: normalizeNonNegativeInteger(h.contradiction_count, 0),
         contradiction_notes: stringArray(h.contradiction_notes),
@@ -563,6 +800,44 @@ function normalizeHeuristicRecord(h) {
         version: normalizeNonNegativeInteger(h.version, 1, 1),
         tags: stringArray(h.tags).map((tag) => tag.toLowerCase().trim()).filter(Boolean),
     };
+}
+function normalizeMemoryScope(value) {
+    if (value === "global")
+        return value;
+    if (typeof value === "string" && /^project:[A-Za-z0-9._:-]{1,128}$/.test(value)) {
+        return value;
+    }
+    return "global";
+}
+function normalizeHeuristicEvidence(value) {
+    return asArray(value).flatMap((item) => {
+        const raw = recordValue(item);
+        if (typeof raw.id !== "string" || typeof raw.source_task !== "string"
+            || typeof raw.content_hash !== "string" || typeof raw.created_at !== "string")
+            return [];
+        return [{
+                id: raw.id,
+                ...(typeof raw.source_reflection_id === "string" ? { source_reflection_id: raw.source_reflection_id } : {}),
+                source_task: raw.source_task,
+                content_hash: raw.content_hash,
+                created_at: raw.created_at,
+            }];
+    });
+}
+function normalizeHeuristicFeedback(value) {
+    return asArray(value).flatMap((item) => {
+        const raw = recordValue(item);
+        if (typeof raw.heuristic_id !== "string" || typeof raw.reflection_id !== "string"
+            || (raw.value !== "helpful" && raw.value !== "harmful" && raw.value !== "irrelevant")
+            || typeof raw.created_at !== "string")
+            return [];
+        return [{
+                heuristic_id: raw.heuristic_id,
+                reflection_id: raw.reflection_id,
+                value: raw.value,
+                created_at: raw.created_at,
+            }];
+    });
 }
 function uniqueById(items) {
     const seen = new Set();
@@ -640,6 +915,67 @@ function normalizeSessionsRecord(input) {
     }
     return sessions;
 }
+function normalizeReviewCandidate(value, fallbackTimestamp) {
+    const input = recordValue(value);
+    const id = typeof input.id === "string" && /^[A-Za-z0-9._:-]{1,100}$/.test(input.id) ? input.id : undefined;
+    const scope = normalizeMemoryScope(input.scope);
+    const stage = input.stage === "deterministic" || input.stage === "llm" ? input.stage : undefined;
+    const fingerprint = typeof input.source_fingerprint === "string" && /^[a-f0-9]{64}$/i.test(input.source_fingerprint)
+        ? input.source_fingerprint.toLowerCase()
+        : undefined;
+    const heuristic = typeof input.heuristic === "string" ? input.heuristic.trim() : "";
+    const domain = typeof input.domain === "string" ? input.domain.trim() : "";
+    const state = input.state === "pending" || input.state === "applied" || input.state === "rejected"
+        ? input.state
+        : undefined;
+    const sourceIds = asArray(input.source_reflection_ids)
+        .filter((item) => typeof item === "string" && item.length > 0 && item.length <= 100)
+        .slice(0, REVIEW_CANDIDATE_SOURCE_IDS_MAX);
+    const tags = [...new Set(asArray(input.tags)
+            .filter((item) => typeof item === "string" && item.length > 0 && item.length <= 100))]
+        .slice(0, REVIEW_CANDIDATE_TAGS_MAX);
+    const riskReasons = [...new Set(asArray(input.risk_reasons)
+            .filter((item) => typeof item === "string" && item.length > 0 && item.length <= 200))]
+        .slice(0, 20);
+    const confidence = Number(input.confidence);
+    const mutationId = typeof input.mutation_id === "string" && /^[A-Za-z0-9._:-]{1,100}$/.test(input.mutation_id)
+        ? input.mutation_id
+        : undefined;
+    if (!id || !stage || !fingerprint || !heuristic || heuristic.length > REVIEW_CANDIDATE_LESSON_MAX
+        || !domain || domain.length > 100 || !state || !Number.isFinite(confidence) || confidence < 0 || confidence > 1
+        || (state === "pending" && !mutationId)) {
+        return null;
+    }
+    return {
+        id,
+        created_at: normalizeIsoTimestamp(input.created_at, fallbackTimestamp),
+        scope,
+        stage,
+        source_fingerprint: fingerprint,
+        source_reflection_ids: sourceIds,
+        heuristic,
+        domain,
+        tags,
+        confidence,
+        risk_reasons: riskReasons,
+        state,
+        ...(mutationId ? { mutation_id: mutationId } : {}),
+    };
+}
+function boundReviewCandidateAudit(candidates) {
+    const retained = new Set();
+    const scopes = new Set(candidates.map((candidate) => candidate.scope));
+    for (const scope of scopes) {
+        const scoped = candidates.filter((candidate) => candidate.scope === scope);
+        for (const item of scoped.filter((candidate) => candidate.state === "pending").slice(-REVIEW_CANDIDATE_PENDING_PER_SCOPE_MAX)) {
+            retained.add(item.id);
+        }
+        for (const item of scoped.filter((candidate) => candidate.state !== "pending").slice(-REVIEW_CANDIDATE_TERMINAL_PER_SCOPE_MAX)) {
+            retained.add(item.id);
+        }
+    }
+    return candidates.filter((candidate) => retained.has(candidate.id));
+}
 function normalizeStoreMetadata(value) {
     if (value === null || typeof value !== "object" || Array.isArray(value))
         return undefined;
@@ -673,16 +1009,25 @@ function normalizeStoreMetadata(value) {
                 : { state: "pending" }),
         });
     }
+    const reviewCandidates = boundReviewCandidateAudit(asArray(input.review_candidates)
+        .map((item) => normalizeReviewCandidate(item, now))
+        .filter((item) => item !== null));
+    const reviewMutationIds = new Set(reviewCandidates
+        .filter((candidate) => candidate.state === "pending" && candidate.mutation_id)
+        .map((candidate) => candidate.mutation_id));
+    const consistentPending = pending.filter((mutation) => mutation.operation !== "apply_review_candidate" || reviewMutationIds.has(mutation.id));
     const provider = recordValue(input.external_provider);
     const providerName = typeof provider.name === "string" && provider.name.trim()
         ? provider.name.trim()
         : undefined;
     return {
+        store_schema_version: 2,
         created_at: normalizeIsoTimestamp(input.created_at, now),
         last_written_at: normalizeIsoTimestamp(input.last_written_at, now),
         write_count: normalizeNonNegativeInteger(input.write_count, 0),
         ...(typeof input.write_approval === "boolean" ? { write_approval: input.write_approval } : {}),
-        pending_mutations: pending,
+        pending_mutations: consistentPending,
+        review_candidates: reviewCandidates,
         ...(providerName
             ? {
                 external_provider: {
@@ -706,7 +1051,7 @@ async function writeStoreIndex(store, incrementWriteCount) {
             store.metadata.write_count = (store.metadata.write_count ?? 0) + 1;
         }
         else {
-            store.metadata = { created_at: now, last_written_at: now, write_count: 1 };
+            store.metadata = { store_schema_version: 2, created_at: now, last_written_at: now, write_count: 1 };
         }
         _storeIndexDirty = false;
     }
@@ -754,7 +1099,10 @@ function isWindowsRenameRetryable(error) {
     const code = error.code;
     return code === "EPERM" || code === "EACCES" || code === "EEXIST";
 }
-async function loadReflections(fallback = []) {
+async function loadReflections(fallback = [], requireV20 = true) {
+    if (requireV20) {
+        fallback.forEach((reflection, index) => validateV20ReflectionRaw(reflection, `fallback reflections[${index}]`));
+    }
     const normalizedFallback = fallback.map((reflection) => normalizeReflectionFrame(reflection));
     const loaded = await readAuthoritativeUtf8(REFLECTIONS_PATH);
     if (!loaded.exists)
@@ -764,7 +1112,10 @@ async function loadReflections(fallback = []) {
         if (!line.trim())
             continue;
         try {
-            results.push(normalizeReflectionFrame(JSON.parse(line)));
+            const parsed = JSON.parse(line);
+            if (requireV20)
+                validateV20ReflectionRaw(parsed, `reflections.jsonl[${index}]`);
+            results.push(normalizeReflectionFrame(parsed));
         }
         catch (error) {
             const backup = await preserveCorruptUtf8(REFLECTIONS_PATH, loaded.raw);
@@ -772,61 +1123,6 @@ async function loadReflections(fallback = []) {
         }
     }
     return results.length > 0 ? uniqueById(results) : uniqueById(normalizedFallback);
-}
-function parseReflectionLines(lines) {
-    const results = [];
-    for (const line of lines) {
-        try {
-            results.push(normalizeReflectionFrame(JSON.parse(line)));
-        }
-        catch (error) {
-            throw new AuthoritativeStateError("Recent reflection chunk contains invalid JSON; validating the full authoritative file.", { cause: error });
-        }
-    }
-    return uniqueById(results);
-}
-async function loadRecentReflections(limit) {
-    if (!existsSync(REFLECTIONS_PATH))
-        return [];
-    const fileStat = await stat(REFLECTIONS_PATH);
-    if (fileStat.size === 0)
-        return [];
-    let chunkSize = Math.max(limit * 2048, 8192);
-    while (chunkSize < fileStat.size) {
-        let parsed;
-        try {
-            parsed = await readRecentReflectionChunk(fileStat.size, chunkSize);
-        }
-        catch {
-            // A fast-path parse failure must not be skipped. Re-read the complete
-            // authoritative file so the exact corrupt line is backed up and reported.
-            return (await loadReflections()).slice(-limit).reverse();
-        }
-        if (parsed.length >= limit)
-            return parsed.slice(-limit).reverse();
-        chunkSize *= 2;
-    }
-    return (await loadReflections()).slice(-limit).reverse();
-}
-async function readRecentReflectionChunk(fileSize, chunkSize) {
-    const start = Math.max(0, fileSize - chunkSize);
-    const length = fileSize - start;
-    const file = await open(REFLECTIONS_PATH, "r");
-    try {
-        const buffer = Buffer.alloc(length);
-        await file.read(buffer, 0, length, start);
-        const text = buffer.toString("utf-8");
-        const newlineIndex = start > 0 ? text.indexOf("\n") : -1;
-        const safeText = newlineIndex >= 0 ? text.slice(newlineIndex + 1) : text;
-        const lines = safeText
-            .split(/\r?\n/)
-            .map((line) => line.trim())
-            .filter(Boolean);
-        return parseReflectionLines(lines);
-    }
-    finally {
-        await file.close();
-    }
 }
 async function replaceReflectionsFile(reflections) {
     await ensureStoreDir();
@@ -851,11 +1147,15 @@ async function persistStoreAfterMutation(store, reflectionHint, previousReflecti
     }
     await writeStoreIndex(store, true);
 }
-async function mutateStore(mutator, reflectionHint = "none", operationName, operationPayload) {
+async function mutateStore(mutator, reflectionHint = "none", operationName, operationPayload, preflight) {
     const run = mutationQueue.then(() => withFileLock(STORE_PATH, async () => {
+        if (operationJournalMutationContext.getStore() !== true && crossStoreOperationActive()) {
+            throw new Error("A recoverable cross-store operation is pending startup recovery; writes are temporarily blocked.");
+        }
         // A process-local cache is insufficient when multiple MCP processes share
         // one HOME. Reload only after acquiring the cross-process transaction lock.
         _mutationStore = await loadStore();
+        preflight?.(_mutationStore);
         // Write-approval gate: queue mutation instead of executing.
         // This uses the live _mutationStore because it must persist immediately.
         if (operationName && _mutationStore.metadata?.write_approval === true) {
@@ -924,6 +1224,49 @@ async function mutateStore(mutator, reflectionHint = "none", operationName, oper
         invalidateStoreCache();
     });
     return run;
+}
+export async function requireWriteApproval(operationName, operationPayload) {
+    const run = mutationQueue.then(() => withFileLock(STORE_PATH, async () => {
+        _mutationStore = await loadStore();
+        if (_mutationStore.metadata?.write_approval !== true)
+            return;
+        if (crossStoreOperationActive()) {
+            throw new Error("A recoverable cross-store operation is active; writing the approval queue is temporarily blocked.");
+        }
+        const store = _mutationStore;
+        const metadata = store.metadata;
+        const pendingId = randomUUID();
+        const pendingMutation = {
+            id: pendingId,
+            created_at: new Date().toISOString(),
+            operation: operationName,
+            preview: `Queued ${operationName} pending approval`,
+            payload: operationPayload,
+        };
+        metadata.pending_mutations = [...(metadata.pending_mutations ?? []), pendingMutation];
+        _storeIndexDirty = true;
+        await persistStoreAfterMutation(store, "none", store.reflections.length);
+        storeCache = await refreshStoreCacheAfterMutation(store, "none", store.reflections.length, storeCache);
+        const approvalError = new Error(`Operation "${operationName}" was queued for approval (pending_mutation_id: ${pendingId}). ` +
+            "Use approve_pending_mutation to approve or reject.");
+        approvalError.isPendingApproval = true;
+        approvalError.pendingMutationId = pendingId;
+        throw approvalError;
+    }));
+    mutationQueue = run.then(() => undefined, (error) => {
+        if (error instanceof Error && error.isPendingApproval === true)
+            return;
+        console.error("[hermes] storage approval preflight error:", error instanceof Error ? error.message : String(error));
+        _mutationStore = null;
+        invalidateStoreCache();
+    });
+    return run;
+}
+export async function withOperationJournalStoreMutation(callback) {
+    return operationJournalMutationContext.run(true, callback);
+}
+export async function withStoreSnapshotBarrier(callback) {
+    return withFileLock(STORE_PATH, callback);
 }
 function ensureSession(store, sessionId, startedAt) {
     let session = getOwnSession(store.sessions, sessionId);
@@ -1071,25 +1414,6 @@ function getOrBuildReflectionByIdMap(store) {
     _reflectionByIdCache.set(store, map);
     return map;
 }
-function getOrBuildHeuristicSearchTextMap(store) {
-    let map = _heuristicSearchTextCache.get(store);
-    if (map)
-        return map;
-    map = new Map();
-    for (const heuristic of store.heuristics) {
-        map.set(heuristic.id, heuristicSearchText(heuristic));
-    }
-    _heuristicSearchTextCache.set(store, map);
-    return map;
-}
-function getOrBuildHeuristicTagSetMap(store) {
-    let map = _heuristicTagSetCache.get(store);
-    if (map)
-        return map;
-    map = buildTagSetIndex(store.heuristics);
-    _heuristicTagSetCache.set(store, map);
-    return map;
-}
 function getOrBuildAffordanceGapIndex(store) {
     let index = _affordanceGapIndex.get(store);
     if (index)
@@ -1131,6 +1455,13 @@ function getOrBuildDedupCache(store) {
 function upsertHeuristicMut(store, input) {
     assertHeuristicTextSafe(input.heuristic);
     const domain = normalizeDomain(input.domain);
+    const now = new Date().toISOString();
+    const incomingEvidence = input.evidence ?? [{
+            id: evidenceId(input.source_task, input.heuristic),
+            source_task: input.source_task,
+            content_hash: lessonContentHash(input.heuristic),
+            created_at: now,
+        }];
     // Use a token-level pre-filter via write-lifetime cache before calling the
     // full BM25 similarity. This avoids re-tokenizing all active heuristics on
     // every call in bulk_reflect hot paths.
@@ -1147,6 +1478,8 @@ function upsertHeuristicMut(store, input) {
         const union = inputTokens.size + entry.tokens.size - overlap;
         if (union === 0 || overlap / union < 0.3)
             continue;
+        if (entry.ref.scope !== (input.scope ?? "global"))
+            continue;
         const dedupSimilarity = Math.max(similarity(entry.ref.heuristic, input.heuristic), similarity(input.heuristic, entry.ref.heuristic));
         if (dedupSimilarity > HEURISTIC_DEDUP_THRESHOLD) {
             existing = entry.ref;
@@ -1154,9 +1487,20 @@ function upsertHeuristicMut(store, input) {
         }
     }
     if (existing) {
-        existing.reinforcement_count++;
-        existing.confidence = Math.min(1.0, existing.confidence + 0.05);
-        existing.updated_at = new Date().toISOString();
+        const evidenceIds = new Set(existing.evidence.map((item) => item.id));
+        let newEvidenceCount = 0;
+        for (const item of incomingEvidence) {
+            if (!evidenceIds.has(item.id)) {
+                existing.evidence.push(item);
+                evidenceIds.add(item.id);
+                newEvidenceCount += 1;
+            }
+        }
+        if (newEvidenceCount > 0) {
+            existing.reinforcement_count += newEvidenceCount;
+            existing.confidence = Math.min(1.0, existing.confidence + 0.05 * newEvidenceCount);
+        }
+        let tagsChanged = false;
         if (input.tags && input.tags.length > 0) {
             const existingTagSet = new Set(existing.tags.map((t) => t.toLowerCase().trim()));
             for (const tag of input.tags) {
@@ -1164,12 +1508,14 @@ function upsertHeuristicMut(store, input) {
                 if (normalizedTag && !existingTagSet.has(normalizedTag)) {
                     existing.tags.push(tag);
                     existingTagSet.add(normalizedTag);
+                    tagsChanged = true;
                 }
             }
         }
+        if (newEvidenceCount > 0 || tagsChanged)
+            existing.updated_at = now;
         return existing;
     }
-    const now = new Date().toISOString();
     const heuristic = {
         id: generateId(),
         created_at: now,
@@ -1184,6 +1530,9 @@ function upsertHeuristicMut(store, input) {
         heuristic: input.heuristic,
         source_task: input.source_task,
         session_id: input.session_id,
+        scope: input.scope ?? "global",
+        evidence: incomingEvidence,
+        feedback: input.feedback ?? [],
         confidence: input.confidence ?? 0.6,
         tags: input.tags ?? [],
     };
@@ -1625,6 +1974,210 @@ export async function getRawMemoryStores() {
         user_profile: structuredClone(cache.store.user_profile ?? normalizeMemoryBoard(undefined, 1800)),
     };
 }
+function canonicalJsonValue(value) {
+    if (Array.isArray(value))
+        return value.map(canonicalJsonValue);
+    if (value && typeof value === "object") {
+        return Object.fromEntries(Object.entries(value)
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([key, item]) => [key, canonicalJsonValue(item)]));
+    }
+    return value;
+}
+export function pendingMutationPayloadHash(payload) {
+    return createHash("sha256").update(JSON.stringify(canonicalJsonValue(payload)), "utf8").digest("hex");
+}
+function reviewCandidateContentHash(candidate) {
+    return pendingMutationPayloadHash({
+        id: candidate.id,
+        scope: candidate.scope,
+        stage: candidate.stage,
+        source_fingerprint: candidate.source_fingerprint,
+        source_reflection_ids: candidate.source_reflection_ids,
+        heuristic: candidate.heuristic,
+        domain: candidate.domain,
+        tags: candidate.tags,
+        confidence: candidate.confidence,
+        risk_reasons: candidate.risk_reasons,
+    });
+}
+function requireReviewCandidateDraft(draft) {
+    const probe = normalizeReviewCandidate({
+        ...draft,
+        created_at: new Date().toISOString(),
+        state: "pending",
+        mutation_id: randomUUID(),
+    }, new Date().toISOString());
+    if (!probe)
+        throw new Error(`Invalid review candidate: ${draft.id}`);
+    return {
+        id: probe.id,
+        scope: probe.scope,
+        stage: probe.stage,
+        source_fingerprint: probe.source_fingerprint,
+        source_reflection_ids: probe.source_reflection_ids,
+        heuristic: probe.heuristic,
+        domain: probe.domain,
+        tags: probe.tags,
+        confidence: probe.confidence,
+        risk_reasons: probe.risk_reasons,
+    };
+}
+/** Persist candidates and their approval mutations in one locked store write. */
+export async function enqueueReviewCandidateRecords(drafts) {
+    if (drafts.length > MAX_REVIEW_CANDIDATES_PER_BATCH) {
+        throw new Error(`Review candidate batch exceeds ${MAX_REVIEW_CANDIDATES_PER_BATCH}`);
+    }
+    const validated = drafts.map(requireReviewCandidateDraft);
+    return mutateStore((store) => {
+        const metadata = store.metadata;
+        if (!metadata)
+            throw new Error("Store metadata is unavailable");
+        const candidates = metadata.review_candidates ?? [];
+        const pending = metadata.pending_mutations ?? [];
+        const saved = [];
+        for (const draft of validated) {
+            const existing = candidates.find((candidate) => candidate.id === draft.id);
+            if (existing) {
+                if (reviewCandidateContentHash(existing) !== reviewCandidateContentHash(draft)) {
+                    throw new Error(`Review candidate id collision: ${draft.id}`);
+                }
+                if (existing.state === "pending"
+                    && (!existing.mutation_id || !pending.some((mutation) => mutation.id === existing.mutation_id))) {
+                    throw new Error(`Review candidate ${draft.id} has no matching pending mutation`);
+                }
+                saved.push(structuredClone(existing));
+                continue;
+            }
+            const pendingForScope = candidates.filter((candidate) => candidate.scope === draft.scope && candidate.state === "pending").length;
+            if (pendingForScope >= REVIEW_CANDIDATE_PENDING_PER_SCOPE_MAX) {
+                throw new Error(`Pending review candidate limit reached for ${draft.scope}`);
+            }
+            const mutationId = randomUUID();
+            const candidate = {
+                ...draft,
+                created_at: new Date().toISOString(),
+                state: "pending",
+                mutation_id: mutationId,
+            };
+            const payload = {
+                candidate_id: candidate.id,
+                candidate_hash: reviewCandidateContentHash(candidate),
+            };
+            candidates.push(candidate);
+            pending.push({
+                id: mutationId,
+                created_at: candidate.created_at,
+                operation: "apply_review_candidate",
+                preview: `Apply review candidate ${candidate.id}`,
+                payload,
+                payload_hash: pendingMutationPayloadHash(payload),
+                state: "pending",
+            });
+            saved.push(structuredClone(candidate));
+        }
+        metadata.review_candidates = boundReviewCandidateAudit(candidates);
+        metadata.pending_mutations = pending;
+        return saved;
+    }, "none");
+}
+const MAX_REVIEW_CANDIDATES_PER_BATCH = 50;
+export async function listReviewCandidateRecords(scope) {
+    await mutationQueue;
+    const store = await getCachedStore();
+    return structuredClone((store.metadata?.review_candidates ?? [])
+        .filter((candidate) => !scope || candidate.scope === scope));
+}
+export async function getReviewCandidateRecord(id) {
+    const candidates = await listReviewCandidateRecords();
+    return candidates.find((candidate) => candidate.id === id) ?? null;
+}
+export async function reviewCandidateIdsExist(ids) {
+    if (ids.length === 0)
+        return true;
+    const candidates = await listReviewCandidateRecords();
+    const known = new Set(candidates.map((candidate) => candidate.id));
+    return ids.every((id) => known.has(id));
+}
+export async function validateReviewCandidateMutation(mutation) {
+    if (mutation.operation !== "apply_review_candidate" || !mutation.payload || !mutation.payload_hash) {
+        throw new Error(`Pending mutation ${mutation.id} is not a review candidate mutation`);
+    }
+    if (pendingMutationPayloadHash(mutation.payload) !== mutation.payload_hash) {
+        throw new Error(`Pending mutation ${mutation.id} payload hash mismatch`);
+    }
+    const candidateId = mutation.payload.candidate_id;
+    const candidateHash = mutation.payload.candidate_hash;
+    if (typeof candidateId !== "string" || typeof candidateHash !== "string") {
+        throw new Error(`Pending mutation ${mutation.id} has an invalid review candidate payload`);
+    }
+    const candidate = await getReviewCandidateRecord(candidateId);
+    if (!candidate || candidate.state !== "pending" || candidate.mutation_id !== mutation.id) {
+        throw new Error(`Review candidate ${candidateId} is missing, finalized, or linked to another mutation`);
+    }
+    if (reviewCandidateContentHash(candidate) !== candidateHash) {
+        throw new Error(`Review candidate ${candidateId} content hash mismatch`);
+    }
+    return candidate;
+}
+export async function completeReviewCandidateMutation(mutationId, claimToken) {
+    return mutateStore((store) => {
+        const metadata = store.metadata;
+        if (!metadata)
+            return null;
+        const pending = metadata.pending_mutations ?? [];
+        const index = pending.findIndex((item) => item.id === mutationId
+            && item.operation === "apply_review_candidate"
+            && item.state === "processing" && item.claim_token === claimToken);
+        if (index < 0)
+            return null;
+        const candidates = metadata.review_candidates ?? [];
+        const candidateIndex = candidates.findIndex((item) => item.mutation_id === mutationId && item.state === "pending");
+        const candidate = candidateIndex >= 0 ? candidates[candidateIndex] : undefined;
+        if (!candidate)
+            return null;
+        pending.splice(index, 1);
+        const finalized = { ...candidate, state: "applied" };
+        candidates.splice(candidateIndex, 1);
+        candidates.push(finalized);
+        metadata.pending_mutations = pending;
+        metadata.review_candidates = boundReviewCandidateAudit(candidates);
+        return structuredClone(finalized);
+    }, "none");
+}
+export async function rejectReviewCandidateMutation(mutationId) {
+    return mutateStore((store) => {
+        const metadata = store.metadata;
+        if (!metadata)
+            return null;
+        const pending = metadata.pending_mutations ?? [];
+        const index = pending.findIndex((mutation) => mutation.id === mutationId
+            && mutation.operation === "apply_review_candidate"
+            && ((mutation.state ?? "pending") === "pending" || isPendingClaimStale(mutation)));
+        if (index < 0)
+            return null;
+        const candidates = metadata.review_candidates ?? [];
+        const candidateIndex = candidates.findIndex((item) => item.mutation_id === mutationId && item.state === "pending");
+        const candidate = candidateIndex >= 0 ? candidates[candidateIndex] : undefined;
+        if (!candidate)
+            return null;
+        pending.splice(index, 1);
+        const finalized = { ...candidate, state: "rejected" };
+        candidates.splice(candidateIndex, 1);
+        candidates.push(finalized);
+        metadata.pending_mutations = pending;
+        metadata.review_candidates = boundReviewCandidateAudit(candidates);
+        return structuredClone(finalized);
+    }, "none");
+}
+export async function reviewCandidateCounts(scope) {
+    const candidates = await listReviewCandidateRecords(scope);
+    return {
+        pending: candidates.filter((candidate) => candidate.state === "pending").length,
+        applied: candidates.filter((candidate) => candidate.state === "applied").length,
+        rejected: candidates.filter((candidate) => candidate.state === "rejected").length,
+    };
+}
 export async function rejectPendingMutation(mutationId) {
     return mutateStore((store) => {
         const pending = store.metadata?.pending_mutations ?? [];
@@ -1670,7 +2223,10 @@ export async function completePendingMutation(mutationId, claimToken) {
 }
 /** Return a failed replay to the queue without making its payload invisible. */
 export async function releasePendingMutation(mutationId, claimToken) {
-    return mutateStore((store) => {
+    // Releasing an approval claim changes only queue metadata, which is excluded
+    // from journaled collection hashes. It must remain possible after an
+    // interrupted journaled replay so the approval is never stranded.
+    return withOperationJournalStoreMutation(() => mutateStore((store) => {
         const mutation = (store.metadata?.pending_mutations ?? []).find((item) => item.id === mutationId
             && item.state === "processing" && item.claim_token === claimToken);
         if (!mutation)
@@ -1679,7 +2235,7 @@ export async function releasePendingMutation(mutationId, claimToken) {
         delete mutation.claim_token;
         delete mutation.claimed_at;
         return true;
-    }, "none");
+    }, "none"));
 }
 export async function listPendingMutations() {
     await mutationQueue;
@@ -1708,8 +2264,55 @@ function safeAutomaticLesson(lesson) {
         return null;
     return redacted;
 }
-export async function saveReflectionAndHeuristics(reflection, lessons, domain, sourceTask, confidence, tags, operationName) {
+function planHeuristicFeedback(store, reflection, feedbackInputs, preexistingIds) {
+    const deduplicated = new Map();
+    for (const input of feedbackInputs) {
+        const previous = deduplicated.get(input.heuristic_id);
+        if (previous && previous.value !== input.value) {
+            throw new Error(`Conflicting feedback values for heuristic ${input.heuristic_id}.`);
+        }
+        deduplicated.set(input.heuristic_id, input);
+    }
+    const targets = [];
+    const byId = getOrBuildHeuristicByIdMap(store);
+    for (const input of deduplicated.values()) {
+        if (!preexistingIds.has(input.heuristic_id)) {
+            throw new Error(`Heuristic feedback target is not a preexisting ID: ${input.heuristic_id}.`);
+        }
+        const heuristic = byId.get(input.heuristic_id);
+        if (!heuristic)
+            throw new Error(`Unknown heuristic feedback target: ${input.heuristic_id}.`);
+        if (heuristic.scope !== "global" && heuristic.scope !== reflection.scope) {
+            throw new Error(`Heuristic feedback target is outside reflection scope: ${input.heuristic_id}.`);
+        }
+        if (heuristic.evidence.some((item) => item.source_reflection_id === reflection.id)) {
+            throw new Error(`Heuristic feedback cannot target a heuristic created by the same reflection: ${input.heuristic_id}.`);
+        }
+        targets.push({ heuristic, input });
+    }
+    return targets;
+}
+function applyHeuristicFeedbackMut(store, reflection, feedbackInputs, preexistingIds) {
+    for (const { heuristic, input } of planHeuristicFeedback(store, reflection, feedbackInputs, preexistingIds)) {
+        const duplicate = heuristic.feedback.some((item) => item.reflection_id === reflection.id && item.heuristic_id === heuristic.id);
+        if (duplicate)
+            continue;
+        heuristic.feedback.push({
+            heuristic_id: heuristic.id,
+            reflection_id: reflection.id,
+            value: input.value,
+            created_at: reflection.timestamp,
+        });
+    }
+}
+export async function saveReflectionAndHeuristics(reflectionInput, lessons, domain, sourceTask, confidence, tags, operationName, heuristicFeedback = []) {
+    const reflection = {
+        ...reflectionInput,
+        scope: reflectionInput.scope ?? "global",
+    };
     return mutateStore((store) => {
+        const preexistingIds = new Set(store.heuristics.map((item) => item.id));
+        applyHeuristicFeedbackMut(store, reflection, heuristicFeedback, preexistingIds);
         const session = ensureSession(store, reflection.session_id);
         session.reflection_count++;
         store.reflections.push(reflection);
@@ -1727,6 +2330,14 @@ export async function saveReflectionAndHeuristics(reflection, lessons, domain, s
                 heuristic: lesson,
                 source_task: sourceTask,
                 session_id: reflection.session_id,
+                scope: reflection.scope,
+                evidence: [{
+                        id: evidenceId(sourceTask, lesson),
+                        source_reflection_id: reflection.id,
+                        source_task: sourceTask,
+                        content_hash: lessonContentHash(lesson),
+                        created_at: reflection.timestamp,
+                    }],
                 confidence,
                 tags,
             });
@@ -1738,13 +2349,21 @@ export async function saveReflectionAndHeuristics(reflection, lessons, domain, s
             reflectionCount: store.reflections.length,
             nearSoftLimit: store.reflections.length >= REFLECTION_SOFT_LIMIT,
         };
-    }, "append-only", operationName, { reflection, lessons, domain, sourceTask, confidence, tags });
+    }, "append-only", operationName, { reflection, lessons, domain, sourceTask, confidence, tags, heuristicFeedback }, (store) => {
+        planHeuristicFeedback(store, reflection, heuristicFeedback, new Set(store.heuristics.map((item) => item.id)));
+    });
 }
 function saveReflectionAndHeuristicsMut(store, input) {
-    const session = ensureSession(store, input.reflection.session_id);
+    const reflection = {
+        ...input.reflection,
+        scope: input.reflection.scope ?? "global",
+    };
+    const preexistingIds = new Set(store.heuristics.map((item) => item.id));
+    applyHeuristicFeedbackMut(store, reflection, input.heuristicFeedback ?? [], preexistingIds);
+    const session = ensureSession(store, reflection.session_id);
     session.reflection_count++;
-    store.reflections.push(input.reflection);
-    for (const gap of input.reflection.affordance_gaps) {
+    store.reflections.push(reflection);
+    for (const gap of reflection.affordance_gaps) {
         const { isNew } = upsertAffordanceGapMut(store, gap);
         if (isNew)
             session.affordance_gap_count++;
@@ -1757,15 +2376,23 @@ function saveReflectionAndHeuristicsMut(store, input) {
             domain: input.domain,
             heuristic: lesson,
             source_task: input.sourceTask,
-            session_id: input.reflection.session_id,
+            session_id: reflection.session_id,
+            scope: reflection.scope,
+            evidence: [{
+                    id: evidenceId(input.sourceTask, lesson),
+                    source_reflection_id: reflection.id,
+                    source_task: input.sourceTask,
+                    content_hash: lessonContentHash(lesson),
+                    created_at: reflection.timestamp,
+                }],
             confidence: input.confidence,
             tags: input.tags,
         });
     }
     return {
-        id: input.reflection.id,
-        task_goal: input.reflection.task_goal,
-        outcome: input.reflection.task_outcome,
+        id: reflection.id,
+        task_goal: reflection.task_goal,
+        outcome: reflection.task_outcome,
         heuristics_extracted: safeLessons.length,
     };
 }
@@ -2019,14 +2646,6 @@ export async function mergeHeuristics(targetId, sourceIds, operationName) {
         return sanitizeHeuristicForOutput(target);
     }, "none", operationName, { target_id: targetId, source_ids: sourceIds });
 }
-function matchesTags(itemTags, filterTags, tagMode) {
-    if (filterTags.length === 0)
-        return true;
-    const normalized = normalizeTags(itemTags);
-    return tagMode === "or"
-        ? filterTags.some((tag) => normalized.includes(tag))
-        : filterTags.every((tag) => normalized.includes(tag));
-}
 function matchesTagSet(itemTagSet, filterTags, tagMode) {
     if (filterTags.length === 0)
         return true;
@@ -2064,6 +2683,7 @@ export async function listHeuristics(options = {}) {
     const minConfidence = options.minConfidence ?? 0;
     const limit = options.limit ?? 20;
     const sort = options.sort ?? "confidence";
+    const scope = options.scope ?? "global";
     const compare = (a, b) => {
         switch (sort) {
             case "updated_at":
@@ -2079,6 +2699,8 @@ export async function listHeuristics(options = {}) {
     const topItems = [];
     for (const heuristic of store.heuristics) {
         if (heuristic.superseded_by)
+            continue;
+        if (heuristic.scope !== "global" && heuristic.scope !== scope)
             continue;
         if (normalizedDomain && normalizeDomain(heuristic.domain) !== normalizedDomain)
             continue;
@@ -2121,15 +2743,21 @@ export async function getHeuristicHistory(id, includeArchived = true) {
     const filtered = includeArchived ? ordered : ordered.filter((heuristic) => !heuristic.superseded_by);
     return filtered.map(sanitizeHeuristicForOutput);
 }
+export async function getHeuristicById(id) {
+    const heuristic = (await getCachedStoreEntry()).heuristicById.get(id);
+    return heuristic ? sanitizeHeuristicForOutput(heuristic) : null;
+}
 function heuristicSearchText(heuristic) {
     return `${heuristic.heuristic} ${heuristic.tags.join(" ")} ${heuristic.domain}`;
 }
-export async function searchHeuristics(query, domain, tags, tagMode = "and", minConfidence = 0, limit = 20) {
+export async function searchHeuristics(query, domain, tags, tagMode = "and", minConfidence = 0, limit = 20, scope = "global") {
     const cache = await getCachedStoreEntry();
     const store = cache.store;
     const normalizedDomain = domain ? normalizeDomain(domain) : undefined;
     const filterTags = normalizeTags(tags);
-    let candidates = store.heuristics.filter((heuristic) => !heuristic.superseded_by && heuristic.confidence >= minConfidence);
+    let candidates = store.heuristics.filter((heuristic) => !heuristic.superseded_by
+        && heuristic.confidence >= minConfidence
+        && (heuristic.scope === "global" || heuristic.scope === scope));
     if (normalizedDomain) {
         candidates = candidates.filter((heuristic) => normalizeDomain(heuristic.domain) === normalizedDomain);
     }
@@ -2152,28 +2780,13 @@ export async function searchHeuristics(query, domain, tags, tagMode = "and", min
         .sort((a, b) => b.score - a.score)
         .slice(0, limit);
 }
-export async function retrieveRelevantHeuristics(taskDescription, domain, limit = 10, tags, includeScores = false, minConfidence = 0.3, tagMode = "and") {
-    return mutateStore((store) => {
-        const searchTextMap = getOrBuildHeuristicSearchTextMap(store);
-        const tagSetMap = getOrBuildHeuristicTagSetMap(store);
-        const topItems = scoreHeuristicsForQuery(store, {
-            taskDescription,
-            domain,
-            tags,
-            tagMode,
-            limit,
-            minConfidence,
-        }, searchTextMap, tagSetMap);
-        const now = new Date().toISOString();
-        for (const item of topItems) {
-            item.heuristic.retrieval_count = (item.heuristic.retrieval_count ?? 0) + 1;
-            item.heuristic.last_retrieved_at = now;
-        }
-        return topItems.map((item) => ({
-            ...sanitizeHeuristicForOutput(item.heuristic),
-            ...(includeScores ? { _score: item.scoreDetail } : {}),
-        }));
-    });
+export async function retrieveRelevantHeuristics(taskDescription, domain, limit = 10, tags, includeScores = false, minConfidence = 0.3, tagMode = "and", scope = "global") {
+    const cache = await getCachedStoreEntry();
+    const topItems = scoreHeuristicsForQuery(cache.store, { taskDescription, domain, tags, tagMode, limit, minConfidence, scope }, cache.heuristicSearchTextById, cache.heuristicTagSetById);
+    return topItems.map((item) => ({
+        ...sanitizeHeuristicForOutput(item.heuristic),
+        ...(includeScores ? { _score: item.scoreDetail } : {}),
+    }));
 }
 function scoreHeuristicsForQuery(store, query, searchTextMap, tagSetMap) {
     const normalizedDomain = query.domain ? normalizeDomain(query.domain) : undefined;
@@ -2181,67 +2794,51 @@ function scoreHeuristicsForQuery(store, query, searchTextMap, tagSetMap) {
     const minConfidence = query.minConfidence ?? 0.3;
     const tagMode = query.tagMode ?? "and";
     const filterTags = normalizeTags(query.tags);
+    const scope = query.scope ?? "global";
     const topItems = [];
-    const scoreCompare = (a, b) => b.score - a.score;
+    const scoreCompare = (a, b) => b.score - a.score
+        || b.heuristic.confidence - a.heuristic.confidence
+        || a.heuristic.id.localeCompare(b.heuristic.id);
     for (const heuristic of store.heuristics) {
         if (heuristic.superseded_by)
             continue;
         if (heuristic.confidence < minConfidence)
+            continue;
+        if (heuristic.scope !== "global" && heuristic.scope !== scope)
+            continue;
+        if (normalizedDomain && normalizeDomain(heuristic.domain) !== normalizedDomain)
             continue;
         if (filterTags.length > 0 && !matchesTagSet(tagSetMap.get(heuristic.id), filterTags, tagMode))
             continue;
         const textScore = similarity(searchTextMap.get(heuristic.id) ?? heuristicSearchText(heuristic), query.taskDescription, 1.5, 0.75, AVG_HEURISTIC_DOC_LEN);
         if (textScore < SEARCH_MIN_TEXT_SCORE)
             continue;
-        const domainBonus = normalizedDomain && normalizeDomain(heuristic.domain) === normalizedDomain ? 0.1 : 0;
-        const reinforcementScore = Math.min(heuristic.reinforcement_count / 10, 1.0);
-        const retrievalScore = Math.min((heuristic.retrieval_count ?? 0) / 20, 0.15);
-        const retention = ebbinghausRetention(heuristic);
-        const baseScore = textScore * 0.55 +
-            heuristic.confidence * 0.25 +
-            reinforcementScore * 0.1 +
-            retrievalScore +
-            domainBonus;
-        const finalScore = baseScore * (0.7 + 0.3 * retention);
+        const evidence = evidenceSignal(heuristic.evidence ?? []);
+        const feedback = feedbackSignal(heuristic.feedback ?? []);
+        const finalScore = textScore * 0.70
+            + heuristic.confidence * 0.15
+            + evidence * 0.10
+            + feedback * 0.05;
         insertSorted(topItems, {
             heuristic,
             score: finalScore,
             scoreDetail: {
-                text: roundScore(textScore),
-                confidence: roundScore(heuristic.confidence),
-                reinforcement: roundScore(reinforcementScore),
-                retrieval: roundScore(retrievalScore),
-                retention: roundScore(retention),
-                domain_bonus: roundScore(domainBonus),
-                final: roundScore(finalScore),
+                text: textScore,
+                confidence: heuristic.confidence,
+                evidence,
+                feedback,
+                final: finalScore,
             },
         }, scoreCompare, limit);
     }
     return topItems;
 }
 export async function bulkRetrieveHeuristics(queries, includeScores = false) {
-    return mutateStore((store) => {
-        const searchTextMap = getOrBuildHeuristicSearchTextMap(store);
-        const tagSetMap = getOrBuildHeuristicTagSetMap(store);
-        const seen = new Set();
-        const results = [];
-        const now = new Date().toISOString();
-        for (const query of queries) {
-            const topItems = scoreHeuristicsForQuery(store, query, searchTextMap, tagSetMap);
-            for (const item of topItems) {
-                if (!seen.has(item.heuristic.id)) {
-                    seen.add(item.heuristic.id);
-                    item.heuristic.retrieval_count = (item.heuristic.retrieval_count ?? 0) + 1;
-                    item.heuristic.last_retrieved_at = now;
-                }
-            }
-            results.push(topItems.map((item) => ({
-                ...sanitizeHeuristicForOutput(item.heuristic),
-                ...(includeScores ? { _score: item.scoreDetail } : {}),
-            })));
-        }
-        return results;
-    });
+    const cache = await getCachedStoreEntry();
+    return queries.map((query) => scoreHeuristicsForQuery(cache.store, query, cache.heuristicSearchTextById, cache.heuristicTagSetById).map((item) => ({
+        ...sanitizeHeuristicForOutput(item.heuristic),
+        ...(includeScores ? { _score: item.scoreDetail } : {}),
+    })));
 }
 /**
  * Return a window of reflections in newest-first order without cloning or
@@ -2277,11 +2874,11 @@ function newestFirstSlice(reflections, limit, offset = 0, isAscending) {
         .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
         .slice(offset, offset + limit);
 }
-export async function searchReflections(query, domain, outcome, limit = 20, sinceDays, tags, failureMode, tagMode = "and") {
+export async function searchReflections(query, domain, outcome, limit = 20, sinceDays, tags, failureMode, tagMode = "and", scope = "global") {
     const cache = await getCachedStoreEntry();
     const store = cache.store;
     const normalizedDomain = domain ? normalizeDomain(domain) : undefined;
-    let candidates = store.reflections;
+    let candidates = store.reflections.filter((reflection) => reflection.scope === "global" || reflection.scope === scope);
     if (normalizedDomain) {
         candidates = candidates.filter((reflection) => normalizeDomain(reflection.domain) === normalizedDomain);
     }
@@ -2335,7 +2932,8 @@ export async function listReflections(options = {}) {
     const base = options.sessionId
         ? (cache.sessionIndex.get(options.sessionId) ?? []).map((index) => store.reflections[index])
         : store.reflections;
-    let candidates = base;
+    const scope = options.scope ?? "global";
+    let candidates = base.filter((reflection) => reflection.scope === "global" || reflection.scope === scope);
     if (normalizedDomain) {
         candidates = candidates.filter((reflection) => normalizeDomain(reflection.domain) === normalizedDomain);
     }
@@ -2489,8 +3087,12 @@ export async function resolveAffordanceGap(id, resolutionNotes, operationName) {
         return { ...gap, available_tools: [...gap.available_tools] };
     }, "none", operationName, { id, resolution_notes: resolutionNotes });
 }
-export async function getRecentReflections(limit = 20) {
-    const recent = await loadRecentReflections(limit);
+export async function getRecentReflections(limit = 20, scope = "global") {
+    const authoritative = await loadReflections();
+    const recent = authoritative
+        .filter((reflection) => reflection.scope === "global" || reflection.scope === scope)
+        .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+        .slice(0, limit);
     return Promise.all(recent.map(sanitizeReflectionForOutput));
 }
 export async function getSessionReflections(sessionId, limit = 20) {
@@ -3004,7 +3606,7 @@ function characterTrigrams(value) {
     }
     return grams;
 }
-export async function getOpenQuestions(domain, priority, limit = 30, sinceDays, includeResolved = false) {
+export async function getOpenQuestions(domain, priority, limit = 30, sinceDays, includeResolved = false, scope = "global") {
     const store = await getCachedStore();
     const resolvedIndex = await getCachedResolvedQuestions();
     const normalizedDomain = domain ? normalizeDomain(domain) : undefined;
@@ -3019,6 +3621,8 @@ export async function getOpenQuestions(domain, priority, limit = 30, sinceDays, 
         return b.timestamp.localeCompare(a.timestamp);
     };
     for (const reflection of store.reflections) {
+        if (reflection.scope !== "global" && reflection.scope !== scope)
+            continue;
         if (normalizedDomain && normalizeDomain(reflection.domain) !== normalizedDomain)
             continue;
         if (cutoff && reflection.timestamp < cutoff)
@@ -3282,7 +3886,6 @@ async function mutateResolvedQuestions(mutator) {
             const index = await loadResolvedQuestions();
             await mutator(index);
             await saveResolvedQuestions(index);
-            _mutationResolvedIndex = index;
             _resolvedQuestionsCache = {
                 index,
                 loadedAt: Date.now(),
@@ -3292,7 +3895,6 @@ async function mutateResolvedQuestions(mutator) {
     });
     resolvedQuestionsMutationQueue = run.then(() => undefined, (error) => {
         console.error("[hermes] resolved questions error:", error instanceof Error ? error.message : String(error));
-        _mutationResolvedIndex = null;
         invalidateResolvedQuestionsCache();
     });
     return run;
@@ -3345,11 +3947,83 @@ async function mergeResolvedQuestionsIntoStore(store) {
         })),
     };
 }
-export async function importData(incoming, mode, operationName) {
-    // B4-fix: validate incoming is a non-null object before accessing properties
+function assertImportObject(incoming) {
     if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) {
         throw new Error("importData requires a non-null 'incoming' object");
     }
+}
+function applyReplaceImportFields(store, incoming) {
+    let replacementResolvedIndex;
+    if (incoming.reflections) {
+        store.reflections = uniqueById(incoming.reflections.map(normalizeReflectionFrame));
+        replacementResolvedIndex = resolvedQuestionsFromReflections(store.reflections);
+    }
+    if (incoming.heuristics) {
+        store.heuristics = uniqueById(incoming.heuristics.map(normalizeHeuristicRecord));
+    }
+    if (incoming.affordance_gaps) {
+        store.affordance_gaps = uniqueById(incoming.affordance_gaps.map((gap) => normalizeAffordanceGapRecord(gap)));
+    }
+    if (incoming.sessions)
+        store.sessions = normalizeSessionsRecord(incoming.sessions);
+    if (incoming.memory_board)
+        store.memory_board = normalizeMemoryBoard(incoming.memory_board);
+    if (incoming.user_profile)
+        store.user_profile = normalizeMemoryBoard(incoming.user_profile, 1800);
+    reconcileSessionCounters(store, true);
+    return replacementResolvedIndex;
+}
+export async function previewReplaceImportData(incoming, base) {
+    assertImportObject(incoming);
+    const preview = structuredClone(base ?? await exportData());
+    const replacementResolvedIndex = applyReplaceImportFields(preview, incoming);
+    if (replacementResolvedIndex) {
+        preview.reflections = preview.reflections.map((reflection) => ({
+            ...reflection,
+            open_questions: reflection.open_questions.map((question, index) => {
+                const resolved = replacementResolvedIndex[resolvedQuestionKey(reflection.id, index)];
+                return resolved
+                    ? {
+                        ...question,
+                        resolved: true,
+                        resolved_at: resolved.resolved_at,
+                        ...(resolved.resolved_by ? { resolved_by: resolved.resolved_by } : {}),
+                    }
+                    : question;
+            }),
+        }));
+    }
+    return preview;
+}
+export async function replaceStoreDataSnapshot(snapshot) {
+    assertImportObject(snapshot);
+    const normalized = structuredClone(snapshot);
+    normalized.sessions = normalizeSessionsRecord(snapshot.sessions);
+    normalized.reflections = uniqueById(asArray(snapshot.reflections).map(normalizeReflectionFrame));
+    normalized.heuristics = uniqueById(asArray(snapshot.heuristics).map(normalizeHeuristicRecord));
+    normalized.affordance_gaps = uniqueById(asArray(snapshot.affordance_gaps).map((gap) => normalizeAffordanceGapRecord(gap)));
+    normalized.memory_board = normalizeMemoryBoard(snapshot.memory_board);
+    normalized.user_profile = normalizeMemoryBoard(snapshot.user_profile, 1800);
+    normalized.version = typeof snapshot.version === "string" && snapshot.version ? snapshot.version : VERSION;
+    const replacementResolvedIndex = resolvedQuestionsFromReflections(normalized.reflections);
+    await mutateStore((store) => {
+        store.sessions = normalized.sessions;
+        store.reflections = normalized.reflections;
+        store.heuristics = normalized.heuristics;
+        store.affordance_gaps = normalized.affordance_gaps;
+        store.memory_board = normalized.memory_board;
+        store.user_profile = normalized.user_profile;
+        store.version = normalized.version;
+    }, "rewrite");
+    await mutateResolvedQuestions(async (resolved) => {
+        for (const key of Object.keys(resolved))
+            delete resolved[key];
+        Object.assign(resolved, replacementResolvedIndex);
+    });
+}
+export async function importData(incoming, mode, operationName) {
+    // B4-fix: validate incoming is a non-null object before accessing properties
+    assertImportObject(incoming);
     const mutationResult = await mutateStore((store) => {
         const originalSessionIds = new Set(Object.keys(store.sessions));
         let replacementResolvedIndex;
@@ -3362,22 +4036,7 @@ export async function importData(incoming, mode, operationName) {
         let newMemoryBoard = 0; // E4-fix: track memory_board/user_profile additions
         let newUserProfile = 0;
         if (mode === "replace") {
-            if (incoming.reflections) {
-                store.reflections = uniqueById(incoming.reflections.map(normalizeReflectionFrame));
-                replacementResolvedIndex = resolvedQuestionsFromReflections(store.reflections);
-            }
-            if (incoming.heuristics) {
-                store.heuristics = uniqueById(incoming.heuristics.map(normalizeHeuristicRecord));
-            }
-            if (incoming.affordance_gaps) {
-                store.affordance_gaps = uniqueById(incoming.affordance_gaps.map((gap) => normalizeAffordanceGapRecord(gap)));
-            }
-            if (incoming.sessions)
-                store.sessions = normalizeSessionsRecord(incoming.sessions);
-            if (incoming.memory_board)
-                store.memory_board = normalizeMemoryBoard(incoming.memory_board);
-            if (incoming.user_profile)
-                store.user_profile = normalizeMemoryBoard(incoming.user_profile, 1800);
+            replacementResolvedIndex = applyReplaceImportFields(store, incoming);
         }
         else {
             // merge mode: append items whose ids are not already present
@@ -3520,35 +4179,7 @@ export async function importData(incoming, mode, operationName) {
 }
 export async function clearData(collection, operationName) {
     await mutateStore((store) => {
-        switch (collection) {
-            case "reflections":
-                store.reflections = [];
-                // E3-fix: reset reflection_count on all sessions to keep counts consistent
-                for (const s of Object.values(store.sessions)) {
-                    s.reflection_count = 0;
-                }
-                break;
-            case "heuristics":
-                store.heuristics = [];
-                break;
-            case "affordance_gaps":
-                store.affordance_gaps = [];
-                for (const session of Object.values(store.sessions)) {
-                    session.affordance_gap_count = 0;
-                }
-                break;
-            case "sessions":
-                store.sessions = {};
-                break;
-            case "all":
-                store.sessions = {};
-                store.reflections = [];
-                store.affordance_gaps = [];
-                store.heuristics = [];
-                store.memory_board = { entries: [], char_limit: store.memory_board?.char_limit ?? 2200, used_chars: 0 };
-                store.user_profile = { entries: [], char_limit: store.user_profile?.char_limit ?? 1800, used_chars: 0 };
-                break;
-        }
+        applyClearDataFields(store, collection);
     }, collection === "reflections" || collection === "all" ? "rewrite" : "none", operationName, { collection });
     if (collection === "reflections" || collection === "all") {
         await mutateResolvedQuestions(async (resolved) => {
@@ -3556,6 +4187,39 @@ export async function clearData(collection, operationName) {
                 delete resolved[key];
         });
     }
+}
+function applyClearDataFields(store, collection) {
+    switch (collection) {
+        case "reflections":
+            store.reflections = [];
+            for (const session of Object.values(store.sessions))
+                session.reflection_count = 0;
+            break;
+        case "heuristics":
+            store.heuristics = [];
+            break;
+        case "affordance_gaps":
+            store.affordance_gaps = [];
+            for (const session of Object.values(store.sessions))
+                session.affordance_gap_count = 0;
+            break;
+        case "sessions":
+            store.sessions = {};
+            break;
+        case "all":
+            store.sessions = {};
+            store.reflections = [];
+            store.affordance_gaps = [];
+            store.heuristics = [];
+            store.memory_board = { entries: [], char_limit: store.memory_board?.char_limit ?? 2200, used_chars: 0 };
+            store.user_profile = { entries: [], char_limit: store.user_profile?.char_limit ?? 1800, used_chars: 0 };
+            break;
+    }
+}
+export async function previewClearData(collection, base) {
+    const preview = structuredClone(base ?? await exportData());
+    applyClearDataFields(preview, collection);
+    return preview;
 }
 export function normalizeDomain(domain) {
     return domain.toLowerCase().trim() || "general";
@@ -3685,9 +4349,6 @@ function tokenOverlapStats(a, b) {
             overlap++;
     }
     return { count: overlap, ratio: overlap / Math.min(aTokens.size, bTokens.size) };
-}
-function roundScore(value) {
-    return Number(value.toFixed(3));
 }
 function buildFreqMap(tokens) {
     const map = new Map();

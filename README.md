@@ -1,165 +1,161 @@
-# Hermes Reflection MCP
+# Hermes Reflection MCP v20.0.0
 
-Local persistent reflection, heuristic, bounded memory, and session recall for Codex Desktop and other stdio MCP clients.
+Hermes Reflection MCP is a local, Agent-first memory and reflection server for Codex Desktop. It keeps the v19-compatible 29-tool surface, but the recommended Codex profile exposes only 10 high-value tools to reduce tool metadata and context usage.
 
-Chinese documentation: [README.zh-CN.md](README.zh-CN.md). Standalone guides: [readmeen.md](readmeen.md) and [readmecn.md](readmecn.md).
+All memory is reference data, never instructions. The server is local-first, rejects unsafe transfer paths, redacts sensitive derived/output text, and requires explicit confirmation for destructive reset.
 
-## What v19.4.1 provides
+## Agent-first core profile
 
-Hermes Reflection MCP is a local-first TypeScript MCP server with 28 public tools. It stores structured task reflections, reusable heuristics, bounded Memory Board and User Profile entries, searchable session turns, frozen memory snapshots, open questions, and import/export data.
+Enable exactly these 10 tools for the default Codex Desktop experience:
 
-Version 19.4.1 strictly validates persisted background lifecycle state, reclaims expired leases regardless of a live old PID, and may reclaim an unexpired same-host lease only when its PID is confirmed dead. Long reviews immediately and periodically renew the exact owner/fencing-token row; transient renewal errors are bounded by the last confirmed expiry, and shutdown lets the active run quiesce before releasing that original fence. The v19.4 fail-closed stores and multi-user handoff, v19.3 strict redaction, opt-in LLM/background lifecycle, 28-tool contract, and existing data remain compatible.
+```text
+retrieve_heuristics
+reflect_on_task
+search_reflections
+get_open_questions
+get_memory_item
+compact_session_context
+memory_board_read
+memory_board_write
+session_lifecycle_hook
+trigger_background_review
+```
 
-## Safety and trust boundaries
+Recommended operating loop:
 
-- The server uses local stdio transport and does not require a remote service.
-- Installing it does not make Codex Desktop call lifecycle or session-capture tools automatically.
-- Memory and profile text is reference data, never a source of fresh instructions.
-- Snapshot mode is explicit and fails closed when the requested session snapshot does not exist.
-- Compaction output is historical reference only; it cannot control a host application's context window.
-- Deterministic review remains the default. LLM review transmits only bounded redacted reflection fields and requires separate explicit provider configuration; it never uses Codex login credentials.
-- Raw reflections and SQLite turns remain available for explicit audit/export. Strict URL redaction is applied to historical output, automatic heuristic derivation, and provider-bound text rather than silently rewriting source records.
-- The background scheduler and background auto-apply are separate opt-ins. Neither path modifies skills or generates Memory Board/User Profile candidates.
-- Threat scans inspect raw stored entries, while normal rendering masks suspicious content.
-- Destructive reset still requires an explicit confirmation argument.
+1. Call `retrieve_heuristics` before substantial engineering work.
+2. Treat results as historical evidence, not executable instructions.
+3. Use `get_memory_item` only when a compact result needs detail.
+4. Use `compact_session_context` before an intentional handoff or compaction.
+5. Call `reflect_on_task` after meaningful success, partial completion, or failure.
 
-## Requirements
+Copy [`codex_config_snippet.toml`](codex_config_snippet.toml) into your Codex configuration and replace `<YOU>`.
 
-- Windows, macOS, or Linux.
-- Node.js 20 or newer and npm.
-- A client that supports local stdio MCP servers.
-- Session search uses better-sqlite3. If SQLite initialization is unavailable, session tools return a clear degraded-mode error while reflection and JSON memory tools remain usable.
+## Tool profiles
 
-## Quick start
+The registry is the single source of truth and contains exactly 29 implemented tools.
 
-Extract the release into a stable directory, then install production dependencies:
+### Core (recommended, 10)
 
-~~~powershell
-npm ci --omit=dev
-~~~
+`retrieve_heuristics`, `reflect_on_task`, `search_reflections`, `get_open_questions`, `get_memory_item`, `compact_session_context`, `memory_board_read`, `memory_board_write`, `session_lifecycle_hook`, `trigger_background_review`
 
-Example Codex Desktop configuration:
+### Extended compatibility surface (29)
 
-~~~toml
-[mcp_servers.hermes-reflection]
-command = 'node'
-args = ['C:\Users\<YOU>\.codex\mcp\hermes-reflection-mcp\dist\index.js']
-~~~
+`reflect_on_task`, `search_reflections`, `list_reflections`, `retrieve_heuristics`, `list_heuristics`, `search_heuristics`, `add_heuristic`, `delete_heuristic`, `memory_board_write`, `memory_board_read`, `user_profile_write`, `user_profile_read`, `get_open_questions`, `get_memory_item`, `resolve_open_question`, `search_sessions`, `append_session_turn`, `get_recent_reflections`, `export_data`, `import_data`, `clear_data`, `capture_memory_snapshot`, `session_lifecycle_hook`, `scan_memory_threats`, `scroll_session_context`, `trigger_background_review`, `list_pending_mutations`, `approve_pending_mutation`, `compact_session_context`
 
-Restart Codex Desktop after changing the configuration. See [INSTALL_HERMES_MCP.md](INSTALL_HERMES_MCP.md) for clean install, upgrade, rollback, and cross-platform examples.
+### Administrative/destructive subset (4)
 
-## The 28 public tools
+`delete_heuristic`, `import_data`, `clear_data`, `approve_pending_mutation`
 
-| Area | Public tools |
-|---|---|
-| Reflection | <code>reflect_on_task</code>, <code>search_reflections</code>, <code>list_reflections</code>, <code>get_recent_reflections</code> |
-| Heuristics | <code>retrieve_heuristics</code>, <code>list_heuristics</code>, <code>search_heuristics</code>, <code>add_heuristic</code>, <code>delete_heuristic</code> |
-| Open questions | <code>get_open_questions</code>, <code>resolve_open_question</code> |
-| Memory Board | <code>memory_board_write</code>, <code>memory_board_read</code> |
-| User Profile | <code>user_profile_write</code>, <code>user_profile_read</code> |
-| Sessions and handoff | <code>append_session_turn</code>, <code>search_sessions</code>, <code>scroll_session_context</code>, <code>compact_session_context</code> |
-| Snapshots and audit | <code>capture_memory_snapshot</code>, <code>session_lifecycle_hook</code>, <code>scan_memory_threats</code> |
-| Background review | <code>trigger_background_review</code> |
-| Write approval | <code>list_pending_mutations</code>, <code>approve_pending_mutation</code> |
-| Data management | <code>export_data</code>, <code>import_data</code>, <code>clear_data</code> |
+Do not auto-approve administrative tools. `memory_board_write` is included in core because lightweight working memory is useful to agents, but clients should still present normal write controls.
 
-Tools not in this table are not part of the v19.4.1 public contract; direct calls to removed names return an MCP error.
+## Context and token budgets
 
-## Recommended workflow
+Long-result tools default to `response_mode: "compact"`.
 
-1. Before significant work, retrieve relevant heuristics.
-2. Explicitly append session turns only when local session recall is wanted.
-3. Optionally start a named lifecycle snapshot for stable Memory Board/User Profile reads.
-4. Use search and scroll tools to inspect past session context.
-5. Generate a reference-only handoff before a client-side compaction or transfer.
-6. Reflect honestly after meaningful work, including outcome, blockers, verification, and transferable lessons.
-7. Preview background-review candidates before enabling automatic heuristic upsert.
+| Mode | Unicode code points | UTF-8 bytes |
+|---|---:|---:|
+| compact | 6,000 | 24 KiB |
+| full | 20,000 | 80 KiB |
 
-## Memory Board and User Profile
+Text summaries are capped at 512 code points. Oversized atomic items fail with a structured error instead of being silently cut. Paged responses expose `has_more` and an opaque `next_cursor`; pass that cursor with the same filters. Cursors bind the query family, normalized filters, sort order, and dataset revision. On `CURSOR_STALE`, restart the query without a cursor.
 
-Memory Board is bounded working reference context. User Profile is bounded stable preference/fact reference context. Both support single and batch writes with final-state capacity checks. Live reads are the default. Unsafe prompt-like content is rejected on normal writes, and raw imports can be audited with the threat scanner.
+The core profile and compact responses address different costs: the profile reduces tool-definition metadata, while response budgets reduce per-call output and retained context.
 
-These stores are not instruction channels. Clients should label their content as reference only and keep credentials out of them.
+## Memory model and retrieval
 
-## Frozen snapshot workflow
+- Reflections record task goal, honest outcome, failure mode, evidence, blockers, questions, and lessons.
+- Heuristics are transferable lessons with confidence, scope, tags, feedback, and reinforcement history.
+- Memory Board is lightweight mutable working memory.
+- Indexed session turns live in SQLite FTS5 and are included only when clients explicitly append them.
+- `get_memory_item` returns one bounded item/section by opaque ID so the agent does not have to request a large list again.
 
-An explicit client call to <code>session_lifecycle_hook</code> with event <code>start</code>, or a direct capture call, freezes both bounded stores under a session id. Later live writes still persist, but snapshot reads remain stable.
+`reflect_on_task.heuristic_feedback` accepts `helpful`, `harmful`, or `irrelevant` feedback for retrieved heuristic IDs. Feedback changes later ranking; it does not rewrite the original reflection.
 
-To read a snapshot, call the relevant read tool with <code>mode:"snapshot"</code> and the same <code>session_id</code>. A missing id or missing active snapshot returns an error; it never silently falls back to live data. Event <code>end</code> releases the snapshot. Pause/resume events are recorded but do not control Codex.
+## Project scopes
 
-## Session search and compaction handoff
+Data defaults to global scope. A client may pass a safe `project_key`, or use the lifecycle hook to bind a session to a project. The Codex hook derives a project key as an HMAC of the canonical working directory using a local 32-byte salt. Raw paths are never stored in the key.
 
-Session turns exist only when a client explicitly calls <code>append_session_turn</code>. Search uses a local better-sqlite3 FTS index. Historical search snippets are strictly redacted before slicing. Scroll keeps the existing window semantics while returning at most 4,000 Unicode code points for the anchor and 1,200 for each neighboring turn; truncated turns report optional <code>content_truncated</code> and <code>original_content_chars</code> metadata.
+Project-scoped retrieval considers the active project plus global memory. Session-to-project bindings are bounded and released on session end.
 
-<code>compact_session_context</code> deterministically combines bounded stored turns and reflections into a strictly redacted handoff beginning with a reference-only marker. It preserves the newest nonblank stored user and assistant anchors and, with <code>preserve_recent_user_turns</code> (1-5, default 3), retains earlier genuine user anchors when the character budget permits. It does not invoke a model, write data, or compact Codex itself.
+## Automatic LLM review
 
-## Reflection and background review
+Deterministic review is always available. LLM review is opt-in and uses a dedicated OpenAI-compatible provider configuration; it never reuses Codex login credentials.
 
-<code>reflect_on_task</code> stores structured outcomes, task state, lessons, open questions, and optional tool/world-model observations. Safe lessons may become reusable heuristics.
+Readiness is explicit:
 
-<code>trigger_background_review</code> reviews at most 10 recent or 200 full-scope reflections and emits at most 50 heuristic candidates. Preview is the default. Automatic apply uses one storage transaction and returns heuristic ids for audit. Candidates are strictly credential-redacted before threat checks and persistence; suspicious candidates are masked and skipped. Its unchanged-source fingerprint covers stable, redacted review-relevant content rather than only ids and timestamps.
+- disabled: `HERMES_REFLECTION_LLM_ENABLED` is false or absent;
+- not ready: enabled but base URL, model, key, or URL policy is invalid;
+- ready: a dedicated provider endpoint, model, key, and bounded timeout are valid.
 
-Use <code>review_mode:"llm"</code> for the configured provider, <code>review_mode:"auto"</code> for LLM-with-deterministic-fallback, or <code>action:"status"</code> for sanitized readiness and scheduler state. LLM output must be strict schema-valid JSON; authentication failures, rate limits, timeouts, redirects, oversized responses, and suspicious candidates fail safely.
+Required environment variables for LLM mode:
 
-### Optional automatic review
+```text
+HERMES_REFLECTION_LLM_ENABLED=true
+HERMES_REFLECTION_LLM_BASE_URL=https://provider.example/v1
+HERMES_REFLECTION_LLM_MODEL=your-model
+HERMES_REFLECTION_LLM_API_KEY=<dedicated-provider-key>
+```
 
-The scheduler starts only when <code>HERMES_REFLECTION_BACKGROUND_ENABLED=true</code>. Its timers are unreferenced, session state is strictly schema-validated in <code>background_lifecycle.json</code>, and a cross-process lease/fencing token prevents overlapping Codex windows. Long reviews renew only their exact owner/token lease; they stop before commit if ownership is lost or renewal cannot be confirmed before expiry. Automatic persistence remains off unless <code>HERMES_REFLECTION_BACKGROUND_AUTO_APPLY=true</code>.
+Only bounded, strictly redacted reflection fields are sent. Output must match the strict candidate schema. Redirects are rejected; authentication, permission, quota, timeout, network, oversized, and invalid-output failures are classified without exposing provider response bodies or credentials.
 
-LLM review additionally requires <code>HERMES_REFLECTION_LLM_ENABLED=true</code>, <code>HERMES_REFLECTION_LLM_BASE_URL</code>, <code>HERMES_REFLECTION_LLM_MODEL</code>, and <code>HERMES_REFLECTION_LLM_API_KEY</code>. Non-loopback endpoints must use HTTPS. Keep the key only in the MCP process environment and never store it in reflections or configuration committed to source control.
+`review_mode: "auto"` uses LLM review when ready and otherwise falls back to deterministic review. `review_mode: "llm"` fails closed when the provider is unavailable.
 
-## Write approval
+Auto-apply is a separate opt-in. A candidate is eligible only when confidence is at least 0.85, it has no risk reasons, remains pending, is at most 1,000 characters, and has source reflection IDs. Auto-apply is blocked when write approval is enabled or the background fencing lease is stale. It never edits skills, User Profile, or Memory Board.
 
-Stores with metadata flag <code>write_approval:true</code> queue supported typed writes instead of executing them. Use <code>list_pending_mutations</code> for redacted previews. Use <code>approve_pending_mutation</code> with decision <code>approve</code> to replay the typed payload; the queue item is removed only after replay succeeds. Decision <code>reject</code> removes it without execution.
+## Background lifecycle and Codex hooks
 
-Background-review auto-apply is explicitly blocked while write approval is enabled because that derived batch is not represented as a replayable public mutation.
+The scheduler starts only when `HERMES_REFLECTION_BACKGROUND_ENABLED=true`. It tracks dirty sessions, uses unreferenced timers, single-flight provider calls, bounded retries, and cross-process leases with fencing tokens. Automatic persistence remains off unless `HERMES_REFLECTION_BACKGROUND_AUTO_APPLY=true`.
 
-## Storage layout and backup
+The included `hermes-reflection-codex-hook` accepts bounded JSON on stdin for `SessionStart`, `Stop`, `SessionEnd`, `PreCompact`, and `PostCompact`. It enqueues quickly; the MCP process consumes the durable inbox. Hooks do not pause/resume Codex execution and installation alone does not capture conversation turns.
 
-Runtime data is stored outside the package:
+Example client hook command:
 
-~~~text
-~/.hermes-reflection/store.json
-~/.hermes-reflection/reflections.jsonl
-~/.hermes-reflection/resolved_questions.json
-~/.hermes-reflection/sessions.db
-~/.hermes-reflection/background_lifecycle.json
-~~~
+```text
+node <install-dir>/dist/src/codex_hook_cli.js
+```
 
-Back up this directory only when you intend to preserve user data. Do not put it in a public release. Version 19.4.1 reads valid v19.4/v19.3/v19.2/v19.1 stores without a destructive migration. Unsupported, structurally invalid, or corrupt authoritative state is preserved with one <code>.corrupt.&lt;digest&gt;.bak</code> evidence copy and the operation fails closed; inspect or restore a verified backup instead of deleting the active file blindly.
+The public MCP tool `session_lifecycle_hook` remains available for clients that integrate directly.
+
+## Safe import, export, and transactions
+
+Default transfer directories are:
+
+```text
+~/.hermes-reflection/transfers/imports
+~/.hermes-reflection/transfers/exports
+```
+
+Additional allow-listed roots may be supplied with `HERMES_TRANSFER_IMPORT_ROOTS` and `HERMES_TRANSFER_EXPORT_ROOTS` using the platform path delimiter. Device paths, alternate data streams, non-JSON imports, traversal, links, and paths outside allowed roots are rejected.
+
+Safe export redacts derived content by default. Raw export requires an explicit sensitive confirmation. Replace imports and clear operations use a cross-store journal: JSON and logical SQLite snapshots are staged, committed, verified, and recovered after interruption. Startup rolls back pre-commit phases and completes an interrupted committing phase.
+
+## Migration and rollback
+
+v20 uses store schema version 2 and migrates supported legacy state under a lock with backup/recovery checks. Future or corrupt authoritative state fails closed and preserves content-addressed evidence; it is not silently replaced.
+
+Before upgrading, stop the old MCP process, back up the installed code directory, and separately back up `~/.hermes-reflection`. Install into a clean staging directory, run the full validation matrix, then switch Codex to the validated path. To roll back, stop Codex, restore the previous code directory and matching data backup, then restart a fresh Codex process.
 
 ## Development and verification
 
-For a source checkout:
+Node.js 20 or newer is required.
 
-~~~powershell
+```powershell
 npm ci
-npx tsc --noEmit
+npm run test:strict
 npm run build
-node scripts\smoke.mjs
-node scripts\concurrency-test.mjs
-node scripts\cross-process-concurrency-test.mjs
+npm run smoke
 npm run test:v19.3
 npm run test:v19.4
 npm run test:v19.4.1
-npm audit --omit=dev
-~~~
+npm run test:v19.5
+npm run test:v20
+npm run test:concurrency
+npm run test:v20:agent-fixture
+```
 
-All tests use temporary HOME/USERPROFILE locations and must not touch the real memory store.
+`npm run test:v20:agent` runs 20 fresh-process Codex Agent workflows and requires at least 18/20 passes with zero destructive-tool violations. It needs the local `codex` executable and can make model calls. The fixture grader is deterministic and offline.
 
-## Privacy-safe release contents
+CI runs Windows and Linux on Node 20 and 22, including strict TypeScript, compatibility tests, v20 tests, concurrency checks, package dry-run, fixture grading, and production audit.
 
-The GitHub ZIP is assembled from an exact whitelist. It contains source, compiled JavaScript, tests, manifests, and public documentation only. It excludes user memory, SQLite databases, credentials, actual Codex configuration, logs, caches, dependencies, internal plans, project memory, backup trees, and local machine paths. The required guide aliases <code>readmecn.md</code> and <code>readmeen.md</code> are included.
-
-## Troubleshooting
-
-- If the server does not appear, confirm the absolute <code>dist/index.js</code> path, Node version, and restart the MCP client.
-- If a session tool reports SQLite unavailable, run <code>npm ci --omit=dev</code> in the target environment and confirm the native better-sqlite3 binary supports that Node/platform combination.
-- If snapshot reads fail, first capture/start the exact session id and pass both snapshot mode and that id.
-- If a write returns PENDING, list the queue and explicitly approve or reject its id.
-- If a lock timeout occurs, ensure no hung server owns the shared store. Locks older than the bounded stale threshold are quarantined automatically.
-
-## Upstream inspiration and licensing
-
-This project is inspired by a local source snapshot of NousResearch Hermes Agent's memory and reflection systems. Hermes Agent itself is not bundled in this package.
-
-No project license is granted by this package. The upstream Hermes Agent license does not automatically license this separate implementation. A repository publisher must choose and include a license only when authorized to grant those rights.
+See [`INSTALL_HERMES_MCP.md`](INSTALL_HERMES_MCP.md) for installation and [`CHANGELOG.md`](CHANGELOG.md) for release history.

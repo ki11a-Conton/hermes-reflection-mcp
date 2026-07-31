@@ -14,6 +14,29 @@ export type FailureMode =
 export type Priority = "high" | "medium" | "low";
 export type Polarity = "affirm" | "negate";
 export type InsightStatus = "confirmed" | "needs_verification";
+export type MemoryScope = "global" | `project:${string}`;
+
+export interface HeuristicEvidence {
+  id: string;
+  source_reflection_id?: string;
+  source_task: string;
+  content_hash: string;
+  created_at: string;
+}
+
+export type HeuristicFeedbackValue = "helpful" | "harmful" | "irrelevant";
+
+export interface HeuristicFeedbackInput {
+  heuristic_id: string;
+  value: HeuristicFeedbackValue;
+}
+
+export interface HeuristicFeedback {
+  heuristic_id: string;
+  reflection_id: string;
+  value: HeuristicFeedbackValue;
+  created_at: string;
+}
 
 export interface WorldModelUpdate {
   fact: string;
@@ -57,6 +80,7 @@ export interface ReflectionFrame {
   id: string;
   timestamp: string;
   session_id: string;
+  scope: MemoryScope;
   task_goal: string;
   task_outcome: "success" | "partial" | "failure";
   failure_mode: FailureMode;
@@ -98,6 +122,9 @@ export interface Heuristic {
   heuristic: string;
   source_task: string;
   session_id?: string;
+  scope: MemoryScope;
+  evidence: HeuristicEvidence[];
+  feedback: HeuristicFeedback[];
   reinforcement_count: number;
   contradiction_count: number;
   contradiction_notes: string[];
@@ -128,6 +155,24 @@ export interface PendingMutation {
   state?: "pending" | "processing";
   claim_token?: string;
   claimed_at?: string;
+}
+
+export type ReviewCandidateState = "pending" | "applied" | "rejected";
+
+export interface ReviewCandidate {
+  id: string;
+  created_at: string;
+  scope: MemoryScope;
+  stage: "deterministic" | "llm";
+  source_fingerprint: string;
+  source_reflection_ids: string[];
+  heuristic: string;
+  domain: string;
+  tags: string[];
+  confidence: number;
+  risk_reasons: string[];
+  state: ReviewCandidateState;
+  mutation_id?: string;
 }
 
 export interface MemoryEntry {
@@ -179,11 +224,13 @@ export interface ReflectionStore {
   memory_board?: MemoryBoard;
   user_profile?: MemoryBoard;
   metadata?: {
+    store_schema_version: 2;
     created_at: string;
     last_written_at: string;
     write_count: number;
     write_approval?: boolean;
     pending_mutations?: PendingMutation[];
+    review_candidates?: ReviewCandidate[];
     external_provider?: { name: string; endpoint?: string; db_path?: string; auto_sync?: boolean };
   };
 }

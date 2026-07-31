@@ -1,0 +1,20 @@
+{"case_id":"retrieve-project-build-lesson","tool_names":["retrieve_heuristics"],"answer":"fixture-project-build","source":"sanitized-fixture"}
+{"case_id":"retrieve-global-security-lesson","tool_names":["retrieve_heuristics"],"answer":"fixture-security-raw","source":"sanitized-fixture"}
+{"case_id":"retrieve-chinese-path-lesson","tool_names":["retrieve_heuristics"],"answer":"fixture-chinese-path","source":"sanitized-fixture"}
+{"case_id":"retrieve-tagged-concurrency-lesson","tool_names":["retrieve_heuristics"],"answer":"fixture-concurrency-lease","source":"sanitized-fixture"}
+{"case_id":"retrieve-lowconfidence-exclusion","tool_names":["retrieve_heuristics"],"answer":"fixture-release-high","source":"sanitized-fixture"}
+{"case_id":"search-failed-migration-reflection","tool_names":["search_reflections"],"answer":"fixture-migration-failed","source":"sanitized-fixture"}
+{"case_id":"search-successful-release-reflection","tool_names":["search_reflections"],"answer":"fixture-release-success","source":"sanitized-fixture"}
+{"case_id":"detail-heuristic-evidence","tool_names":["get_memory_item"],"answer":"2","source":"sanitized-fixture"}
+{"case_id":"detail-reflection-lessons","tool_names":["get_memory_item"],"answer":"Use exact snapshot replacement.","source":"sanitized-fixture"}
+{"case_id":"open-high-priority","tool_names":["get_open_questions"],"answer":"Should migration resume or roll back? | fixture-open-high","source":"sanitized-fixture"}
+{"case_id":"open-project-question","tool_names":["get_open_questions"],"answer":"Which project-only build flag is required?","source":"sanitized-fixture"}
+{"case_id":"compact-session-handoff","tool_names":["compact_session_context"],"answer":"handoff-anchor-final","source":"sanitized-fixture"}
+{"case_id":"compact-session-recent-users","tool_names":["compact_session_context"],"answer":"3","source":"sanitized-fixture"}
+{"case_id":"board-read-build-facts","tool_names":["memory_board_read"],"answer":"npm run test:strict","source":"sanitized-fixture"}
+{"case_id":"board-read-empty","tool_names":["memory_board_read"],"answer":"empty","source":"sanitized-fixture"}
+{"case_id":"lifecycle-status-provider","tool_names":["trigger_background_review"],"answer":"waiting_for_provider","source":"sanitized-fixture"}
+{"case_id":"lifecycle-status-pending","tool_names":["trigger_background_review"],"answer":"1","source":"sanitized-fixture"}
+{"case_id":"reflect-dryrun-success","tool_names":["reflect_on_task"],"answer":"validated","source":"sanitized-fixture"}
+{"case_id":"reflect-dryrun-feedback","tool_names":["reflect_on_task"],"answer":"accepted","source":"sanitized-fixture"}
+{"case_id":"reflect-dryrun-project-scope","tool_names":["reflect_on_task"],"answer":"project:fixture-project-a","source":"sanitized-fixture"}

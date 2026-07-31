@@ -1,29 +1,96 @@
 import { createHash } from "node:crypto";
-import { exportData, safeHeuristicText, scanHeuristicThreats, upsertHeuristicsBatch, } from "../storage.js";
+import { exportData, safeHeuristicText, scanHeuristicThreats, } from "../storage.js";
 import { getLlmReviewReadiness, runLlmReview } from "./llm_review.js";
 import { redactSensitiveText } from "./redaction.js";
+import { autoApplyReviewCandidate, enqueueReviewCandidates } from "./review_queue.js";
 export const MAX_RECENT_REFLECTIONS = 10;
 export const MAX_FULL_REFLECTIONS = 200;
 export const MAX_REVIEW_CANDIDATES = 50;
+const inFlight = new Map();
 export function normalizeCandidateText(text) {
     return text.trim().replace(/\s+/g, " ").toLowerCase();
 }
+export function reviewSingleFlightKey(options) {
+    return `${options.session_id}:${options.stage}:${options.source_fingerprint}`;
+}
+export function inFlightReview(options) {
+    return inFlight.get(reviewSingleFlightKey(options));
+}
+export function mayAutoApply(candidate) {
+    return candidate.confidence >= 0.85
+        && candidate.risk_reasons.length === 0
+        && candidate.state === "pending"
+        && candidate.heuristic.length <= 1_000
+        && candidate.source_reflection_ids.length > 0;
+}
 function strictDerivedText(value) {
     return redactSensitiveText(value, { strictHistorical: true }).trim();
+}
+function boundedCandidateText(value) {
+    return Array.from(value).slice(0, 1_000).join("");
+}
+function semanticCandidateRisks(value) {
+    const risks = [];
+    const checks = [
+        [/\b(?:api[ _-]?key|token|password|secret|credential)s?\b|凭据|密钥|密码/i, "secret_or_credential"],
+        [/\b(?:delete|remove|erase|clear|drop|purge)\b|删除|清除/i, "deletion"],
+        [/\b(?:overwrite|replace existing|truncate)\b|覆盖/i, "overwrite"],
+        [/\b(?:identity|impersonat|user profile|memory board)\b|身份/i, "identity_change"],
+        [/\b(?:permission|privilege|administrator|sudo|chmod)\b|权限/i, "permission_change"],
+    ];
+    for (const [pattern, reason] of checks)
+        if (pattern.test(value))
+            risks.push(reason);
+    return risks;
+}
+function conflictShape(value) {
+    const normalized = value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    const negative = /\b(?:never|not|disable|avoid|forbid|without)\b/.test(normalized);
+    return {
+        negative,
+        key: normalized
+            .replace(/\b(?:always|never|not|do|must|should|enable|disable|avoid|forbid|without)\b/g, " ")
+            .replace(/\s+/g, " ")
+            .trim(),
+    };
+}
+function conflictsWithExisting(candidate, existing) {
+    const shape = conflictShape(candidate);
+    if (!shape.key)
+        return false;
+    for (const current of existing) {
+        const other = conflictShape(current);
+        if (other.key === shape.key && other.negative !== shape.negative)
+            return true;
+    }
+    return false;
+}
+function extractedRiskReasons(raw, sanitized, sourceIds, threats) {
+    const rawNormalized = raw.trim().replace(/\s+/g, " ");
+    const safeNormalized = sanitized.trim().replace(/\s+/g, " ");
+    return [...new Set([
+            ...(Array.from(raw).length > 1_000 ? ["oversized_payload"] : []),
+            ...(rawNormalized !== safeNormalized && /\[REDACTED/i.test(sanitized) ? ["secret_or_credential"] : []),
+            ...semanticCandidateRisks(raw),
+            ...(threats.length > 0 ? ["injection_or_threat"] : []),
+            ...threats.map((threat) => `threat:${threat}`),
+            ...(sourceIds.length === 0 ? ["missing_evidence"] : []),
+        ])];
 }
 export function buildDeterministicReviewCandidates(reflections, existingHeuristics) {
     const seen = new Set(existingHeuristics);
     const candidates = [];
     for (const reflection of reflections) {
         for (const lesson of reflection.lessons_learned) {
-            const heuristic = strictDerivedText(lesson);
+            const sanitized = strictDerivedText(lesson);
+            const heuristic = boundedCandidateText(sanitized);
             if (!heuristic)
                 continue;
             const normalized = normalizeCandidateText(heuristic);
             if (seen.has(normalized))
                 continue;
             seen.add(normalized);
-            const threatPatterns = scanHeuristicThreats(heuristic, "strict");
+            const threatPatterns = scanHeuristicThreats(lesson, "strict");
             candidates.push({
                 heuristic: threatPatterns.length > 0 ? safeHeuristicText(heuristic) : heuristic,
                 source_reflection_id: reflection.id,
@@ -32,6 +99,7 @@ export function buildDeterministicReviewCandidates(reflections, existingHeuristi
                 tags: [...new Set([...(reflection.tags ?? []), "background-review"])],
                 skipped_reason: threatPatterns.length > 0 ? "threat_pattern_detected" : undefined,
                 threat_patterns: threatPatterns.length > 0 ? threatPatterns : undefined,
+                risk_reasons: extractedRiskReasons(lesson, sanitized, [reflection.id], threatPatterns),
             });
         }
     }
@@ -77,6 +145,7 @@ function llmCandidates(llm, existingHeuristics, fallbackSourceId) {
             tags: [...new Set([...item.tags, "background-review"])],
             skipped_reason: threatPatterns.length > 0 ? "threat_pattern_detected" : undefined,
             threat_patterns: threatPatterns.length > 0 ? threatPatterns : undefined,
+            risk_reasons: item.risk_reasons,
         });
     }
     return candidates;
@@ -105,7 +174,7 @@ export async function runReview(options) {
         llmResult = await runLlmReview(reviewedReflections, { signal: options.signal });
         if (llmResult.success) {
             modeUsed = "llm";
-            candidateHeuristics = llmCandidates(llmResult, existingHeuristics, options.session_id);
+            candidateHeuristics = llmCandidates(llmResult, existingHeuristics, reviewedReflections.at(-1)?.id);
         }
         else if (options.review_mode === "llm") {
             return {
@@ -152,8 +221,34 @@ export async function runReview(options) {
         candidateHeuristics = buildDeterministicReviewCandidates(reviewedReflections, existingHeuristics);
     }
     candidateHeuristics = candidateHeuristics.slice(0, MAX_REVIEW_CANDIDATES);
-    const skipped = candidateHeuristics.filter((candidate) => candidate.skipped_reason);
-    const safeCandidates = candidateHeuristics.filter((candidate) => !candidate.skipped_reason);
+    for (const candidate of candidateHeuristics) {
+        if (conflictsWithExisting(candidate.heuristic, existingHeuristics)) {
+            candidate.risk_reasons = [...new Set([...(candidate.risk_reasons ?? []), "conflicting_memory"])];
+        }
+    }
+    const scope = options.scope ?? reviewedReflections[0]?.scope ?? "global";
+    if (options.source_fingerprint && options.source_fingerprint !== fingerprint) {
+        throw new Error("Review source changed before candidate generation");
+    }
+    const persistedCandidates = await enqueueReviewCandidates(candidateHeuristics.map((candidate) => ({
+        scope,
+        stage: modeUsed,
+        source_fingerprint: fingerprint,
+        source_reflection_ids: [candidate.source_reflection_id]
+            .filter((id) => typeof id === "string" && id.length > 0)
+            .slice(0, 50),
+        heuristic: candidate.heuristic,
+        domain: candidate.domain,
+        tags: candidate.tags,
+        confidence: candidate.confidence,
+        risk_reasons: [
+            ...(candidate.skipped_reason ? [candidate.skipped_reason] : []),
+            ...(candidate.threat_patterns ?? []),
+            ...(candidate.risk_reasons ?? []),
+        ],
+    })));
+    const skipped = persistedCandidates.filter((candidate) => candidate.risk_reasons.length > 0);
+    const autoApplyCandidates = persistedCandidates.filter(mayAutoApply);
     const existingHeuristicIds = new Set(store.heuristics.map((heuristic) => heuristic.id));
     const applied = {
         heuristics_added: 0,
@@ -165,17 +260,20 @@ export async function runReview(options) {
     if (options.auto_apply && store.metadata?.write_approval === true) {
         autoApplyBlocked = "write_approval_enabled";
     }
-    else if (options.auto_apply && safeCandidates.length > 0) {
-        const apply = () => upsertHeuristicsBatch(safeCandidates.map((candidate) => ({
-            domain: candidate.domain,
-            heuristic: candidate.heuristic,
-            source_task: modeUsed === "deterministic"
-                ? `background_review:${options.session_id}`
-                : `llm_background_review:${options.session_id}`,
-            session_id: options.session_id,
-            confidence: candidate.confidence,
-            tags: candidate.tags,
-        })));
+    else if (options.auto_apply && autoApplyCandidates.length > 0) {
+        if (options.before_apply)
+            await options.before_apply();
+        const apply = async () => {
+            const results = [];
+            for (const candidate of autoApplyCandidates) {
+                const result = await autoApplyReviewCandidate(candidate);
+                if (result) {
+                    candidate.state = "applied";
+                    results.push(result);
+                }
+            }
+            return results;
+        };
         const leaseCurrent = options.beforeApply ? await options.beforeApply() : true;
         const saved = leaseCurrent
             ? (options.withApplyLease ? await options.withApplyLease(apply) : await apply())
@@ -184,11 +282,11 @@ export async function runReview(options) {
             autoApplyBlocked = "stale_background_lease";
         }
         else {
-            const added = saved.filter((item) => !existingHeuristicIds.has(item.id));
+            const added = saved.filter((item) => !existingHeuristicIds.has(item.heuristic_id));
             applied.heuristics_added = added.length;
             applied.heuristics_reinforced = saved.length - added.length;
-            applied.heuristic_ids = added.map((item) => item.id);
-            applied.all_processed_heuristic_ids = saved.map((item) => item.id);
+            applied.heuristic_ids = added.map((item) => item.heuristic_id);
+            applied.all_processed_heuristic_ids = saved.map((item) => item.heuristic_id);
         }
     }
     return {
@@ -216,13 +314,25 @@ export async function runReview(options) {
         source_fingerprint: fingerprint,
         review_summary: modeUsed === "llm" ? llmResult?.summary : undefined,
         review_open_questions: modeUsed === "llm" ? llmResult?.open_questions : undefined,
-        candidate_heuristics: candidateHeuristics,
+        candidate_heuristics: persistedCandidates,
         candidate_memory_entries: [],
         candidate_user_profile_entries: [],
         skipped_items: skipped,
         llm: llmResult ? sanitizeLlmAudit(llmResult) : undefined,
         applied,
     };
+}
+export function runReviewSingleFlight(options) {
+    const key = reviewSingleFlightKey(options);
+    const current = inFlight.get(key);
+    if (current)
+        return current;
+    const started = runReview(options).finally(() => {
+        if (inFlight.get(key) === started)
+            inFlight.delete(key);
+    });
+    inFlight.set(key, started);
+    return started;
 }
 export async function getReviewSourceState(sessionId, reviewScope = "recent") {
     const store = await exportData();
@@ -232,7 +342,11 @@ export async function getReviewSourceState(sessionId, reviewScope = "recent") {
     const reviewed = reviewScope === "recent"
         ? allSessionReflections.slice(-MAX_RECENT_REFLECTIONS)
         : allSessionReflections.slice(-MAX_FULL_REFLECTIONS);
-    return { source_fingerprint: reviewSourceFingerprint(reviewed), reflection_count: reviewed.length };
+    return {
+        source_fingerprint: reviewSourceFingerprint(reviewed),
+        reflection_count: reviewed.length,
+        ...(reviewed.at(-1)?.scope ? { scope: reviewed.at(-1).scope } : {}),
+    };
 }
 export function getReviewReadinessStatus() {
     return getLlmReviewReadiness();

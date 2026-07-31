@@ -1,11 +1,12 @@
 {
   "name": "hermes-reflection-mcp",
-  "version": "19.4.1",
+  "version": "20.0.0",
   "description": "Hermes-inspired local reflection, heuristic, memory, and session MCP server",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "hermes-reflection-mcp": "./dist/index.js"
+    "hermes-reflection-mcp": "./dist/index.js",
+    "hermes-reflection-codex-hook": "./dist/src/codex_hook_cli.js"
   },
   "files": [
     "dist/",
@@ -18,6 +19,18 @@
     "scripts/v19.3-integration-test.mjs",
     "scripts/v19.4-regression-test.mjs",
     "scripts/v19.4.1-regression-test.mjs",
+    "scripts/v19.5-context-budget-regression-test.mjs",
+    "scripts/v20-test-helpers.mjs",
+    "scripts/v20-tool-registry-test.mjs",
+    "scripts/v20-response-budget-test.mjs",
+    "scripts/v20-migration-test.mjs",
+    "scripts/v20-retrieval-test.mjs",
+    "scripts/v20-background-test.mjs",
+    "scripts/v20-lifecycle-test.mjs",
+    "scripts/v20-storage-transaction-test.mjs",
+    "scripts/v20-agent-eval.mjs",
+    "evals/v20-agent-workflows.json",
+    "evals/v20-agent-transcript.jsonl",
     "scripts/background-worker-child.mjs",
     "index.ts",
     "storage.ts",
@@ -44,12 +57,25 @@
     "test:v19.3": "npm run build && node scripts/v19.3-regression-test.mjs && node scripts/v19.3-integration-test.mjs",
     "test:v19.4": "npm run build && node scripts/v19.4-regression-test.mjs",
     "test:v19.4.1": "npm run build && node scripts/v19.4.1-regression-test.mjs",
+    "test:v19.5": "npm run build && node scripts/v19.5-context-budget-regression-test.mjs",
+    "test:strict": "tsc --noEmit --noUnusedLocals --noUnusedParameters",
+    "test:v20:registry": "npm run build && node scripts/v20-tool-registry-test.mjs",
+    "test:v20:response": "npm run build && node scripts/v20-response-budget-test.mjs",
+    "test:v20:migration": "npm run build && node scripts/v20-migration-test.mjs",
+    "test:v20:retrieval": "npm run build && node scripts/v20-retrieval-test.mjs",
+    "test:v20:background": "npm run build && node scripts/v20-background-test.mjs",
+    "test:v20:lifecycle": "npm run build && node scripts/v20-lifecycle-test.mjs",
+    "test:v20:storage": "npm run build && node scripts/v20-storage-transaction-test.mjs",
+    "test:v20": "npm run test:v20:registry && node scripts/v20-response-budget-test.mjs && node scripts/v20-migration-test.mjs && node scripts/v20-retrieval-test.mjs && node scripts/v20-background-test.mjs && node scripts/v20-lifecycle-test.mjs && node scripts/v20-storage-transaction-test.mjs",
+    "test:v20:agent": "node scripts/v20-agent-eval.mjs",
+    "test:v20:agent-fixture": "node scripts/v20-agent-eval.mjs --fixture evals/v20-agent-transcript.jsonl",
     "start": "node dist/index.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "better-sqlite3": "^12.11.1",
-    "zod": "^3.22.0"
+    "zod": "^3.22.0",
+    "zod-to-json-schema": "3.25.2"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
