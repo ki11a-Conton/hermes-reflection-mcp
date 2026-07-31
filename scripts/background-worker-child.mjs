@@ -6,6 +6,15 @@ const store = new BackgroundStateStore(statePath);
 const lease = await store.acquireLease(ownerId, 30_000);
 process.stdout.write(`${JSON.stringify(lease)}\n`);
 if (lease.acquired) {
-  await new Promise((resolve) => setTimeout(resolve, Number(holdText) || 0));
+  if (holdText === "signal") {
+    await new Promise((resolve, reject) => {
+      process.stdin.once("data", resolve);
+      process.stdin.once("end", resolve);
+      process.stdin.once("error", reject);
+      process.stdin.resume();
+    });
+  } else {
+    await new Promise((resolve) => setTimeout(resolve, Number(holdText) || 0));
+  }
   await store.releaseLease(ownerId, lease.fencing_token);
 }

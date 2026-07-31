@@ -170,6 +170,12 @@ async function runManualShutdownChild() {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.equal((await state.status()).lease.active, true, "manual shutdown fixture never acquired its lease");
+  await new Promise((resolve, reject) => {
+    process.stdin.once("data", resolve);
+    process.stdin.once("end", resolve);
+    process.stdin.once("error", reject);
+    process.stdin.resume();
+  });
   await lifecycle.shutdown(2_000);
   assert.equal((await state.status()).lease.active, false, "shutdown returned before the manual review released its fence");
   await run.catch(() => undefined);
@@ -179,11 +185,16 @@ async function runManualShutdownChild() {
 async function withMockProvider(fn) {
   const requests = [];
   let scenario = { kind: "success", attempt: 0 };
+  let signalRequest;
+  let requestSeen = new Promise((resolve) => {
+    signalRequest = resolve;
+  });
   const server = createServer(async (request, response) => {
     let body = "";
     request.setEncoding("utf8");
     for await (const chunk of request) body += chunk;
     requests.push(JSON.parse(body));
+    signalRequest();
     scenario.attempt += 1;
     if (scenario.kind === "429" && scenario.attempt === 1) {
       response.writeHead(429).end("rate limited");
@@ -229,16 +240,19 @@ async function withMockProvider(fn) {
   const setScenario = (kind) => {
     scenario = { kind, attempt: 0 };
     requests.length = 0;
+    requestSeen = new Promise((resolve) => {
+      signalRequest = resolve;
+    });
   };
   try {
-    await fn({ endpoint, requests, setScenario });
+    await fn({ endpoint, requests, setScenario, waitForRequest: () => requestSeen });
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
 }
 
 async function testBoundedLlmAndSingleFlight(home) {
-  await withMockProvider(async ({ endpoint, requests, setScenario }) => {
+  await withMockProvider(async ({ endpoint, requests, setScenario, waitForRequest }) => {
     Object.assign(process.env, {
       HERMES_REFLECTION_LLM_ENABLED: "1",
       HERMES_REFLECTION_LLM_BASE_URL: endpoint,
@@ -495,13 +509,29 @@ async function testBoundedLlmAndSingleFlight(home) {
         HERMES_REFLECTION_LLM_API_KEY: "test-only-key",
         HERMES_REFLECTION_LLM_TIMEOUT_MS: "2500",
       },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
     let shutdownStderr = "";
     manualShutdownChild.stderr.setEncoding("utf8");
     manualShutdownChild.stderr.on("data", (chunk) => { shutdownStderr += chunk; });
-    const [shutdownCode] = await once(manualShutdownChild, "exit");
+    const shutdownExit = once(manualShutdownChild, "exit");
+    let requestTimeout;
+    try {
+      await Promise.race([
+        waitForRequest(),
+        shutdownExit.then(([code]) => {
+          throw new Error(`manual shutdown child exited before provider request (${code}): ${shutdownStderr}`);
+        }),
+        new Promise((_, reject) => {
+          requestTimeout = setTimeout(() => reject(new Error("manual shutdown provider request timed out")), 10_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(requestTimeout);
+    }
+    manualShutdownChild.stdin.end("shutdown\n");
+    const [shutdownCode] = await shutdownExit;
     assert.equal(shutdownCode, 0, `manual shutdown child failed: ${shutdownStderr}`);
     assert.equal(requests.length, 1, "manual shutdown fixture must issue one provider request");
   });

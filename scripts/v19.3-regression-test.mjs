@@ -502,7 +502,7 @@ async function testBackgroundState() {
 function spawnLeaseChild(statePath, ownerId, holdMs) {
   const child = spawn(process.execPath, ["scripts/background-worker-child.mjs", statePath, ownerId, String(holdMs)], {
     cwd: process.cwd(),
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
   child.stdout.setEncoding("utf8");
@@ -525,21 +525,30 @@ function spawnLeaseChild(statePath, ownerId, holdMs) {
     child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`lease child failed (${code}): ${stderr}`)));
     child.once("error", reject);
   });
-  return { firstLine, exited };
+  return {
+    firstLine,
+    exited,
+    release: () => child.stdin.end("release\n"),
+  };
 }
 
 async function testBackgroundFencing() {
   const root = await mkdtemp(join(tmpdir(), "hermes-v19.3-fencing-"));
   try {
     const statePath = join(root, "background_lifecycle.json");
-    const first = spawnLeaseChild(statePath, "process-a", 500);
+    const first = spawnLeaseChild(statePath, "process-a", "signal");
     const firstLease = await first.firstLine;
     assert.equal(firstLease.acquired, true);
-    const second = spawnLeaseChild(statePath, "process-b", 0);
-    const secondLease = await second.firstLine;
-    assert.equal(secondLease.acquired, false, "a second process must not displace a live lease owner");
-    assert.equal(secondLease.fencing_token, firstLease.fencing_token);
-    await Promise.all([first.exited, second.exited]);
+    try {
+      const second = spawnLeaseChild(statePath, "process-b", 0);
+      const secondLease = await second.firstLine;
+      assert.equal(secondLease.acquired, false, "a second process must not displace a live lease owner");
+      assert.equal(secondLease.fencing_token, firstLease.fencing_token);
+      await second.exited;
+    } finally {
+      first.release();
+      await first.exited;
+    }
 
     const third = spawnLeaseChild(statePath, "process-c", 0);
     const thirdLease = await third.firstLine;
