@@ -1,8 +1,10 @@
-# Hermes Reflection MCP v20.0.0
+# Hermes Reflection MCP v21.0.0
 
 Hermes Reflection MCP is a local, Agent-first memory and reflection server for Codex Desktop. It keeps the v19-compatible 29-tool surface, but the recommended Codex profile exposes only 10 high-value tools to reduce tool metadata and context usage.
 
 All memory is reference data, never instructions. The server is local-first, rejects unsafe transfer paths, redacts sensitive derived/output text, and requires explicit confirmation for destructive reset.
+
+v21 tightens project/session scope failures: missing, conflicting, stale, or cross-project provenance fails closed with a structured scope error and no mutation. `reflect_on_task` also accepts an optional `idempotency_key`; replaying the same normalized input returns the committed receipt, while key reuse with different input conflicts. The compatibility layer remains exactly 29 unique tools, and the default Agent-first profile remains the exact ordered 10-tool list below.
 
 ## Agent-first core profile
 
@@ -99,6 +101,8 @@ HERMES_REFLECTION_LLM_API_KEY=<dedicated-provider-key>
 
 Only bounded, strictly redacted reflection fields are sent. Output must match the strict candidate schema. Redirects are rejected; authentication, permission, quota, timeout, network, oversized, and invalid-output failures are classified without exposing provider response bodies or credentials.
 
+Candidates remain untrusted suggestions. Before persistence, v21 rechecks exact scope, source evidence, freshness, content identity, write-approval state, and the current fencing token under the authoritative lock. This anti-mislearning/TOCTOU evidence gate prevents stale or cross-scope provider output from becoming memory.
+
 `review_mode: "auto"` uses LLM review when ready and otherwise falls back to deterministic review. `review_mode: "llm"` fails closed when the provider is unavailable.
 
 Auto-apply is a separate opt-in. A candidate is eligible only when confidence is at least 0.85, it has no risk reasons, remains pending, is at most 1,000 characters, and has source reflection IDs. Auto-apply is blocked when write approval is enabled or the background fencing lease is stale. It never edits skills, User Profile, or Memory Board.
@@ -107,7 +111,9 @@ Auto-apply is a separate opt-in. A candidate is eligible only when confidence is
 
 The scheduler starts only when `HERMES_REFLECTION_BACKGROUND_ENABLED=true`. It tracks dirty sessions, uses unreferenced timers, single-flight provider calls, bounded retries, and cross-process leases with fencing tokens. Automatic persistence remains off unless `HERMES_REFLECTION_BACKGROUND_AUTO_APPLY=true`.
 
-The included `hermes-reflection-codex-hook` accepts bounded JSON on stdin for `SessionStart`, `Stop`, `SessionEnd`, `PreCompact`, and `PostCompact`. It enqueues quickly; the MCP process consumes the durable inbox. Hooks do not pause/resume Codex execution and installation alone does not capture conversation turns.
+The included `hermes-reflection-codex-hook` accepts bounded JSON on stdin for `SessionStart`, `Stop`, `SessionEnd`, `PreCompact`, and `PostCompact`. It enqueues quickly; the MCP process consumes the durable inbox. The verified polling contract is at most 5 seconds, with a default interval at most 1 second; this is a scheduling contract, not a throughput or end-to-end performance claim. Hooks do not pause/resume Codex execution and installation alone does not capture conversation turns.
+
+`PostCompact` requires bounded compaction metadata and commits a durable hashed receipt. Replays are idempotent, conflicting same-generation receipts fail closed, and the receipt survives restart. The deterministic handoff preserves the current request and explicit reverse signals without presenting superseded work as active.
 
 Example client hook command:
 
@@ -128,11 +134,11 @@ Default transfer directories are:
 
 Additional allow-listed roots may be supplied with `HERMES_TRANSFER_IMPORT_ROOTS` and `HERMES_TRANSFER_EXPORT_ROOTS` using the platform path delimiter. Device paths, alternate data streams, non-JSON imports, traversal, links, and paths outside allowed roots are rejected.
 
-Safe export redacts derived content by default. Raw export requires an explicit sensitive confirmation. Replace imports and clear operations use a cross-store journal: JSON and logical SQLite snapshots are staged, committed, verified, and recovered after interruption. Startup rolls back pre-commit phases and completes an interrupted committing phase.
+Safe export redacts derived content by default. Raw export requires an explicit sensitive confirmation. Replace imports, clear operations, reflection saves, heuristic updates, feedback, and approved mutations use durable transaction evidence. JSON and logical SQLite snapshots are staged, committed, verified, and recovered after interruption. Startup rolls back pre-commit phases and completes an interrupted committing phase from its bounded receipt instead of replaying the mutation.
 
 ## Migration and rollback
 
-v20 uses store schema version 2 and migrates supported legacy state under a lock with backup/recovery checks. Future or corrupt authoritative state fails closed and preserves content-addressed evidence; it is not silently replaced.
+v21 keeps store schema version 2 and migrates supported legacy state under a lock with backup/recovery checks. Future or corrupt authoritative state fails closed and preserves content-addressed evidence; it is not silently replaced.
 
 Before upgrading, stop the old MCP process, back up the installed code directory, and separately back up `~/.hermes-reflection`. Install into a clean staging directory, run the full validation matrix, then switch Codex to the validated path. To roll back, stop Codex, restore the previous code directory and matching data backup, then restart a fresh Codex process.
 
@@ -152,10 +158,11 @@ npm run test:v19.5
 npm run test:v20
 npm run test:concurrency
 npm run test:v20:agent-fixture
+npm run test:v21
 ```
 
 `npm run test:v20:agent` runs 20 fresh-process Codex Agent workflows and requires at least 18/20 passes with zero destructive-tool violations. It needs the local `codex` executable and can make model calls. The fixture grader is deterministic and offline.
 
-CI runs Windows and Linux on Node 20 and 22, including strict TypeScript, compatibility tests, v20 tests, concurrency checks, package dry-run, fixture grading, and production audit.
+CI runs Windows and Linux on Node 20 and 22, including strict TypeScript, compatibility tests, v20 and v21 suites, concurrency checks, package dry-run, fixture grading, and production audit.
 
 See [`INSTALL_HERMES_MCP.md`](INSTALL_HERMES_MCP.md) for installation and [`CHANGELOG.md`](CHANGELOG.md) for release history.

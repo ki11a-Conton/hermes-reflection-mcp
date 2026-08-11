@@ -1,30 +1,13 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { lstat, mkdir, open, readFile, rename, rmdir, unlink } from "node:fs/promises";
+import { link, lstat, mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { ReflectionStore } from "../types.js";
-import {
-  STORE_DIR,
-  exportData,
-  previewClearData,
-  previewReplaceImportData,
-  replaceStoreDataSnapshot,
-  withOperationJournalStoreMutation,
-  withStoreSnapshotBarrier,
-  type ClearCollection,
-} from "../storage.js";
-import {
-  emptySessionStorageSnapshot,
-  replaceSessionStorageSnapshot,
-  snapshotSessionStorage,
-  snapshotSessionStorageAfterWriteBarrier,
-  validateSessionStorageSnapshot,
-  withOperationJournalSessionMutation,
-  type SessionStorageSnapshot,
-} from "../session_storage.js";
+import type { SessionStorageSnapshot } from "../session_storage.js";
 
 export type OperationPhase = "prepared" | "json_staged" | "sqlite_staged" | "committing" | "complete";
-
 export interface OperationJournalRecord {
   schema_version: 1;
   id: string;
@@ -37,37 +20,128 @@ export interface OperationJournalRecord {
   backup_paths: string[];
 }
 
-interface OperationSnapshots {
-  beforeJson: ReflectionStore;
-  afterJson: ReflectionStore;
-  beforeSqlite: SessionStorageSnapshot;
-  afterSqlite: SessionStorageSnapshot;
+export const OPERATION_RESOURCE_NAMES = [
+  "reflections", "store_index", "resolved_questions", "session_storage",
+] as const;
+export type OperationResourceName = typeof OPERATION_RESOURCE_NAMES[number];
+export type OperationV2Phase = "prepared" | "committing" | "committed";
+
+export interface OperationResourceRecord {
+  name: OperationResourceName;
+  target_path: string;
+  before_sha256: string;
+  after_sha256: string;
+  staged_after_path: string;
 }
 
+export interface OperationResultReceipt {
+  transaction_id: string;
+  result_id: string;
+  operation: string;
+  reflection_ids: string[];
+  result_hash: string;
+}
+
+export interface OperationReceiptInput {
+  reflection_ids?: string[];
+  result_hash: string;
+}
+
+export interface OperationTransactionReservation {
+  transaction_id: string;
+  result_id: string;
+  created_at: string;
+}
+
+export interface OperationJournalV2 {
+  schema_version: 2;
+  transaction_id: string;
+  operation: string;
+  phase: OperationV2Phase;
+  created_at: string;
+  resources: OperationResourceRecord[];
+  result_receipt: OperationResultReceipt;
+}
+
+export interface OperationResourceInput {
+  name: OperationResourceName;
+  after: string;
+}
+
+const RESOURCE_FAILPOINTS = OPERATION_RESOURCE_NAMES.flatMap((name) => [
+  `before_stage_write:${name}`,
+  `after_stage_write:${name}`,
+  `before_stage_fsync:${name}`,
+  `after_stage_fsync:${name}`,
+  `before_replace:${name}`,
+  `after_replace:${name}`,
+  `before_verify:${name}`,
+  `after_verify:${name}`,
+  `recovery_before_replace:${name}`,
+  `recovery_after_replace:${name}`,
+  `recovery_before_verify:${name}`,
+  `recovery_after_verify:${name}`,
+]);
+export const OPERATION_FAILPOINTS = Object.freeze([
+  ...RESOURCE_FAILPOINTS,
+  "before_prepare_journal_write", "before_prepare_journal_fsync",
+  "after_prepare_journal_write", "after_prepare_journal_fsync",
+  "before_committing_journal_write", "before_committing_journal_fsync",
+  "after_committing_journal_write", "after_committing_journal_fsync",
+  "before_commit_marker_write", "before_commit_marker_fsync",
+  "after_commit_marker_write", "after_commit_marker_fsync",
+  "before_cleanup", "after_cleanup",
+  "recovery_before_commit_marker_write", "recovery_before_commit_marker_fsync",
+  "recovery_after_commit_marker_write", "recovery_after_commit_marker_fsync",
+  "recovery_before_cleanup", "recovery_after_cleanup",
+] as string[]);
+const FAILPOINT_SET = new Set(OPERATION_FAILPOINTS);
+
+const STORE_DIR = join(homedir(), ".hermes-reflection");
 const JOURNAL_PATH = join(STORE_DIR, "operation_journal.json");
 const LOCK_PATH = join(STORE_DIR, "operation_journal.lock");
+const RECLAIM_GUARD_PATH = join(STORE_DIR, "operation_journal.reclaim.guard");
 const OPERATIONS_DIR = join(STORE_DIR, "operations");
-const SHA256_RE = /^[a-f0-9]{64}$/;
+const SHA_RE = /^[a-f0-9]{64}$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const PHASES = new Set<OperationPhase>(["prepared", "json_staged", "sqlite_staged", "committing", "complete"]);
-const NEXT_PHASE: Partial<Record<OperationPhase, OperationPhase>> = {
-  prepared: "json_staged",
-  json_staged: "sqlite_staged",
-  sqlite_staged: "committing",
-  committing: "complete",
+const V1_PHASES = new Set<OperationPhase>(["prepared", "json_staged", "sqlite_staged", "committing", "complete"]);
+const NEXT_V1: Partial<Record<OperationPhase, OperationPhase>> = {
+  prepared: "json_staged", json_staged: "sqlite_staged", sqlite_staged: "committing", committing: "complete",
 };
-
-export function assertOperationPhaseTransition(current: OperationPhase, next: OperationPhase): void {
-  if (NEXT_PHASE[current] !== next) {
-    throw new Error(`non-monotonic operation phase transition: ${current} -> ${next}`);
+const coordinatorContext = new AsyncLocalStorage<boolean>();
+export class OperationJournalStoreUnavailableError extends Error {
+  readonly code = "OPERATION_JOURNAL_STORE_UNAVAILABLE";
+  constructor(cause: unknown) {
+    super("Operation journal store directory is temporarily unavailable.", { cause });
+    this.name = "OperationJournalStoreUnavailableError";
   }
 }
 
-class InjectedOperationFailure extends Error {
-  constructor(failpoint: string) {
-    super(`Recoverable operation interrupted at failpoint: ${failpoint}`);
-    this.name = "InjectedOperationFailure";
-  }
+function isStoreDirectoryObstruction(error: unknown): boolean {
+  if (!error || typeof error !== "object" || !("code" in error) || !("path" in error)) return false;
+  const code = String(error.code);
+  return (code === "EEXIST" || code === "ENOTDIR")
+    && resolve(String(error.path)) === resolve(STORE_DIR);
+}
+
+export function assertOperationJournalCoordinatorContext(): void {
+  if (coordinatorContext.getStore() !== true) throw new Error("operation journal session mutation requires coordinator barrier ownership");
+}
+let durabilityTrace: string[] = [];
+function traceDurability(event: string): void { if (process.env.NODE_ENV === "test") durabilityTrace.push(event); }
+export function operationJournalDurabilityTraceForTest(): string[] { return [...durabilityTrace]; }
+
+export function assertConfiguredOperationFailpoint(): void {
+  if (process.env.NODE_ENV !== "test") return;
+  const value = process.env.HERMES_TEST_OPERATION_FAILPOINT ?? process.env.HERMES_TEST_REFLECTION_TX_FAILPOINT;
+  if (value && !FAILPOINT_SET.has(value)) throw new Error(`Unknown operation failpoint: ${value}`);
+}
+
+function failpoint(name: string): void {
+  assertConfiguredOperationFailpoint();
+  if (process.env.NODE_ENV !== "test") return;
+  const configured = process.env.HERMES_TEST_OPERATION_FAILPOINT ?? process.env.HERMES_TEST_REFLECTION_TX_FAILPOINT;
+  if (configured === name) throw new Error(`Recoverable operation interrupted at failpoint: ${name}`);
 }
 
 function exactKeys(value: Record<string, unknown>, expected: string[], label: string): void {
@@ -76,90 +150,6 @@ function exactKeys(value: Record<string, unknown>, expected: string[], label: st
   if (actual.length !== wanted.length || actual.some((key, index) => key !== wanted[index])) {
     throw new Error(`${label} contains unknown or missing fields`);
   }
-}
-
-function operationPaths(id: string): { staged: string[]; backups: string[]; directory: string } {
-  const base = `operations/${id}`;
-  return {
-    staged: [`${base}/after-json.json`, `${base}/after-sqlite.json`],
-    backups: [`${base}/before-json.json`, `${base}/before-sqlite.json`],
-    directory: base,
-  };
-}
-
-function validateRelativePath(path: string, id: string): string {
-  if (typeof path !== "string" || path.length === 0 || path.length > 300) {
-    throw new Error("operation journal contains an invalid path");
-  }
-  if (isAbsolute(path) || path.includes("\\") || path.includes(":") || path.split("/").includes("..")) {
-    throw new Error("operation journal contains an unsafe path");
-  }
-  const prefix = `operations/${id}/`;
-  if (!path.startsWith(prefix)) throw new Error("operation journal path is outside its operation directory");
-  const absolute = resolve(STORE_DIR, ...path.split("/"));
-  const rel = relative(resolve(STORE_DIR), absolute);
-  if (rel.startsWith("..") || isAbsolute(rel)) throw new Error("operation journal path escapes the store directory");
-  return absolute;
-}
-
-function validateHashMap(value: unknown, label: string): Record<string, string> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
-  const map = value as Record<string, unknown>;
-  exactKeys(map, ["json", "sqlite"], label);
-  if (typeof map.json !== "string" || !SHA256_RE.test(map.json)
-      || typeof map.sqlite !== "string" || !SHA256_RE.test(map.sqlite)) {
-    throw new Error(`${label} contains an invalid SHA-256 hash`);
-  }
-  return { json: map.json, sqlite: map.sqlite };
-}
-
-export function decodeOperationJournal(value: unknown): OperationJournalRecord {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("operation journal must be an object");
-  }
-  const input = value as Record<string, unknown>;
-  exactKeys(input, [
-    "schema_version", "id", "operation", "phase", "created_at",
-    "before", "after", "staged_paths", "backup_paths",
-  ], "operation journal");
-  if (input.schema_version !== 1) throw new Error("unsupported operation journal schema_version");
-  if (typeof input.id !== "string" || !UUID_RE.test(input.id)) throw new Error("operation journal id is invalid");
-  if (input.operation !== "clear" && input.operation !== "replace_import") {
-    throw new Error("operation journal operation is invalid");
-  }
-  if (typeof input.phase !== "string" || !PHASES.has(input.phase as OperationPhase)) {
-    throw new Error("operation journal phase is invalid");
-  }
-  if (typeof input.created_at !== "string") throw new Error("operation journal created_at is invalid");
-  const timestamp = new Date(input.created_at);
-  if (Number.isNaN(timestamp.getTime()) || timestamp.toISOString() !== input.created_at) {
-    throw new Error("operation journal created_at must be a canonical ISO-8601 timestamp");
-  }
-  if (!Array.isArray(input.staged_paths) || !input.staged_paths.every((item) => typeof item === "string")) {
-    throw new Error("operation journal staged_paths is invalid");
-  }
-  if (!Array.isArray(input.backup_paths) || !input.backup_paths.every((item) => typeof item === "string")) {
-    throw new Error("operation journal backup_paths is invalid");
-  }
-  const expected = operationPaths(input.id);
-  const staged = input.staged_paths as string[];
-  const backups = input.backup_paths as string[];
-  if (JSON.stringify(staged) !== JSON.stringify(expected.staged)
-      || JSON.stringify(backups) !== JSON.stringify(expected.backups)) {
-    throw new Error("operation journal artifact paths do not match the operation id");
-  }
-  for (const path of [...staged, ...backups]) validateRelativePath(path, input.id);
-  return {
-    schema_version: 1,
-    id: input.id,
-    operation: input.operation,
-    phase: input.phase as OperationPhase,
-    created_at: input.created_at,
-    before: validateHashMap(input.before, "operation journal before"),
-    after: validateHashMap(input.after, "operation journal after"),
-    staged_paths: [...staged],
-    backup_paths: [...backups],
-  };
 }
 
 function stableValue(value: unknown): unknown {
@@ -173,392 +163,931 @@ function stableValue(value: unknown): unknown {
     }
     return result;
   }
-  throw new Error("operation snapshot contains a non-JSON value");
+  throw new Error("operation value is not JSON-serializable");
 }
 
-function canonicalJson(value: unknown): string {
-  return JSON.stringify(stableValue(value));
-}
-
-function sha256(value: string): string {
-  return createHash("sha256").update(value, "utf8").digest("hex");
-}
+function canonicalJson(value: unknown): string { return JSON.stringify(stableValue(value)); }
+function sha(value: string): string { return createHash("sha256").update(value, "utf8").digest("hex"); }
+export function operationResultHash(value: unknown): string { return sha(canonicalJson(value === undefined ? null : value)); }
+function rawHash(value: string | null): string { return sha(value === null ? "\0missing" : `\0present\0${value}`); }
 
 function jsonProjection(store: ReflectionStore): Record<string, unknown> {
   return {
-    sessions: store.sessions,
-    reflections: store.reflections,
-    affordance_gaps: store.affordance_gaps,
-    heuristics: store.heuristics,
-    version: store.version,
-    memory_board: store.memory_board,
-    user_profile: store.user_profile,
+    sessions: store.sessions, reflections: store.reflections, affordance_gaps: store.affordance_gaps,
+    heuristics: store.heuristics, version: store.version, memory_board: store.memory_board, user_profile: store.user_profile,
+  };
+}
+export function hashJournalJsonState(store: ReflectionStore): string { return sha(canonicalJson(jsonProjection(store))); }
+export function hashLegacyV1JsonState(store: ReflectionStore): string { return hashJournalJsonState(store); }
+
+export function hashJournalSqliteState(snapshot: SessionStorageSnapshot): string {
+  return sha(canonicalJson(snapshot));
+}
+export function hashLegacyV1SqliteState(snapshot: unknown): string { return sha(canonicalJson(snapshot)); }
+
+function v1Paths(id: string): { staged: string[]; backups: string[] } {
+  const base = `operations/${id}`;
+  return {
+    staged: [`${base}/after-json.json`, `${base}/after-sqlite.json`],
+    backups: [`${base}/before-json.json`, `${base}/before-sqlite.json`],
   };
 }
 
-export function hashJournalJsonState(store: ReflectionStore): string {
-  return sha256(canonicalJson(jsonProjection(store)));
-}
-
-export function hashJournalSqliteState(snapshot: SessionStorageSnapshot): string {
-  return sha256(canonicalJson(validateSessionStorageSnapshot(snapshot)));
-}
-
-async function atomicWriteJson(path: string, value: unknown): Promise<void> {
-  const temporary = `${path}.tmp.${process.pid}.${Date.now()}.${randomUUID()}`;
-  const handle = await open(temporary, "wx", 0o600);
-  try {
-    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
+function safeOperationPath(path: string, id: string): string {
+  if (!path || path.length > 300 || isAbsolute(path) || path.includes("\\") || path.includes(":") || path.split("/").includes("..")) {
+    throw new Error("operation journal contains an unsafe path");
   }
-  try {
-    await rename(temporary, path);
-  } catch (error) {
-    await unlink(temporary).catch(() => undefined);
-    throw error;
-  }
+  if (!path.startsWith(`operations/${id}/`)) throw new Error("operation journal path is outside its transaction directory");
+  const absolute = resolve(STORE_DIR, ...path.split("/"));
+  const rel = relative(resolve(STORE_DIR), absolute);
+  if (rel.startsWith("..") || isAbsolute(rel)) throw new Error("operation journal path escapes the store directory");
+  return absolute;
 }
 
-async function readJournal(): Promise<OperationJournalRecord | null> {
-  let raw: string;
+export function decodeOperationJournal(value: unknown): OperationJournalRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("operation journal must be an object");
+  const input = value as Record<string, unknown>;
+  exactKeys(input, ["schema_version", "id", "operation", "phase", "created_at", "before", "after", "staged_paths", "backup_paths"], "operation journal v1");
+  if (input.schema_version !== 1) throw new Error("unsupported operation journal schema_version");
+  if (typeof input.id !== "string" || !UUID_RE.test(input.id)) throw new Error("operation journal id is invalid");
+  if (input.operation !== "clear" && input.operation !== "replace_import") throw new Error("operation journal operation is invalid");
+  if (typeof input.phase !== "string" || !V1_PHASES.has(input.phase as OperationPhase)) throw new Error("operation journal phase is invalid");
+  if (typeof input.created_at !== "string" || new Date(input.created_at).toISOString() !== input.created_at) throw new Error("operation journal timestamp is invalid");
+  const hashes = (raw: unknown, label: string): Record<string, string> => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`${label} must be an object`);
+    const map = raw as Record<string, unknown>; exactKeys(map, ["json", "sqlite"], label);
+    if (typeof map.json !== "string" || !SHA_RE.test(map.json) || typeof map.sqlite !== "string" || !SHA_RE.test(map.sqlite)) throw new Error(`${label} contains an invalid SHA-256 hash`);
+    return { json: map.json, sqlite: map.sqlite };
+  };
+  if (!Array.isArray(input.staged_paths) || !Array.isArray(input.backup_paths)) throw new Error("operation journal artifact paths are invalid");
+  const expected = v1Paths(input.id);
+  if (JSON.stringify(input.staged_paths) !== JSON.stringify(expected.staged) || JSON.stringify(input.backup_paths) !== JSON.stringify(expected.backups)) throw new Error("operation journal artifact paths do not match id");
+  for (const path of [...expected.staged, ...expected.backups]) safeOperationPath(path, input.id);
+  return {
+    schema_version: 1, id: input.id, operation: input.operation, phase: input.phase as OperationPhase,
+    created_at: input.created_at, before: hashes(input.before, "operation journal before"),
+    after: hashes(input.after, "operation journal after"), staged_paths: expected.staged, backup_paths: expected.backups,
+  };
+}
+
+export function assertOperationPhaseTransition(current: OperationPhase, next: OperationPhase): void {
+  if (NEXT_V1[current] !== next) throw new Error(`non-monotonic operation phase transition: ${current} -> ${next}`);
+}
+
+function targetPathFor(name: OperationResourceName): string {
+  if (name === "reflections") return "reflections.jsonl";
+  if (name === "store_index") return "store.json";
+  if (name === "resolved_questions") return "resolved_questions.json";
+  return "authority:session_storage";
+}
+
+export function decodeOperationJournalV2(value: unknown): OperationJournalV2 {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("operation journal v2 must be an object");
+  const input = value as Record<string, unknown>;
+  exactKeys(input, ["schema_version", "transaction_id", "operation", "phase", "created_at", "resources", "result_receipt"], "operation journal v2");
+  if (input.schema_version !== 2) throw new Error("unsupported operation journal v2 schema_version");
+  if (typeof input.transaction_id !== "string" || !UUID_RE.test(input.transaction_id)) throw new Error("operation journal transaction_id is invalid");
+  if (typeof input.operation !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(input.operation)) throw new Error("operation journal operation is invalid");
+  if (input.phase !== "prepared" && input.phase !== "committing" && input.phase !== "committed") throw new Error("operation journal phase is invalid");
+  if (typeof input.created_at !== "string" || new Date(input.created_at).toISOString() !== input.created_at) throw new Error("operation journal timestamp is invalid");
+  if (!Array.isArray(input.resources) || input.resources.length === 0 || input.resources.length > OPERATION_RESOURCE_NAMES.length) throw new Error("operation journal resources are invalid");
+  const seen = new Set<string>();
+  const resources = input.resources.map((raw, index): OperationResourceRecord => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("operation journal resource must be an object");
+    const item = raw as Record<string, unknown>;
+    exactKeys(item, ["name", "target_path", "before_sha256", "after_sha256", "staged_after_path"], "operation journal resource");
+    if (typeof item.name !== "string" || !OPERATION_RESOURCE_NAMES.includes(item.name as OperationResourceName) || seen.has(item.name)) throw new Error("operation journal resource name is invalid or duplicated");
+    seen.add(item.name);
+    const name = item.name as OperationResourceName;
+    if (item.target_path !== targetPathFor(name)) throw new Error("operation journal resource target path is unsafe or invalid");
+    if (typeof item.before_sha256 !== "string" || !SHA_RE.test(item.before_sha256) || typeof item.after_sha256 !== "string" || !SHA_RE.test(item.after_sha256)) throw new Error("operation journal resource SHA-256 is invalid");
+    const staged = `operations/${input.transaction_id}/after-${index}.bin`;
+    if (item.staged_after_path !== staged) throw new Error("operation journal staged path is unsafe or invalid");
+    safeOperationPath(staged, input.transaction_id as string);
+    return { name, target_path: item.target_path, before_sha256: item.before_sha256, after_sha256: item.after_sha256, staged_after_path: staged };
+  });
+  if (!input.result_receipt || typeof input.result_receipt !== "object" || Array.isArray(input.result_receipt)) throw new Error("operation result receipt is invalid");
+  const receipt = input.result_receipt as Record<string, unknown>;
+  exactKeys(receipt, ["transaction_id", "result_id", "operation", "reflection_ids", "result_hash"], "operation result receipt");
+  if (receipt.transaction_id !== input.transaction_id || typeof receipt.result_id !== "string" || !UUID_RE.test(receipt.result_id)) throw new Error("operation result receipt IDs are invalid");
+  if (receipt.operation !== input.operation || !Array.isArray(receipt.reflection_ids) || receipt.reflection_ids.length > 256
+      || !receipt.reflection_ids.every((id) => typeof id === "string" && id.length > 0 && id.length <= 100)
+      || new Set(receipt.reflection_ids).size !== receipt.reflection_ids.length) throw new Error("operation result receipt reflection IDs are invalid");
+  if (typeof receipt.result_hash !== "string" || !SHA_RE.test(receipt.result_hash)) throw new Error("operation result receipt hash is invalid");
+  return {
+    schema_version: 2, transaction_id: input.transaction_id, operation: input.operation, phase: input.phase,
+    created_at: input.created_at, resources, result_receipt: {
+      transaction_id: receipt.transaction_id as string,
+      result_id: receipt.result_id,
+      operation: receipt.operation as string,
+      reflection_ids: [...receipt.reflection_ids] as string[],
+      result_hash: receipt.result_hash,
+    },
+  };
+}
+
+async function readOptional(path: string): Promise<string | null> {
   try {
-    const info = await lstat(JOURNAL_PATH);
-    if (!info.isFile() || info.isSymbolicLink()) {
-      throw new Error("operation journal must be a regular file, not a link");
-    }
-    raw = await readFile(JOURNAL_PATH, "utf8");
+    const info = await lstat(path);
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error(`${relative(STORE_DIR, path)} must be a regular file`);
+    return await readFile(path, "utf8");
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return null;
     throw error;
   }
+}
+
+async function syncDirectory(path: string): Promise<"synced" | "unsupported"> {
+  try {
+    const handle = await open(path, "r");
+    try { await handle.sync(); } finally { await handle.close(); }
+    return "synced";
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+    if (process.platform === "win32" && (code === "EPERM" || code === "EACCES" || code === "EISDIR" || code === "EBADF")) return "unsupported";
+    throw error;
+  }
+}
+
+async function durableStage(path: string, content: string, name: OperationResourceName): Promise<void> {
+  const handle = await open(path, "wx", 0o600);
+  try {
+    failpoint(`before_stage_write:${name}`);
+    await handle.writeFile(content, "utf8");
+    failpoint(`after_stage_write:${name}`);
+    failpoint(`before_stage_fsync:${name}`);
+    await handle.sync();
+    failpoint(`after_stage_fsync:${name}`);
+  } finally { await handle.close(); }
+}
+
+function journalPoint(prefix: "prepare" | "committing" | "commit_marker" | "recovery_commit_marker", when: "before" | "after", action: "write" | "fsync"): string {
+  if (prefix === "recovery_commit_marker") return `recovery_${when}_commit_marker_${action}`;
+  if (prefix === "commit_marker") return `${when}_commit_marker_${action}`;
+  return `${when}_${prefix}_journal_${action}`;
+}
+
+async function durableReplace(target: string, content: string): Promise<void> {
+  const temporary = `${target}.tmp.${process.pid}.${Date.now()}.${randomUUID()}`;
+  const handle = await open(temporary, "wx", 0o600);
+  try { await handle.writeFile(content, "utf8"); await handle.sync(); } finally { await handle.close(); }
+  try {
+    await rename(temporary, target);
+    await syncDirectory(resolve(target, ".."));
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function writeJournal(record: OperationJournalV2, prefix: "prepare" | "committing" | "commit_marker" | "recovery_commit_marker"): Promise<void> {
+  const temporary = `${JOURNAL_PATH}.tmp.${process.pid}.${Date.now()}.${randomUUID()}`;
+  let renamed = false;
+  try {
+    const handle = await open(temporary, "wx", 0o600);
+    try {
+      failpoint(journalPoint(prefix, "before", "write"));
+      await handle.writeFile(`${JSON.stringify(record, null, 2)}\n`, "utf8");
+      failpoint(journalPoint(prefix, "after", "write"));
+      failpoint(journalPoint(prefix, "before", "fsync"));
+      await handle.sync();
+    } finally { await handle.close(); }
+    await rename(temporary, JOURNAL_PATH);
+    renamed = true;
+    await syncDirectory(STORE_DIR);
+    if (prefix === "prepare") traceDurability("prepared_journal_published");
+    failpoint(journalPoint(prefix, "after", "fsync"));
+  } finally {
+    if (!renamed) await rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
+async function readJournal(): Promise<{ version: 1; record: OperationJournalRecord } | { version: 2; record: OperationJournalV2 } | null> {
+  const raw = await readOptional(JOURNAL_PATH); if (raw === null) return null;
   let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (error) {
-    throw new Error("operation journal is not valid JSON; refusing unsafe recovery", { cause: error });
+  try { parsed = JSON.parse(raw); } catch (error) { throw new Error("TRANSACTION_RECOVERY_PENDING: malformed operation journal", { cause: error }); }
+  if (parsed && typeof parsed === "object" && (parsed as Record<string, unknown>).schema_version === 1) return { version: 1, record: decodeOperationJournal(parsed) };
+  return { version: 2, record: decodeOperationJournalV2(parsed) };
+}
+
+async function validateSessionSnapshot(value: unknown): Promise<SessionStorageSnapshot> {
+  const session = await import("../session_storage.js");
+  return session.validateSessionStorageSnapshot(value);
+}
+
+async function resourceHash(name: OperationResourceName, staged?: string): Promise<string> {
+  if (name === "session_storage") {
+    const session = await import("../session_storage.js");
+    const value = staged === undefined ? await session.snapshotSessionStorage() : await validateSessionSnapshot(JSON.parse(staged));
+    if (!value) throw new Error("session storage is unavailable during transaction authority read");
+    return hashJournalSqliteState(value);
   }
-  return decodeOperationJournal(parsed);
+  const target = join(STORE_DIR, targetPathFor(name));
+  return rawHash(staged === undefined ? await readOptional(target) : staged);
 }
 
-async function writeJournal(record: OperationJournalRecord): Promise<void> {
-  await atomicWriteJson(JOURNAL_PATH, decodeOperationJournal(record));
+async function replaceResource(resource: OperationResourceRecord, staged: string): Promise<void> {
+  if (resource.name === "session_storage") {
+    const session = await import("../session_storage.js");
+    const snapshot = await validateSessionSnapshot(JSON.parse(staged));
+    const replaced = await session.withOperationJournalSessionMutation(() => session.replaceSessionStorageSnapshot(snapshot));
+    if (!replaced) throw new Error("session storage is unavailable during transaction replace");
+    return;
+  }
+  await durableReplace(join(STORE_DIR, resource.target_path), staged);
 }
 
-async function ensureDirectoryIsSafe(path: string, label: string): Promise<void> {
-  const info = await lstat(path);
-  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`${label} must be a real directory, not a link`);
+async function readStaged(resource: OperationResourceRecord, required: boolean): Promise<string | null> {
+  const staged = await readOptional(safeOperationPath(resource.staged_after_path, resource.staged_after_path.split("/")[1]));
+  if (staged === null && required) throw new Error(`TRANSACTION_RECOVERY_PENDING: staged after-image missing for ${resource.name}`);
+  if (staged !== null && await resourceHash(resource.name, staged) !== resource.after_sha256) throw new Error(`TRANSACTION_RECOVERY_PENDING: staged after-image hash mismatch for ${resource.name}`);
+  return staged;
 }
 
-async function prepareDirectories(id: string): Promise<string> {
-  await mkdir(STORE_DIR, { recursive: true, mode: 0o700 });
-  await mkdir(OPERATIONS_DIR, { recursive: true, mode: 0o700 });
-  await ensureDirectoryIsSafe(OPERATIONS_DIR, "operations directory");
-  const opDir = join(OPERATIONS_DIR, id);
-  await mkdir(opDir, { recursive: false, mode: 0o700 });
-  await ensureDirectoryIsSafe(opDir, "operation directory");
-  return opDir;
+async function cleanupV2(record: OperationJournalV2, recovery: boolean): Promise<void> {
+  failpoint(recovery ? "recovery_before_cleanup" : "before_cleanup");
+  await unlink(JOURNAL_PATH).catch((error: unknown) => {
+    if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+  });
+  await syncDirectory(STORE_DIR);
+  await rm(join(OPERATIONS_DIR, record.transaction_id), { recursive: true, force: true });
+  failpoint(recovery ? "recovery_after_cleanup" : "after_cleanup");
 }
 
-async function readArtifact(path: string): Promise<unknown> {
-  let raw: string;
-  try {
-    const info = await lstat(path);
-    if (!info.isFile() || info.isSymbolicLink()) {
-      throw new Error("operation artifact must be a regular file, not a link");
+async function recoverV2(record: OperationJournalV2): Promise<OperationResultReceipt> {
+  if (record.phase !== "committed") {
+    if (record.phase === "prepared") { record = { ...record, phase: "committing" }; await writeJournal(record, "committing"); }
+    for (const resource of record.resources) {
+      const current = await resourceHash(resource.name);
+      if (current === resource.after_sha256) continue;
+      if (current !== resource.before_sha256) throw new Error(`TRANSACTION_RECOVERY_PENDING: ${resource.name} matches neither before nor after authority hash`);
+      const staged = await readStaged(resource, true);
+      failpoint(`recovery_before_replace:${resource.name}`);
+      await replaceResource(resource, staged!);
+      failpoint(`recovery_after_replace:${resource.name}`);
+      failpoint(`recovery_before_verify:${resource.name}`);
+      if (await resourceHash(resource.name) !== resource.after_sha256) throw new Error(`TRANSACTION_RECOVERY_PENDING: recovery verification failed for ${resource.name}`);
+      failpoint(`recovery_after_verify:${resource.name}`);
     }
-    raw = await readFile(path, "utf8");
-  } catch (error) {
-    throw new Error(`operation artifact is unreadable: ${relative(STORE_DIR, path)}`, { cause: error });
+    record = { ...record, phase: "committed" };
+    await writeJournal(record, "recovery_commit_marker");
   }
+  for (const resource of record.resources) {
+    if (await resourceHash(resource.name) !== resource.after_sha256) throw new Error(`TRANSACTION_RECOVERY_PENDING: committed authority mismatch for ${resource.name}`);
+  }
+  const receipt = record.result_receipt;
+  recoveryGeneration += 1;
+  await cleanupV2(record, true);
+  return receipt;
+}
+
+async function readJsonArtifact(path: string): Promise<unknown> {
+  const raw = await readOptional(path); if (raw === null) throw new Error(`legacy operation artifact missing: ${relative(STORE_DIR, path)}`);
+  try { return JSON.parse(raw); } catch (error) { throw new Error("legacy operation artifact is malformed", { cause: error }); }
+}
+
+function parseV1AuthorityObject(raw: string, label: string): Record<string, unknown> {
+  let value: unknown;
+  try { value = JSON.parse(raw); }
+  catch (error) { throw new Error(`TRANSACTION_RECOVERY_PENDING: legacy v1 ${label} authority is malformed`, { cause: error }); }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`TRANSACTION_RECOVERY_PENDING: legacy v1 ${label} authority must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function parseV1ReflectionRows(raw: string): unknown[] {
+  const rows: unknown[] = [];
+  for (const [index, line] of raw.split(/\r?\n/).entries()) {
+    if (!line.trim()) continue;
+    try { rows.push(JSON.parse(line)); }
+    catch (error) { throw new Error(`TRANSACTION_RECOVERY_PENDING: legacy v1 reflections authority row ${index + 1} is malformed`, { cause: error }); }
+  }
+  return rows;
+}
+
+async function recoverV1(record: OperationJournalRecord): Promise<void> {
+  const useAfter = record.phase === "committing" || record.phase === "complete";
+  const jsonPath = useAfter ? record.staged_paths[0] : record.backup_paths[0];
+  const sqlitePath = useAfter ? record.staged_paths[1] : record.backup_paths[1];
+  const json = await readJsonArtifact(safeOperationPath(jsonPath, record.id)) as ReflectionStore;
+  const rawSqlite = await readJsonArtifact(safeOperationPath(sqlitePath, record.id));
+  const sqlite = await validateSessionSnapshot(rawSqlite);
+  const expected = useAfter ? record.after : record.before;
+  if (hashLegacyV1JsonState(json) !== expected.json || hashLegacyV1SqliteState(rawSqlite) !== expected.sqlite) throw new Error("TRANSACTION_RECOVERY_PENDING: legacy v1 artifact hash mismatch");
+  const storage = await import("../storage.js");
+  const session = await import("../session_storage.js");
+  const expectedSqliteCanonical = canonicalJson(sqlite);
+  const replacement = await storage.withOperationJournalStoreMutation(() => storage.replaceStoreDataSnapshot(json));
+  const expectedJsonAuthority = replacement.store;
+  const replaced = await session.withOperationJournalSessionMutation(() => session.replaceSessionStorageSnapshot(sqlite));
+  if (!replaced) throw new Error("legacy v1 session storage unavailable");
+  const mismatchMode = process.env.NODE_ENV === "test" ? process.env.HERMES_TEST_V1_POST_WRITE_MISMATCH : undefined;
+  if (mismatchMode === "store_index") {
+    const target = join(STORE_DIR, "store.json");
+    const raw = await readOptional(target);
+    if (raw === null) throw new Error("legacy v1 mismatch seam authority missing: store_index");
+    const value = parseV1AuthorityObject(raw, "store_index");
+    value.version = "21.0.0-v1-mismatch";
+    await writeFile(target, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  }
+  if (mismatchMode === "reflections") {
+    const target = join(STORE_DIR, "reflections.jsonl");
+    const raw = await readOptional(target);
+    if (raw === null) throw new Error("legacy v1 mismatch seam authority missing: reflections");
+    const rows = parseV1ReflectionRows(raw) as Array<Record<string, unknown>>;
+    if (!rows[0]) throw new Error("legacy v1 reflections mismatch seam requires a fixture row");
+    rows[0] = { ...rows[0], task_goal: "injected v1 reflection mismatch" };
+    await writeFile(target, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "utf8");
+  }
+  if (mismatchMode === "resolved_questions") {
+    const target = join(STORE_DIR, "resolved_questions.json");
+    const raw = await readOptional(target);
+    if (raw === null) throw new Error("legacy v1 mismatch seam authority missing: resolved_questions");
+    const value = parseV1AuthorityObject(raw, "resolved_questions");
+    value["injected-reflection:0"] = { resolved_at: "2026-08-11T00:00:00.000Z" };
+    await writeFile(target, JSON.stringify(value, null, 2), "utf8");
+  }
+  if (mismatchMode === "session_storage") {
+    const mismatched = await session.withOperationJournalSessionMutation(() => session.replaceSessionStorageSnapshot({
+      schema_version: 2, sessions: [], turns: [],
+    }));
+    if (!mismatched) throw new Error("legacy v1 mismatch seam could not replace session storage");
+  }
+  if (mismatchMode === "missing_store_index") await unlink(join(STORE_DIR, "store.json"));
+  if (mismatchMode === "missing_reflections") await unlink(join(STORE_DIR, "reflections.jsonl"));
+  if (mismatchMode === "missing_resolved_questions") await unlink(join(STORE_DIR, "resolved_questions.json"));
+  const actualSqlite = await session.snapshotSessionStorage();
+  if (!actualSqlite || canonicalJson(actualSqlite) !== expectedSqliteCanonical) {
+    throw new Error("TRANSACTION_RECOVERY_PENDING: legacy v1 post-write authority mismatch for session_storage");
+  }
+  const reflection = await import("./reflection_transaction.js");
+  const actualStoreIndex = await readOptional(join(STORE_DIR, "store.json"));
+  const actualReflections = await readOptional(join(STORE_DIR, "reflections.jsonl"));
+  const actualResolvedQuestions = await readOptional(join(STORE_DIR, "resolved_questions.json"));
+  if (actualStoreIndex === null) throw new Error("TRANSACTION_RECOVERY_PENDING: legacy v1 post-write authority missing for store_index");
+  if (actualReflections === null) throw new Error("TRANSACTION_RECOVERY_PENDING: legacy v1 post-write authority missing for reflections");
+  if (actualResolvedQuestions === null) throw new Error("TRANSACTION_RECOVERY_PENDING: legacy v1 post-write authority missing for resolved_questions");
+  const expectedResources = reflection.serializeReflectionResources(
+    expectedJsonAuthority,
+    replacement.resolvedQuestions as Record<string, unknown>,
+  );
+  const actualStoreObject = parseV1AuthorityObject(actualStoreIndex, "store_index");
+  const expectedStoreObject = parseV1AuthorityObject(expectedResources.store_index, "expected store_index");
+  if (canonicalJson(parseV1ReflectionRows(actualReflections)) !== canonicalJson(parseV1ReflectionRows(expectedResources.reflections))) {
+    throw new Error("TRANSACTION_RECOVERY_PENDING: legacy v1 post-write authority mismatch for reflections");
+  }
+  if (canonicalJson(parseV1AuthorityObject(actualResolvedQuestions, "resolved_questions"))
+    !== canonicalJson(parseV1AuthorityObject(expectedResources.resolved_questions, "expected resolved_questions"))) {
+    throw new Error("TRANSACTION_RECOVERY_PENDING: legacy v1 post-write authority mismatch for resolved_questions");
+  }
+  try { await storage.loadStore(); }
+  catch (error) { throw new Error("TRANSACTION_RECOVERY_PENDING: legacy v1 post-write authority validation failed for store_index", { cause: error }); }
+  delete actualStoreObject.metadata;
+  delete actualStoreObject.reflections;
+  delete expectedStoreObject.metadata;
+  delete expectedStoreObject.reflections;
+  if (canonicalJson(actualStoreObject) !== canonicalJson(expectedStoreObject)) {
+    throw new Error("TRANSACTION_RECOVERY_PENDING: legacy v1 post-write authority mismatch for store_index");
+  }
+  recoveryGeneration += 1;
+  await unlink(JOURNAL_PATH);
+  await rm(join(OPERATIONS_DIR, record.id), { recursive: true, force: true });
+}
+
+function processAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (error) { return Boolean(error && typeof error === "object" && "code" in error && error.code === "EPERM"); }
+}
+
+interface LockOwner { schema_version: 1; pid: number; token: string }
+async function readLockOwner(path: string, label = "operation lock"): Promise<LockOwner> {
+  const value = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+  exactKeys(value, ["schema_version", "pid", "token"], label);
+  if (value.schema_version !== 1 || typeof value.pid !== "number" || !Number.isInteger(value.pid)
+      || value.pid <= 0 || typeof value.token !== "string" || !UUID_RE.test(value.token)) {
+    throw new Error(`${label} is malformed`);
+  }
+  return value as unknown as LockOwner;
+}
+
+function staleReclaimGuardError(reason: string): Error & { code: string } {
+  return Object.assign(new Error(`STALE_RECLAIM_GUARD: ${reason}`), { code: "STALE_RECLAIM_GUARD" });
+}
+
+async function readReclaimGuard(): Promise<LockOwner | null> {
   try {
-    return JSON.parse(raw) as unknown;
+    const owner = await readLockOwner(RECLAIM_GUARD_PATH, "operation reclaim guard");
+    if (!processAlive(owner.pid)) throw staleReclaimGuardError("guard owner is not alive; manual or startup recovery required");
+    return owner;
   } catch (error) {
-    throw new Error(`operation artifact is invalid JSON: ${relative(STORE_DIR, path)}`, { cause: error });
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return null;
+    if (error && typeof error === "object" && "code" in error && error.code === "STALE_RECLAIM_GUARD") throw error;
+    throw staleReclaimGuardError("guard is unreadable or malformed; manual or startup recovery required");
   }
 }
 
-async function transition(record: OperationJournalRecord, next: OperationPhase): Promise<OperationJournalRecord> {
-  const current = await readJournal();
-  if (!current || current.id !== record.id || current.phase !== record.phase) {
-    throw new Error("operation journal changed concurrently");
+async function createOwnedFile(
+  path: string,
+  owner: LockOwner,
+  onVisible?: () => Promise<void>,
+  publishLink: (existingPath: string, newPath: string) => Promise<void> = link,
+  afterCollisionLstat?: () => Promise<void>,
+): Promise<void> {
+  const temporaryPath = `${path}.tmp.${process.pid}.${randomUUID()}`;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(temporaryPath, "wx", 0o600);
+    await handle.writeFile(JSON.stringify(owner), "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    try {
+      await publishLink(temporaryPath, path);
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "EPERM")) throw error;
+      let targetInfo;
+      try { targetInfo = await lstat(path); }
+      catch (targetError) {
+        if (targetError && typeof targetError === "object" && "code" in targetError && targetError.code === "ENOENT") throw error;
+        throw targetError;
+      }
+      if (!targetInfo.isFile() || targetInfo.isSymbolicLink()) throw new Error("owned-file collision target is not a regular file");
+      await afterCollisionLstat?.();
+      try { await readLockOwner(path); }
+      catch (ownerError) {
+        if (ownerError && typeof ownerError === "object" && "code" in ownerError && ownerError.code === "ENOENT") {
+          throw Object.assign(new Error("owned-file collision target vanished during verification", { cause: ownerError }), { code: "EAGAIN" });
+        }
+        throw ownerError;
+      }
+      throw Object.assign(new Error("owned-file target already exists", { cause: error }), { code: "EEXIST" });
+    }
+    await onVisible?.();
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await rm(temporaryPath, { force: true }).catch(() => undefined);
   }
-  assertOperationPhaseTransition(current.phase, next);
-  const updated = { ...current, phase: next };
-  await writeJournal(updated);
-  return updated;
 }
 
-async function markRecoveredComplete(record: OperationJournalRecord): Promise<OperationJournalRecord> {
-  const current = await readJournal();
-  if (!current || current.id !== record.id || current.phase !== record.phase) {
-    throw new Error("operation journal changed concurrently during recovery");
-  }
-  if (current.phase === "complete") return current;
-  const updated = { ...current, phase: "complete" as const };
-  await writeJournal(updated);
-  return updated;
-}
-
-async function removeExact(path: string): Promise<void> {
-  await unlink(path).catch((error: unknown) => {
-    if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+export async function runOwnedFilePublishRaceForTest(legacyOpenTarget = false): Promise<{
+  reader_state: "valid" | "malformed" | "missing";
+  missing_reads: number;
+  valid_reads: number;
+  malformed_reads: number;
+}> {
+  if (process.env.NODE_ENV !== "test") throw new Error("owned-file publish race seam is test-only");
+  await mkdir(STORE_DIR, { recursive: true });
+  await rm(LOCK_PATH, { force: true });
+  const owner: LockOwner = { schema_version: 1, pid: process.pid, token: randomUUID() };
+  const readyPath = `${LOCK_PATH}.watcher-ready`;
+  const donePath = `${LOCK_PATH}.watcher-done`;
+  const resultPath = `${LOCK_PATH}.watcher-result`;
+  const malformedPath = `${LOCK_PATH}.watcher-malformed`;
+  const watcher = new Promise<void>((resolveWatcher, rejectWatcher) => {
+    execFile(process.execPath, ["--input-type=module", "--eval", `
+      import { readFile, writeFile } from "node:fs/promises";
+      const target = ${JSON.stringify(LOCK_PATH)};
+      const ready = ${JSON.stringify(readyPath)};
+      const done = ${JSON.stringify(donePath)};
+      const result = ${JSON.stringify(resultPath)};
+      const malformed = ${JSON.stringify(malformedPath)};
+      const counts = { missing_reads: 0, valid_reads: 0, malformed_reads: 0 };
+      await writeFile(ready, "ready", "utf8");
+      for (;;) {
+        try {
+          const value = JSON.parse(await readFile(target, "utf8"));
+          const keys = Object.keys(value).sort().join("|");
+          if (keys === "pid|schema_version|token" && value.schema_version === 1
+              && Number.isInteger(value.pid) && value.pid > 0
+              && typeof value.token === "string" && /^[0-9a-f-]{36}$/.test(value.token)) counts.valid_reads += 1;
+          else counts.malformed_reads += 1;
+        } catch (error) {
+          if (error?.code === "ENOENT") counts.missing_reads += 1;
+          else {
+            counts.malformed_reads += 1;
+            await writeFile(malformed, "observed", "utf8");
+          }
+        }
+        try { await readFile(done, "utf8"); break; }
+        catch (error) { if (error?.code !== "ENOENT") throw error; }
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      await writeFile(result, JSON.stringify(counts), "utf8");
+    `], { windowsHide: true }, (error) => error ? rejectWatcher(error) : resolveWatcher());
   });
-}
-
-async function cleanup(record: OperationJournalRecord): Promise<void> {
-  await ensureRecordDirectoriesSafe(record);
-  await removeExact(JOURNAL_PATH);
-  for (const relativePath of [...record.staged_paths, ...record.backup_paths]) {
-    await removeExact(validateRelativePath(relativePath, record.id));
+  let counts = { missing_reads: 0, valid_reads: 0, malformed_reads: 0 };
+  try {
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
+      try { await readFile(readyPath, "utf8"); break; }
+      catch (error) {
+        if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+        if (attempt === 999) throw new Error("timed out waiting for owned-file watcher");
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+      }
+    }
+    if (legacyOpenTarget) {
+      const handle = await open(LOCK_PATH, "wx", 0o600);
+      try {
+        for (let attempt = 0; attempt < 1_000; attempt += 1) {
+          try { await readFile(malformedPath, "utf8"); break; }
+          catch (error) {
+            if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+            if (attempt === 999) throw new Error("timed out waiting for legacy partial-payload observation");
+            await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+          }
+        }
+        await handle.writeFile(JSON.stringify(owner), "utf8");
+        await handle.sync();
+      } finally { await handle.close(); }
+    } else {
+      await createOwnedFile(LOCK_PATH, owner, async () => {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+      });
+    }
+    await writeFile(donePath, "done", "utf8");
+    await watcher;
+    counts = JSON.parse(await readFile(resultPath, "utf8")) as typeof counts;
+  } finally {
+    await Promise.all([LOCK_PATH, readyPath, donePath, resultPath, malformedPath].map((path) => rm(path, { force: true }).catch(() => undefined)));
   }
-  const opDir = validateRelativePath(`${operationPaths(record.id).directory}/placeholder`, record.id);
-  const directory = resolve(opDir, "..");
-  if (relative(resolve(OPERATIONS_DIR), directory).startsWith("..")) throw new Error("unsafe operation cleanup directory");
-  await rmdir(directory).catch((error: unknown) => {
-    if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
-  });
-}
-
-async function ensureRecordDirectoriesSafe(record: OperationJournalRecord): Promise<void> {
-  await ensureDirectoryIsSafe(OPERATIONS_DIR, "operations directory");
-  const placeholder = validateRelativePath(`${operationPaths(record.id).directory}/placeholder`, record.id);
-  await ensureDirectoryIsSafe(resolve(placeholder, ".."), "operation directory");
-}
-
-async function prepare(
-  operation: OperationJournalRecord["operation"],
-  snapshots: OperationSnapshots,
-): Promise<OperationJournalRecord> {
-  if (existsSync(JOURNAL_PATH)) throw new Error("another recoverable cross-store operation is pending");
-  const id = randomUUID();
-  await prepareDirectories(id);
-  const paths = operationPaths(id);
-  const record: OperationJournalRecord = {
-    schema_version: 1,
-    id,
-    operation,
-    phase: "prepared",
-    created_at: new Date().toISOString(),
-    before: {
-      json: hashJournalJsonState(snapshots.beforeJson),
-      sqlite: hashJournalSqliteState(snapshots.beforeSqlite),
-    },
-    after: {
-      json: hashJournalJsonState(snapshots.afterJson),
-      sqlite: hashJournalSqliteState(snapshots.afterSqlite),
-    },
-    staged_paths: paths.staged,
-    backup_paths: paths.backups,
+  return {
+    reader_state: counts.malformed_reads > 0 ? "malformed" : counts.valid_reads > 0 ? "valid" : "missing",
+    ...counts,
   };
-  await atomicWriteJson(validateRelativePath(record.backup_paths[0], id), snapshots.beforeJson);
-  await atomicWriteJson(validateRelativePath(record.backup_paths[1], id), snapshots.beforeSqlite);
-  await writeJournal(record);
-  return record;
 }
 
-function maybeFail(failpoint: string): void {
-  if (process.env.HERMES_TEST_OPERATION_FAILPOINT === failpoint) throw new InjectedOperationFailure(failpoint);
-}
-
-async function stageJson(record: OperationJournalRecord, snapshot: ReflectionStore): Promise<OperationJournalRecord> {
-  if (hashJournalJsonState(snapshot) !== record.after.json) throw new Error("staged JSON hash does not match journal");
-  await atomicWriteJson(validateRelativePath(record.staged_paths[0], record.id), snapshot);
-  return transition(record, "json_staged");
-}
-
-async function stageSqlite(record: OperationJournalRecord, snapshot: SessionStorageSnapshot): Promise<OperationJournalRecord> {
-  if (hashJournalSqliteState(snapshot) !== record.after.sqlite) throw new Error("staged SQLite hash does not match journal");
-  await atomicWriteJson(validateRelativePath(record.staged_paths[1], record.id), snapshot);
-  return transition(record, "sqlite_staged");
-}
-
-async function loadJsonArtifact(record: OperationJournalRecord, kind: "before" | "after"): Promise<ReflectionStore> {
-  const index = kind === "before" ? 0 : 0;
-  const relativePath = kind === "before" ? record.backup_paths[index] : record.staged_paths[index];
-  const value = await readArtifact(validateRelativePath(relativePath, record.id)) as ReflectionStore;
-  if (hashJournalJsonState(value) !== record[kind].json) throw new Error(`${kind} JSON recovery artifact hash mismatch`);
-  return value;
-}
-
-async function loadSqliteArtifact(record: OperationJournalRecord, kind: "before" | "after"): Promise<SessionStorageSnapshot> {
-  const relativePath = kind === "before" ? record.backup_paths[1] : record.staged_paths[1];
-  const value = validateSessionStorageSnapshot(await readArtifact(validateRelativePath(relativePath, record.id)));
-  if (hashJournalSqliteState(value) !== record[kind].sqlite) throw new Error(`${kind} SQLite recovery artifact hash mismatch`);
-  return value;
-}
-
-async function commitJson(snapshot: ReflectionStore): Promise<void> {
-  await withOperationJournalStoreMutation(() => replaceStoreDataSnapshot(snapshot));
-}
-
-async function commitSqlite(snapshot: SessionStorageSnapshot): Promise<void> {
-  const replaced = await withOperationJournalSessionMutation(() => replaceSessionStorageSnapshot(snapshot));
-  if (!replaced) throw new Error("SQLite session storage is unavailable during recoverable operation");
-}
-
-async function verifyHashes(record: OperationJournalRecord, kind: "before" | "after"): Promise<void> {
-  const liveJson = await exportData();
-  const liveSqlite = await snapshotSessionStorage();
-  if (!liveSqlite) throw new Error("SQLite session storage is unavailable during operation verification");
-  if (hashJournalJsonState(liveJson) !== record[kind].json) throw new Error(`${kind} JSON verification hash mismatch`);
-  if (hashJournalSqliteState(liveSqlite) !== record[kind].sqlite) throw new Error(`${kind} SQLite verification hash mismatch`);
-}
-
-async function recoverUnlocked(): Promise<void> {
-  let record = await readJournal();
-  if (!record) return;
-  await ensureRecordDirectoriesSafe(record);
-  if (record.phase === "complete") {
-    await cleanup(record);
-    return;
+export async function runOwnedFileWindowsCollisionForTest(mode: string): Promise<{
+  error_code: string;
+  error_message: string;
+  owner_verified: boolean;
+}> {
+  if (process.env.NODE_ENV !== "test") throw new Error("owned-file collision seam is test-only");
+  await mkdir(STORE_DIR, { recursive: true });
+  await rm(LOCK_PATH, { force: true });
+  const existing: LockOwner = { schema_version: 1, pid: process.pid, token: randomUUID() };
+  if (mode !== "missing-target-eperm") {
+    await writeFile(LOCK_PATH, mode === "malformed-target-eperm" ? "{" : JSON.stringify(existing), "utf8");
   }
-  if (record.phase === "prepared" || record.phase === "json_staged" || record.phase === "sqlite_staged") {
-    const beforeJson = await loadJsonArtifact(record, "before");
-    const beforeSqlite = await loadSqliteArtifact(record, "before");
-    await commitJson(beforeJson);
-    await commitSqlite(beforeSqlite);
-    await verifyHashes(record, "before");
-    record = await markRecoveredComplete(record);
-    await cleanup(record);
-    return;
-  }
-  const afterJson = await loadJsonArtifact(record, "after");
-  const afterSqlite = await loadSqliteArtifact(record, "after");
-  await commitJson(afterJson);
-  await commitSqlite(afterSqlite);
-  await verifyHashes(record, "after");
-  record = await transition(record, "complete");
-  await cleanup(record);
-}
-
-function processIsAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
+  const injectedCode = mode === "valid-target-eacces" ? "EACCES" : "EPERM";
+  let errorCode = "";
+  let errorMessage = "";
   try {
-    process.kill(pid, 0);
-    return true;
+    await createOwnedFile(LOCK_PATH, { schema_version: 1, pid: process.pid, token: randomUUID() }, undefined, async () => {
+      throw Object.assign(new Error(`injected ${injectedCode}`), { code: injectedCode });
+    }, mode === "vanishing-target-eperm" ? async () => { await rm(LOCK_PATH, { force: true }); } : undefined);
   } catch (error) {
-    return Boolean(error && typeof error === "object" && "code" in error && error.code === "EPERM");
+    errorCode = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+    errorMessage = error instanceof Error ? error.message : String(error);
   }
+  let ownerVerified = false;
+  try { ownerVerified = (await readLockOwner(LOCK_PATH)).token === existing.token; } catch (error) {
+    if (mode !== "malformed-target-eperm" && mode !== "missing-target-eperm" && mode !== "vanishing-target-eperm") throw error;
+    errorMessage = errorMessage || (error instanceof Error ? error.message : String(error));
+  } finally { await rm(LOCK_PATH, { force: true }); }
+  return { error_code: errorCode, error_message: errorMessage, owner_verified: ownerVerified };
+}
+
+async function removeOwnedFile(path: string, token: string): Promise<void> {
+  try { if ((await readLockOwner(path)).token === token) await unlink(path); }
+  catch (error) { if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error; }
+}
+
+interface ReclaimHooks {
+  afterRead?: () => Promise<void>;
+  afterGuardAcquired?: () => Promise<void>;
+  afterUnlink?: () => Promise<void>;
+}
+
+async function tryReclaimStaleLock(
+  replacement: LockOwner,
+  hooks: ReclaimHooks = {},
+): Promise<boolean> {
+  let expected: LockOwner;
+  try { expected = await readLockOwner(LOCK_PATH); }
+  catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return false;
+    if (error instanceof SyntaxError) return false;
+    throw error;
+  }
+  if (processAlive(expected.pid)) return false;
+  await hooks.afterRead?.();
+  const guard: LockOwner = { schema_version: 1, pid: process.pid, token: randomUUID() };
+  try { await createOwnedFile(RECLAIM_GUARD_PATH, guard); }
+  catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "EEXIST") {
+      await readReclaimGuard();
+      return false;
+    }
+    throw error;
+  }
+  try {
+    await hooks.afterGuardAcquired?.();
+    let current: LockOwner;
+    try { current = await readLockOwner(LOCK_PATH); }
+    catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return false;
+      throw error;
+    }
+    if (current.pid !== expected.pid || current.token !== expected.token || processAlive(current.pid)) return false;
+    await unlink(LOCK_PATH);
+    await hooks.afterUnlink?.();
+    await createOwnedFile(LOCK_PATH, replacement);
+    return true;
+  } finally {
+    await removeOwnedFile(RECLAIM_GUARD_PATH, guard.token);
+  }
+}
+
+export async function runStaleLockAbaRaceForTest(): Promise<{
+  c_entered_during_reclaim: boolean;
+  a_token_always_in_main: boolean;
+  b_reclaimed_a: boolean;
+}> {
+  if (process.env.NODE_ENV !== "test") throw new Error("stale lock race seam is test-only");
+  await mkdir(STORE_DIR, { recursive: true });
+  const stale: LockOwner = { schema_version: 1, pid: 2_147_483_647, token: randomUUID() };
+  await writeFile(LOCK_PATH, JSON.stringify(stale), { encoding: "utf8", flag: "wx" });
+  let arrivals = 0;
+  let bothReadResolve!: () => void;
+  const bothRead = new Promise<void>((resolvePromise) => { bothReadResolve = resolvePromise; });
+  let releaseBResolve!: () => void;
+  const releaseB = new Promise<void>((resolvePromise) => { releaseBResolve = resolvePromise; });
+  let cEntered = false;
+  let aTokenAlwaysInMain = true;
+  const aOwner: LockOwner = { schema_version: 1, pid: process.pid, token: randomUUID() };
+  const afterReadA = async () => { arrivals += 1; if (arrivals === 2) bothReadResolve(); await bothRead; };
+  const afterReadB = async () => { arrivals += 1; if (arrivals === 2) bothReadResolve(); await bothRead; await releaseB; };
+  const a = tryReclaimStaleLock(aOwner, { afterRead: afterReadA, afterUnlink: async () => {
+    const cOwner: LockOwner = { schema_version: 1, pid: process.pid, token: randomUUID() };
+    cEntered = await tryAcquireMainOnce(cOwner);
+    if (cEntered) await removeOwnedFile(LOCK_PATH, cOwner.token);
+  } });
+  const bOwner: LockOwner = { schema_version: 1, pid: process.pid, token: randomUUID() };
+  const b = tryReclaimStaleLock(bOwner, { afterRead: afterReadB, afterGuardAcquired: async () => {
+    aTokenAlwaysInMain = aTokenAlwaysInMain && (await readLockOwner(LOCK_PATH)).token === aOwner.token;
+  } });
+  await a;
+  releaseBResolve();
+  const bReclaimed = await b;
+  try {
+    aTokenAlwaysInMain = aTokenAlwaysInMain && (await readLockOwner(LOCK_PATH)).token === aOwner.token;
+  } finally { await rm(LOCK_PATH, { force: true }); }
+  return { c_entered_during_reclaim: cEntered, a_token_always_in_main: aTokenAlwaysInMain, b_reclaimed_a: bReclaimed };
+}
+
+async function tryAcquireMainOnce(owner: LockOwner): Promise<boolean> {
+  if (await readReclaimGuard()) return false;
+  try { await createOwnedFile(LOCK_PATH, owner); }
+  catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "EAGAIN") return false;
+    if (error && typeof error === "object" && "code" in error && error.code === "EEXIST") {
+      try { await readLockOwner(LOCK_PATH); }
+      catch (readError) {
+        await classifyLockReadFailure(readError);
+        return false;
+      }
+      return false;
+    }
+    if (error && typeof error === "object" && "code" in error
+      && (error.code === "EPERM" || error.code === "EBUSY")) {
+      await classifyLockReadFailure(error);
+      return false;
+    }
+    throw error;
+  }
+  if (await readReclaimGuard()) {
+    await removeOwnedFile(LOCK_PATH, owner.token);
+    return false;
+  }
+  return true;
+}
+
+type LockReadFailureDisposition = "missing" | "contention";
+type LockTargetInfo = { isFile(): boolean; isSymbolicLink(): boolean };
+
+async function classifyLockReadFailure(
+  error: unknown,
+  statTarget: () => Promise<LockTargetInfo> = () => lstat(LOCK_PATH),
+  platform: NodeJS.Platform = process.platform,
+): Promise<LockReadFailureDisposition> {
+  if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return "missing";
+  if (!(error && typeof error === "object" && "code" in error
+    && (error.code === "EPERM" || error.code === "EBUSY") && platform === "win32")) throw error;
+  let target: LockTargetInfo;
+  try { target = await statTarget(); }
+  catch (targetError) {
+    if (targetError && typeof targetError === "object" && "code" in targetError && targetError.code === "ENOENT") return "missing";
+    throw targetError;
+  }
+  if (!target.isFile() || target.isSymbolicLink()) throw new Error("operation lock target is not a regular file", { cause: error });
+  return "contention";
 }
 
 async function acquireLock(): Promise<() => Promise<void>> {
-  await mkdir(STORE_DIR, { recursive: true, mode: 0o700 });
-  const token = randomUUID();
-  for (let attempt = 0; attempt < 400; attempt += 1) {
-    try {
-      const handle = await open(LOCK_PATH, "wx", 0o600);
-      try {
-        await handle.writeFile(JSON.stringify({ schema_version: 1, pid: process.pid, token }), "utf8");
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-      return async () => {
-        try {
-          const current = JSON.parse(await readFile(LOCK_PATH, "utf8")) as { token?: unknown };
-          if (current.token === token) await unlink(LOCK_PATH);
-        } catch (error) {
-          if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
-        }
-      };
-    } catch (error) {
-      if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
-      let staleToken: string | undefined;
-      try {
-        const owner = JSON.parse(await readFile(LOCK_PATH, "utf8")) as Record<string, unknown>;
-        exactKeys(owner, ["schema_version", "pid", "token"], "operation lock");
-        if (owner.schema_version !== 1 || typeof owner.token !== "string" || typeof owner.pid !== "number") {
-          throw new Error("operation lock is malformed");
-        }
-        if (!processIsAlive(owner.pid)) staleToken = owner.token;
-      } catch (readError) {
-        if (readError && typeof readError === "object" && "code" in readError && readError.code === "ENOENT") continue;
-        throw new Error("operation lock is invalid; refusing to remove an unknown owner", { cause: readError });
-      }
-      if (staleToken) {
-        const current = JSON.parse(await readFile(LOCK_PATH, "utf8")) as { token?: unknown };
-        if (current.token === staleToken) await unlink(LOCK_PATH);
-        continue;
-      }
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
-    }
-  }
-  throw new Error("timed out waiting for the recoverable operation lock");
-}
-
-async function withLock<T>(callback: () => Promise<T>): Promise<T> {
-  const release = await acquireLock();
   try {
-    return await callback();
-  } finally {
-    await release();
+    await mkdir(STORE_DIR, { recursive: true, mode: 0o700 });
+  } catch (error) {
+    if (isStoreDirectoryObstruction(error)) throw new OperationJournalStoreUnavailableError(error);
+    throw error;
   }
-}
-
-export async function recoverPendingOperation(): Promise<void> {
-  await withLock(recoverUnlocked);
-}
-
-async function execute(
-  operation: OperationJournalRecord["operation"],
-  prepareJson: () => Promise<{ beforeJson: ReflectionStore; afterJson: ReflectionStore }>,
-): Promise<ReflectionStore> {
-  return withLock(async () => {
-    await recoverUnlocked();
-    const { beforeJson, afterJson } = await withStoreSnapshotBarrier(prepareJson);
-    const beforeSqlite = await snapshotSessionStorageAfterWriteBarrier();
-    if (!beforeSqlite) throw new Error("SQLite session storage is unavailable; no operation journal was created");
-    const afterSqlite = emptySessionStorageSnapshot();
-    let record = await prepare(operation, { beforeJson, afterJson, beforeSqlite, afterSqlite });
+  const owner: LockOwner = { schema_version: 1, pid: process.pid, token: randomUUID() };
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    if (await tryAcquireMainOnce(owner)) return async () => removeOwnedFile(LOCK_PATH, owner.token);
     try {
-      maybeFail("after_prepare");
-      record = await stageJson(record, afterJson);
-      maybeFail("after_json_stage");
-      record = await stageSqlite(record, afterSqlite);
-      maybeFail("after_sqlite_stage");
-      record = await transition(record, "committing");
-      await commitJson(afterJson);
-      maybeFail("after_json_commit");
-      await commitSqlite(afterSqlite);
-      maybeFail("after_sqlite_commit");
-      await verifyHashes(record, "after");
-      record = await transition(record, "complete");
-      await cleanup(record);
-      return afterJson;
-    } catch (error) {
-      if (error instanceof InjectedOperationFailure) throw error;
-      try {
-        await recoverUnlocked();
-      } catch (recoveryError) {
-        throw new AggregateError([error, recoveryError], "cross-store operation failed and immediate recovery did not complete");
-      }
-      throw error;
+      const current = await readLockOwner(LOCK_PATH);
+      if (!processAlive(current.pid) && await tryReclaimStaleLock(owner)) return async () => removeOwnedFile(LOCK_PATH, owner.token);
+    } catch (readError) {
+      if (await classifyLockReadFailure(readError) === "missing") continue;
     }
-  });
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+  }
+  throw new Error("timed out waiting for operation journal lock");
 }
 
-export async function executeJournaledClear(collection: Extract<ClearCollection, "sessions" | "all">): Promise<void> {
-  await execute("clear", async () => {
-    const beforeJson = await exportData();
-    const afterJson = await previewClearData(collection, beforeJson);
-    return { beforeJson, afterJson };
-  });
-}
-
-export async function executeJournaledReplaceImport(
-  incoming: Partial<ReflectionStore>,
-): Promise<{ reflections: number; heuristics: number; affordance_gaps: number; sessions: number }> {
-  const committed = await execute("replace_import", async () => {
-    const beforeJson = await exportData();
-    const afterJson = await previewReplaceImportData(incoming, beforeJson);
-    return { beforeJson, afterJson };
-  });
+export async function runLockReadEpermRetryForTest(mode: string): Promise<{
+  owner_read: boolean;
+  read_attempts: number;
+  waits: number;
+  error_code: string;
+  error_message: string;
+  store_unavailable: boolean;
+}> {
+  if (process.env.NODE_ENV !== "test") throw new Error("lock read EPERM retry seam is test-only");
+  let readAttempts = 0;
+  let waits = 0;
+  let ownerRead = false;
+  let caught: unknown;
+  const contentionCode = mode.endsWith("-ebusy") ? "EBUSY" : "EPERM";
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      readAttempts += 1;
+      if (mode.startsWith("transient") && readAttempts >= 3) { ownerRead = true; break; }
+      if (mode === "missing" && readAttempts >= 2) { ownerRead = true; break; }
+      if (mode === "malformed") throw new SyntaxError("injected malformed lock owner");
+      if (mode === "eacces") throw Object.assign(new Error("injected EACCES"), { code: "EACCES" });
+      if (mode === "unexpected") throw Object.assign(new Error("injected EIO"), { code: "EIO" });
+      throw Object.assign(new Error(`injected ${contentionCode}`), { code: contentionCode });
+    } catch (error) {
+      try {
+        const disposition = await classifyLockReadFailure(error, async () => {
+          if (mode === "missing") throw Object.assign(new Error("injected ENOENT"), { code: "ENOENT" });
+          return {
+            isFile: () => mode !== "nonregular",
+            isSymbolicLink: () => mode === "symlink",
+          };
+        }, "win32");
+        if (disposition === "missing") continue;
+      } catch (failure) { caught = failure; break; }
+    }
+    waits += 1;
+  }
+  if (!ownerRead && caught === undefined) caught = new Error("timed out waiting for operation journal lock");
   return {
-    reflections: committed.reflections.length,
-    heuristics: committed.heuristics.length,
-    affordance_gaps: committed.affordance_gaps.length,
-    sessions: Object.keys(committed.sessions).length,
+    owner_read: ownerRead,
+    read_attempts: readAttempts,
+    waits,
+    error_code: caught && typeof caught === "object" && "code" in caught ? String(caught.code) : "",
+    error_message: caught instanceof Error ? caught.message : caught === undefined ? "" : String(caught),
+    store_unavailable: caught instanceof OperationJournalStoreUnavailableError,
   };
+}
+
+let lastRecoveredReceipt: OperationResultReceipt | null = null;
+// Process-local authority epoch: advances after every verified journal commit,
+// whether reached normally or by recovery, so readers can invalidate hot caches.
+let recoveryGeneration = 0;
+async function recoverUnlocked(): Promise<void> {
+  const found = await readJournal(); if (!found) return;
+  if (found.version === 1) { await recoverV1(found.record); return; }
+  lastRecoveredReceipt = await recoverV2(found.record);
+}
+
+export async function withOperationJournalBarrier<T>(callback: () => Promise<T>, _options: { allowLegacyJournal?: boolean } = {}): Promise<T> {
+  if (coordinatorContext.getStore() === true) return callback();
+  const release = await acquireLock();
+  try { return await coordinatorContext.run(true, async () => { assertConfiguredOperationFailpoint(); await recoverUnlocked(); return callback(); }); }
+  finally { await release(); }
+}
+
+export async function recoverPendingOperation(): Promise<void> { await withOperationJournalBarrier(async () => undefined); }
+export function consumeRecoveredResultReceipt(): OperationResultReceipt | null {
+  return lastRecoveredReceipt ? structuredClone(lastRecoveredReceipt) : null;
+}
+export function operationRecoveryGeneration(): number { return recoveryGeneration; }
+
+export function reserveOperationTransaction(): OperationTransactionReservation {
+  return { transaction_id: randomUUID(), result_id: randomUUID(), created_at: new Date().toISOString() };
+}
+
+export async function commitResourceTransaction(
+  operation: string,
+  resources: OperationResourceInput[],
+  resultReceipt: OperationReceiptInput,
+  reservation: OperationTransactionReservation = reserveOperationTransaction(),
+): Promise<OperationResultReceipt> {
+  if (coordinatorContext.getStore() !== true) throw new Error("resource transaction requires operation journal barrier");
+  assertConfiguredOperationFailpoint();
+  durabilityTrace = [];
+  if (await readJournal()) throw new Error("another recoverable operation is pending");
+  if (!/^[a-z][a-z0-9_]{0,63}$/.test(operation)) throw new Error("invalid operation name");
+  if (!UUID_RE.test(reservation.transaction_id) || !UUID_RE.test(reservation.result_id)
+      || new Date(reservation.created_at).toISOString() !== reservation.created_at) {
+    throw new Error("operation transaction reservation is invalid");
+  }
+  const transactionId = reservation.transaction_id; const directory = join(OPERATIONS_DIR, transactionId);
+  const reflectionIds = [...new Set(resultReceipt.reflection_ids ?? [])];
+  if (reflectionIds.length > 256 || reflectionIds.some((id) => !id || id.length > 100) || !SHA_RE.test(resultReceipt.result_hash)) {
+    throw new Error("operation result receipt input is invalid");
+  }
+  const receipt: OperationResultReceipt = {
+    transaction_id: transactionId,
+    result_id: reservation.result_id,
+    operation,
+    reflection_ids: reflectionIds,
+    result_hash: resultReceipt.result_hash,
+  };
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const records: OperationResourceRecord[] = [];
+  let journal: OperationJournalV2;
+  try {
+    for (const [index, input] of resources.entries()) {
+      if (records.some((item) => item.name === input.name)) throw new Error("duplicate transaction resource");
+      const stagedPath = `operations/${transactionId}/after-${index}.bin`;
+      const record: OperationResourceRecord = {
+        name: input.name, target_path: targetPathFor(input.name), before_sha256: await resourceHash(input.name),
+        after_sha256: await resourceHash(input.name, input.after), staged_after_path: stagedPath,
+      };
+      await durableStage(safeOperationPath(stagedPath, transactionId), input.after, input.name);
+      records.push(record);
+    }
+    traceDurability("stage_files_fsynced");
+    await syncDirectory(directory);
+    traceDurability("transaction_directory_fsynced");
+    await syncDirectory(OPERATIONS_DIR);
+    traceDurability("operations_directory_fsynced");
+    journal = decodeOperationJournalV2({
+      schema_version: 2, transaction_id: transactionId, operation, phase: "prepared", created_at: reservation.created_at,
+      resources: records, result_receipt: receipt,
+    });
+    await writeJournal(journal, "prepare");
+  } catch (error) {
+    let published = false;
+    try {
+      const found = await readJournal();
+      published = found?.version === 2 && found.record.transaction_id === transactionId;
+    } catch { published = true; }
+    if (!published) await rm(directory, { recursive: true, force: true });
+    throw error;
+  }
+  journal = { ...journal, phase: "committing" }; await writeJournal(journal, "committing");
+  for (const resource of journal.resources) {
+    const staged = await readStaged(resource, true);
+    failpoint(`before_replace:${resource.name}`); await replaceResource(resource, staged!); failpoint(`after_replace:${resource.name}`);
+    failpoint(`before_verify:${resource.name}`);
+    if (await resourceHash(resource.name) !== resource.after_sha256) throw new Error(`verification failed for ${resource.name}`);
+    failpoint(`after_verify:${resource.name}`);
+  }
+  journal = { ...journal, phase: "committed" }; await writeJournal(journal, "commit_marker");
+  recoveryGeneration += 1;
+  await cleanupV2(journal, false);
+  return journal.result_receipt;
+}
+
+export async function executeJournaledClear(collection: "sessions" | "all"): Promise<void> {
+  await withOperationJournalBarrier(async () => {
+    const storage = await import("../storage.js"); const session = await import("../session_storage.js");
+    const reflection = await import("./reflection_transaction.js");
+    const before = await storage.exportData(); const afterJson = await storage.previewClearData(collection, before);
+    const beforeSqlite = await session.snapshotSessionStorageAfterWriteBarrier();
+    if (!beforeSqlite) throw new Error("session storage unavailable; no transaction created");
+    const afterSqlite = session.emptySessionStorageSnapshot();
+    const serialized = reflection.serializeReflectionResources(afterJson);
+    await commitResourceTransaction("clear", [
+      { name: "reflections", after: serialized.reflections },
+      { name: "store_index", after: serialized.store_index },
+      { name: "resolved_questions", after: serialized.resolved_questions },
+      { name: "session_storage", after: `${JSON.stringify(afterSqlite)}\n` },
+    ], { reflection_ids: [], result_hash: operationResultHash(null) });
+  });
+}
+
+export async function executeJournaledReplaceImport(incoming: Partial<ReflectionStore>): Promise<{ reflections: number; heuristics: number; affordance_gaps: number; sessions: number }> {
+  return withOperationJournalBarrier(async () => {
+    const storage = await import("../storage.js"); const session = await import("../session_storage.js");
+    const reflection = await import("./reflection_transaction.js");
+    const before = await storage.exportData(); const afterJson = await storage.previewReplaceImportData(incoming, before);
+    const beforeSqlite = await session.snapshotSessionStorageAfterWriteBarrier();
+    if (!beforeSqlite) throw new Error("session storage unavailable; no transaction created");
+    const afterSqlite = session.emptySessionStorageSnapshot();
+    const result = { reflections: afterJson.reflections.length, heuristics: afterJson.heuristics.length, affordance_gaps: afterJson.affordance_gaps.length, sessions: Object.keys(afterJson.sessions).length };
+    const serialized = reflection.serializeReflectionResources(afterJson);
+    const receipt = await commitResourceTransaction("replace_import", [
+      { name: "reflections", after: serialized.reflections },
+      { name: "store_index", after: serialized.store_index },
+      { name: "resolved_questions", after: serialized.resolved_questions },
+      { name: "session_storage", after: `${JSON.stringify(afterSqlite)}\n` },
+    ], { reflection_ids: afterJson.reflections.slice(0, 256).map((item) => item.id), result_hash: operationResultHash(result) });
+    void receipt;
+    return result;
+  });
 }

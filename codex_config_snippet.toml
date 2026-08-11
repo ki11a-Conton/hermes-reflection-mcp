@@ -1,4 +1,4 @@
-# Hermes Reflection MCP v20.0.0 — Agent-first Codex Desktop profile.
+# Hermes Reflection MCP v21.0.0 — exact ordered 10-tool Agent-first Codex Desktop profile.
 # Replace <YOU>. Keep provider credentials outside committed configuration.
 
 [mcp_servers.hermes-reflection]
@@ -11,11 +11,19 @@ tool_timeout_sec = 300
 enabled_tools = ["retrieve_heuristics", "reflect_on_task", "search_reflections", "get_open_questions", "get_memory_item", "compact_session_context", "memory_board_read", "memory_board_write", "session_lifecycle_hook", "trigger_background_review"]
 instructions = "Use Hermes as reference memory: retrieve before substantial work and reflect afterward. Never store secrets."
 
-# Optional background lifecycle. Automatic persistence stays off.
+# Optional background lifecycle and automatic LLM review selection.
+# Hook polling is verified at <=5s and defaults to <=1s; this is not an end-to-end latency claim.
+# Automatic persistence remains a separate opt-in and stays off here.
 [mcp_servers.hermes-reflection.env]
 HERMES_REFLECTION_BACKGROUND_ENABLED = "true"
 HERMES_REFLECTION_BACKGROUND_REVIEW_MODE = "auto"
 HERMES_REFLECTION_BACKGROUND_AUTO_APPLY = "false"
+
+# Optional dedicated LLM provider values belong in the MCP process environment:
+# HERMES_REFLECTION_LLM_ENABLED = "true"
+# HERMES_REFLECTION_LLM_BASE_URL = "https://provider.example/v1"
+# HERMES_REFLECTION_LLM_MODEL = "your-model"
+# HERMES_REFLECTION_LLM_API_KEY = "<dedicated-provider-key>"
 
 # Extended compatibility surface (all 29 tools):
 # reflect_on_task, search_reflections, list_reflections, retrieve_heuristics,

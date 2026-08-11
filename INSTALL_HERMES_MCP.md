@@ -1,4 +1,4 @@
-# Installing Hermes Reflection MCP v20.0.0
+# Installing Hermes Reflection MCP v21.0.0
 
 This guide installs the local stdio MCP with the Agent-first 10-tool Codex profile. Node.js 20 or newer is required.
 
@@ -13,7 +13,7 @@ This guide installs the local stdio MCP with the Agent-first 10-tool Codex profi
 npm ci --omit=dev
 ```
 
-The release contains `dist/`; production installation does not need TypeScript. Never reuse `node_modules` from another OS, Node version, computer, or older installation.
+The release contains `dist/`; production installation does not need TypeScript. Never reuse `node_modules` from another OS, Node version, computer, or older installation. v21 keeps the exact ordered 10-tool default profile and exact 29-tool compatibility surface.
 
 Suggested install directories:
 
@@ -50,6 +50,8 @@ HERMES_REFLECTION_BACKGROUND_REVIEW_MODE = "auto"
 HERMES_REFLECTION_BACKGROUND_AUTO_APPLY = "false"
 ```
 
+The hook pump has a verified polling contract of at most 5 seconds and defaults to at most 1 second. This is not a throughput or end-to-end latency claim. LLM review, background lifecycle, and automatic persistence are independent opt-ins.
+
 For automatic LLM review, inject a dedicated provider key through the MCP process environment and also set:
 
 ```text
@@ -69,7 +71,7 @@ Configure the client to pass JSON hook events to:
 node <install-dir>/dist/src/codex_hook_cli.js
 ```
 
-Supported events are `SessionStart`, `Stop`, `SessionEnd`, `PreCompact`, and `PostCompact`. The hook writes a bounded durable inbox and exits promptly. The MCP process consumes those events; the hook does not control Codex execution state. Direct integrations may call `session_lifecycle_hook` instead.
+Supported events are `SessionStart`, `Stop`, `SessionEnd`, `PreCompact`, and `PostCompact`. `PostCompact` requires bounded metadata and produces a durable hashed receipt that survives restart; identical replay is idempotent and a conflicting same-generation receipt fails closed. The hook writes a bounded durable inbox and exits promptly. The MCP process consumes those events; the hook does not control Codex execution state. Direct integrations may call `session_lifecycle_hook` instead.
 
 ## Validation
 
@@ -88,11 +90,12 @@ npm run test:v19.5
 npm run test:v20
 npm run test:concurrency
 npm run test:v20:agent-fixture
+npm run test:v21
 npm pack --dry-run --json
 npm audit --omit=dev
 ```
 
-Expected v20 gates:
+Expected v21 gates:
 
 - exactly 29 complete public tools;
 - exact 10-tool core profile;
@@ -116,14 +119,14 @@ User state remains outside the code directory at `~/.hermes-reflection`. Default
 
 Use `HERMES_TRANSFER_IMPORT_ROOTS` and `HERMES_TRANSFER_EXPORT_ROOTS` only for explicit additional allow-listed roots. Safe export is redacted by default; raw export requires explicit sensitive confirmation.
 
-v20 migrates supported older stores to schema 2 under a lock. It fails closed on future or corrupt authoritative state and preserves evidence. Replace import and clear operations journal JSON plus logical SQLite state so startup can roll back a pre-commit interruption or complete an interrupted commit.
+v21 migrates supported older stores to schema 2 under a lock. It fails closed on future or corrupt authoritative state and preserves evidence. Scope provenance errors fail closed without mutation. Replace import, clear, reflection, heuristic, feedback, and approval operations journal authoritative state so startup can roll back a pre-commit interruption or complete an interrupted commit from its durable receipt without replaying the mutation. LLM candidates are revalidated against exact scope and current evidence under the authoritative lock before persistence.
 
 ## Upgrade and rollback
 
 1. Stop Codex Desktop and any standalone MCP process.
 2. Back up the current installed code directory to a dated sibling path.
 3. Back up `~/.hermes-reflection` separately; never put it into the release directory.
-4. Install the v20 release into a clean staging directory and run validation.
+4. Install the v21 release into a clean staging directory and run validation.
 5. Switch the stable install path or Codex configuration only after validation passes.
 6. Start a fresh Codex Desktop process and confirm the 10-tool surface.
 

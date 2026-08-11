@@ -5,9 +5,9 @@
 import { appendFile, copyFile, rename, writeFile, mkdir, rm, stat } from "fs/promises";
 import { existsSync } from "fs";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash, randomUUID } from "crypto";
+import { createHash, randomUUID, timingSafeEqual } from "crypto";
 import { homedir } from "os";
-import { join } from "path";
+import { isAbsolute, join, relative, resolve } from "path";
 import type {
   ReflectionStore,
   ReflectionFrame,
@@ -27,6 +27,7 @@ import type {
   HeuristicFeedback,
   HeuristicFeedbackInput,
   ReviewCandidate,
+  CommittedReceipt,
 } from "./types.js";
 
 import { 
@@ -44,6 +45,16 @@ import {
   readAuthoritativeJson,
   readAuthoritativeUtf8,
 } from "./src/authoritative_state.js";
+import {
+  commitResourceTransaction,
+  operationResultHash,
+  operationRecoveryGeneration,
+  recoverPendingOperation,
+  reserveOperationTransaction,
+  type OperationTransactionReservation,
+  withOperationJournalBarrier,
+} from "./src/operation_journal.js";
+import { serializeReflectionResources } from "./src/reflection_transaction.js";
 
 const WINDOWS_RENAME_RETRIES = 5;
 const REVIEW_CANDIDATE_LESSON_MAX = 1_000;
@@ -51,19 +62,17 @@ const REVIEW_CANDIDATE_TAGS_MAX = 100;
 const REVIEW_CANDIDATE_SOURCE_IDS_MAX = 50;
 const REVIEW_CANDIDATE_PENDING_PER_SCOPE_MAX = 100;
 const REVIEW_CANDIDATE_TERMINAL_PER_SCOPE_MAX = 20;
+const COMMITTED_RECEIPT_MAX = 2_048;
+const COMMITTED_RECEIPT_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const SHA256_RE = /^[a-f0-9]{64}$/;
 
 export const STORE_DIR = join(homedir(), ".hermes-reflection");
 const STORE_PATH = join(STORE_DIR, "store.json");
 const REFLECTIONS_PATH = join(STORE_DIR, "reflections.jsonl");
 const RESOLVED_QUESTIONS_PATH = join(STORE_DIR, "resolved_questions.json");
-const OPERATION_JOURNAL_PATH = join(STORE_DIR, "operation_journal.json");
-const OPERATION_JOURNAL_LOCK_PATH = join(STORE_DIR, "operation_journal.lock");
 const operationJournalMutationContext = new AsyncLocalStorage<boolean>();
-
-function crossStoreOperationActive(): boolean {
-  return existsSync(OPERATION_JOURNAL_PATH) || existsSync(OPERATION_JOURNAL_LOCK_PATH);
-}
-export const VERSION = "20.0.0";
+export const VERSION = "21.0.0";
 export const HEURISTIC_DEDUP_THRESHOLD = 0.75;
 const WORLD_FACT_DEDUP_THRESHOLD = 0.65;
 export const HEURISTIC_MAX_COUNT = 500;
@@ -145,6 +154,9 @@ let mutationQueue: Promise<void> = Promise.resolve();
 let resolvedQuestionsMutationQueue: Promise<void> = Promise.resolve();
 
 interface FileFingerprint {
+  exists: boolean;
+  dev: number;
+  ino: number;
   size: number;
   mtimeMs: number;
   ctimeMs: number;
@@ -170,7 +182,22 @@ interface StoreCache {
 let storeCache: StoreCache | null = null;
 let _mutationStore: ReflectionStore | null = null;
 let _storeIndexDirty = false;
-const CACHE_TTL_MS = 500;
+let seenReflectionRecoveryGeneration = 0;
+
+async function runReflectionRecoveryBarrier(): Promise<void> {
+  const generation = operationRecoveryGeneration();
+  if (generation !== seenReflectionRecoveryGeneration) {
+    seenReflectionRecoveryGeneration = generation;
+    invalidateStoreCache();
+  }
+}
+
+async function withReflectionAuthorityRead<T>(callback: () => Promise<T>): Promise<T> {
+  return withOperationJournalBarrier(async () => {
+    await runReflectionRecoveryBarrier();
+    return callback();
+  });
+}
 
 interface ResolvedQuestionsCache {
   index: ResolvedQuestionIndex;
@@ -179,7 +206,6 @@ interface ResolvedQuestionsCache {
 }
 
 let _resolvedQuestionsCache: ResolvedQuestionsCache | null = null;
-const RESOLVED_QUESTIONS_CACHE_TTL_MS = 500;
 const PENDING_CLAIM_STALE_MS = 5 * 60_000;
 
 function isPendingClaimStale(mutation: PendingMutation): boolean {
@@ -402,12 +428,8 @@ async function refreshStoreCacheAfterMutation(
   return buildStoreCache(store, storeFingerprint, await fileFingerprint(REFLECTIONS_PATH), loadedAt);
 }
 
-async function getCachedStoreEntry(): Promise<StoreCache> {
+async function getCachedStoreEntryUnderBarrier(): Promise<StoreCache> {
   const now = Date.now();
-  if (storeCache && now - storeCache.loadedAt < CACHE_TTL_MS) {
-    return storeCache;
-  }
-
   if (storeCache) {
     try {
       const storeFingerprint = await fileFingerprint(STORE_PATH);
@@ -424,13 +446,17 @@ async function getCachedStoreEntry(): Promise<StoreCache> {
     }
   }
 
-  const store = await loadStore();
+  const store = await loadStoreUnderBarrier();
   storeCache = buildStoreCache(
     store,
     await fileFingerprint(STORE_PATH),
     await fileFingerprint(REFLECTIONS_PATH),
   );
   return storeCache;
+}
+
+async function getCachedStoreEntry(): Promise<StoreCache> {
+  return withReflectionAuthorityRead(getCachedStoreEntryUnderBarrier);
 }
 
 async function getCachedStore(): Promise<ReflectionStore> {
@@ -443,13 +469,8 @@ function invalidateStoreCache(): void {
   invalidateResolvedQuestionsCache();
 }
 
-async function getCachedResolvedQuestions(): Promise<ResolvedQuestionIndex> {
+async function getCachedResolvedQuestionsUnderBarrier(): Promise<ResolvedQuestionIndex> {
   const now = Date.now();
-  // Within TTL window: return cache directly, no file stat
-  if (_resolvedQuestionsCache && now - _resolvedQuestionsCache.loadedAt < RESOLVED_QUESTIONS_CACHE_TTL_MS) {
-    return _resolvedQuestionsCache.index;
-  }
-  // TTL expired but cache exists: stat once to check freshness
   if (_resolvedQuestionsCache) {
     try {
       const currentFingerprint = await fileFingerprint(RESOLVED_QUESTIONS_PATH);
@@ -460,13 +481,23 @@ async function getCachedResolvedQuestions(): Promise<ResolvedQuestionIndex> {
     } catch { /* stat failed or file missing, fall through to reload */ }
   }
   // No cache or size changed or stat failed: full reload
-  const index = await loadResolvedQuestions();
+  const index = await loadResolvedQuestionsUnderBarrier();
   _resolvedQuestionsCache = {
     index,
     loadedAt: Date.now(),
     fingerprint: await fileFingerprint(RESOLVED_QUESTIONS_PATH),
   };
   return index;
+}
+
+async function getCachedStoreAndResolvedQuestions(): Promise<{
+  cache: StoreCache;
+  resolvedIndex: ResolvedQuestionIndex;
+}> {
+  return withReflectionAuthorityRead(async () => ({
+    cache: await getCachedStoreEntryUnderBarrier(),
+    resolvedIndex: await getCachedResolvedQuestionsUnderBarrier(),
+  }));
 }
 
 function invalidateResolvedQuestionsCache(): void {
@@ -609,7 +640,7 @@ async function rejectInvalidStore(raw: string, reason: string): Promise<never> {
 
 export async function initializeStoreV20(): Promise<void> {
   await ensureStoreDir();
-  await withFileLock(STORE_PATH, async () => {
+  await withOperationJournalBarrier(() => withFileLock(STORE_PATH, async () => {
     const loaded = await readAuthoritativeJson<unknown>(STORE_PATH, "Hermes Reflection main store");
     if (!loaded.exists) return;
     let raw: Record<string, unknown>;
@@ -706,10 +737,47 @@ export async function initializeStoreV20(): Promise<void> {
       await rm(storeTemp, { force: true }).catch(() => undefined);
       await rm(reflectionsTemp, { force: true }).catch(() => undefined);
     }
-  });
+  }), { allowLegacyJournal: true });
 }
 
-export async function loadStore(): Promise<ReflectionStore> {
+async function runAuthorityReadHookForTest(
+  point: "after_store_index_read" | "before_mutation_result_finalize",
+): Promise<void> {
+  const configured = process.env.HERMES_TEST_AUTHORITY_READ_HOOK_DIR;
+  if (process.env.NODE_ENV !== "test" || !configured) return;
+  const configuredPoint = process.env.HERMES_TEST_AUTHORITY_READ_HOOK_POINT;
+  const allowedPoints = new Set(["after_store_index_read", "before_mutation_result_finalize"]);
+  if (!configuredPoint || !allowedPoints.has(configuredPoint)) {
+    throw new Error("authority-read test hook point is missing or invalid");
+  }
+  if (configuredPoint !== point) return;
+  const storeRoot = resolve(STORE_DIR);
+  const hookDir = resolve(configured);
+  const relativeHookDir = relative(storeRoot, hookDir);
+  if (!relativeHookDir || relativeHookDir.startsWith("..") || isAbsolute(relativeHookDir)) {
+    throw new Error("authority-read test hook directory must be a strict descendant of STORE_DIR");
+  }
+  await mkdir(hookDir, { recursive: true });
+  const readyMarker = join(hookDir, `${point}.ready`);
+  const continueMarker = join(hookDir, `${point}.continue`);
+  await writeFile(readyMarker, "ready\n", { encoding: "utf8", mode: 0o600 });
+  const deadline = Date.now() + 5_000;
+  try {
+    while (Date.now() < deadline) {
+      try { await stat(continueMarker); return; }
+      catch (error) {
+        if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+      }
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+    }
+    throw new Error(`authority-read test hook timed out at ${point}`);
+  } finally {
+    await rm(readyMarker, { force: true }).catch(() => undefined);
+    await rm(continueMarker, { force: true }).catch(() => undefined);
+  }
+}
+
+async function loadStoreUnderBarrier(): Promise<ReflectionStore> {
   await ensureStoreDir();
   const loaded = await readAuthoritativeJson<unknown>(STORE_PATH, "Hermes Reflection main store");
   if (!loaded.exists) {
@@ -719,6 +787,7 @@ export async function loadStore(): Promise<ReflectionStore> {
     return store;
   }
   const parsed = requireRecord(loaded.value, "store.json") as Partial<ReflectionStore>;
+  await runAuthorityReadHookForTest("after_store_index_read");
   const metadata = recordValue(parsed.metadata);
   if (metadata.store_schema_version !== 2) {
     // Validate JSONL first so an existing corrupt sidecar remains the primary
@@ -751,6 +820,10 @@ export async function loadStore(): Promise<ReflectionStore> {
   };
   reconcileSessionCounters(store, false);
   return store;
+}
+
+export async function loadStore(): Promise<ReflectionStore> {
+  return withReflectionAuthorityRead(loadStoreUnderBarrier);
 }
 
 function emptyStore(): ReflectionStore {
@@ -1069,6 +1142,9 @@ function normalizeReviewCandidate(value: unknown, fallbackTimestamp: string): Re
   const fingerprint = typeof input.source_fingerprint === "string" && /^[a-f0-9]{64}$/i.test(input.source_fingerprint)
     ? input.source_fingerprint.toLowerCase()
     : undefined;
+  const evidenceFingerprint = typeof input.evidence_fingerprint === "string" && /^[a-f0-9]{64}$/i.test(input.evidence_fingerprint)
+    ? input.evidence_fingerprint.toLowerCase()
+    : "0".repeat(64);
   const heuristic = typeof input.heuristic === "string" ? input.heuristic.trim() : "";
   const domain = typeof input.domain === "string" ? input.domain.trim() : "";
   const state = input.state === "pending" || input.state === "applied" || input.state === "rejected"
@@ -1080,8 +1156,11 @@ function normalizeReviewCandidate(value: unknown, fallbackTimestamp: string): Re
   const tags = [...new Set(asArray<unknown>(input.tags)
     .filter((item): item is string => typeof item === "string" && item.length > 0 && item.length <= 100))]
     .slice(0, REVIEW_CANDIDATE_TAGS_MAX);
-  const riskReasons = [...new Set(asArray<unknown>(input.risk_reasons)
-    .filter((item): item is string => typeof item === "string" && item.length > 0 && item.length <= 200))]
+  const riskReasons = [...new Set([
+    ...asArray<unknown>(input.risk_reasons)
+      .filter((item): item is string => typeof item === "string" && item.length > 0 && item.length <= 200),
+    ...(evidenceFingerprint === "0".repeat(64) ? ["legacy_missing_evidence_fingerprint"] : []),
+  ])]
     .slice(0, 20);
   const confidence = Number(input.confidence);
   const mutationId = typeof input.mutation_id === "string" && /^[A-Za-z0-9._:-]{1,100}$/.test(input.mutation_id)
@@ -1098,6 +1177,7 @@ function normalizeReviewCandidate(value: unknown, fallbackTimestamp: string): Re
     scope,
     stage,
     source_fingerprint: fingerprint,
+    evidence_fingerprint: evidenceFingerprint,
     source_reflection_ids: sourceIds,
     heuristic,
     domain,
@@ -1122,6 +1202,42 @@ function boundReviewCandidateAudit(candidates: ReviewCandidate[]): ReviewCandida
     }
   }
   return candidates.filter((candidate) => retained.has(candidate.id));
+}
+
+export function idempotencyKeyHash(key: string): string {
+  return createHash("sha256").update(key, "utf8").digest("hex");
+}
+
+function normalizeCommittedReceipts(value: unknown, now = Date.now()): Record<string, CommittedReceipt> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return Object.create(null) as Record<string, CommittedReceipt>;
+  const cutoff = now - COMMITTED_RECEIPT_RETENTION_MS;
+  const entries: Array<[string, CommittedReceipt]> = [];
+  for (const [keyHash, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (!SHA256_RE.test(keyHash) || !raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const item = raw as Record<string, unknown>;
+    if (Object.keys(item).sort().join("\0") !== ["committed_at", "input_hash", "reflection_ids", "result_id", "transaction_id"].join("\0")) continue;
+    const committedAt = typeof item.committed_at === "string" ? Date.parse(item.committed_at) : NaN;
+    if (!Number.isFinite(committedAt) || committedAt < cutoff
+        || typeof item.transaction_id !== "string" || !UUID_RE.test(item.transaction_id)
+        || typeof item.result_id !== "string" || !UUID_RE.test(item.result_id)
+        || typeof item.input_hash !== "string" || !SHA256_RE.test(item.input_hash)
+        || !Array.isArray(item.reflection_ids) || item.reflection_ids.length > 256
+        || !item.reflection_ids.every((id) => typeof id === "string" && id.length > 0 && id.length <= 100)) continue;
+    entries.push([keyHash, {
+      transaction_id: item.transaction_id,
+      result_id: item.result_id,
+      reflection_ids: [...item.reflection_ids] as string[],
+      input_hash: item.input_hash,
+      committed_at: new Date(committedAt).toISOString(),
+    }]);
+  }
+  entries.sort((left, right) => left[1].committed_at.localeCompare(right[1].committed_at) || left[0].localeCompare(right[0]));
+  const bounded = entries.slice(-COMMITTED_RECEIPT_MAX);
+  return Object.fromEntries(bounded) as Record<string, CommittedReceipt>;
+}
+
+function committedReceiptFor(store: ReflectionStore, key: string): CommittedReceipt | undefined {
+  return store.metadata?.committed_receipts?.[idempotencyKeyHash(key)];
 }
 
 function normalizeStoreMetadata(value: unknown): ReflectionStore["metadata"] | undefined {
@@ -1180,6 +1296,7 @@ function normalizeStoreMetadata(value: unknown): ReflectionStore["metadata"] | u
     ...(typeof input.write_approval === "boolean" ? { write_approval: input.write_approval } : {}),
     pending_mutations: consistentPending,
     review_candidates: reviewCandidates,
+    committed_receipts: normalizeCommittedReceipts(input.committed_receipts),
     ...(providerName
       ? {
           external_provider: {
@@ -1200,6 +1317,13 @@ async function writeStoreIndex(
   incrementWriteCount: boolean,
 ): Promise<void> {
   await ensureStoreDir();
+  const content = prepareStoreIndexContent(store, incrementWriteCount);
+  const tmpPath = join(STORE_DIR, `store.json.tmp.${process.pid}.${Date.now()}.${randomUUID()}`);
+  await writeFile(tmpPath, content, "utf-8");
+  await replaceFileAtomically(tmpPath, STORE_PATH);
+}
+
+function prepareStoreIndexContent(store: ReflectionStore, incrementWriteCount: boolean): string {
   store.version = VERSION;
   if (incrementWriteCount && _storeIndexDirty) {
     const now = new Date().toISOString();
@@ -1211,10 +1335,8 @@ async function writeStoreIndex(
     }
     _storeIndexDirty = false;
   }
-  const tmpPath = join(STORE_DIR, `store.json.tmp.${process.pid}.${Date.now()}.${randomUUID()}`);
   const indexStore = { ...store, reflections: undefined };
-  await writeFile(tmpPath, JSON.stringify(indexStore, null, 2), "utf-8");
-  await replaceFileAtomically(tmpPath, STORE_PATH);
+  return `${JSON.stringify(indexStore, null, 2)}\n`;
 }
 
 async function replaceFileAtomically(tmpPath: string, targetPath: string): Promise<void> {
@@ -1300,6 +1422,17 @@ async function appendReflectionsFile(reflections: ReflectionFrame[]): Promise<vo
 
 type ReflectionWriteHint = "append-only" | "rewrite" | "none";
 
+export interface ReflectionIdempotencyContext {
+  key: string;
+  input_hash: string;
+}
+
+interface MutationIdempotency<T> extends ReflectionIdempotencyContext {
+  reflection_ids: string[];
+  replay: (store: ReflectionStore, receipt: CommittedReceipt) => T;
+  decorate: (result: T, receipt: CommittedReceipt, replayed: boolean) => T;
+}
+
 async function persistStoreAfterMutation(
   store: ReflectionStore,
   reflectionHint: ReflectionWriteHint,
@@ -1320,11 +1453,12 @@ async function mutateStore<T>(
   operationName?: string,
   operationPayload?: Record<string, unknown>,
   preflight?: (store: ReflectionStore) => void,
+  resolvedQuestionsMutator?: (index: ResolvedQuestionIndex, result: T) => void | Promise<void>,
+  idempotency?: MutationIdempotency<T>,
+  approvalInputHash?: string,
+  resultFinalizer?: (result: T, resolved: ResolvedQuestionIndex) => T | Promise<T>,
 ): Promise<T> {
-  const run = mutationQueue.then(() => withFileLock(STORE_PATH, async () => {
-    if (operationJournalMutationContext.getStore() !== true && crossStoreOperationActive()) {
-      throw new Error("A recoverable cross-store operation is pending startup recovery; writes are temporarily blocked.");
-    }
+  const execute = () => withFileLock(STORE_PATH, async () => {
     // A process-local cache is insufficient when multiple MCP processes share
     // one HOME. Reload only after acquiring the cross-process transaction lock.
     _mutationStore = await loadStore();
@@ -1343,6 +1477,7 @@ async function mutateStore<T>(
         operation: operationName,
         preview: `Queued ${operationName} pending approval`,
         payload: operationPayload ?? {},
+        payload_hash: approvalInputHash ?? pendingMutationPayloadHash(operationPayload ?? {}),
       };
       pending.push(pendingMutation);
       metadata.pending_mutations = pending;
@@ -1358,13 +1493,42 @@ async function mutateStore<T>(
       throw approvalError;
     }
 
+    if (idempotency) {
+      const prior = committedReceiptFor(_mutationStore, idempotency.key);
+      if (prior) {
+        if (prior.input_hash !== idempotency.input_hash) {
+          throw new Error("IDEMPOTENCY_CONFLICT: idempotency_key is already committed for different normalized input");
+        }
+        return idempotency.decorate(idempotency.replay(_mutationStore, prior), structuredClone(prior), true);
+      }
+    }
+
     // Normal mutation: work on a clone so a partial or failed mutator
     // cannot corrupt the live cached _mutationStore.
     const store = structuredClone(_mutationStore) as ReflectionStore;
     const previousReflectionCount = store.reflections.length;
     let result: T;
+    let resolvedForFinalizer: ResolvedQuestionIndex | undefined;
+    let reservation: OperationTransactionReservation | undefined;
+    let committedReceipt: CommittedReceipt | undefined;
     try {
       result = await mutator(store);
+      if (idempotency && reflectionHint !== "none" && operationJournalMutationContext.getStore() !== true) {
+        reservation = reserveOperationTransaction();
+        committedReceipt = {
+          transaction_id: reservation.transaction_id,
+          result_id: reservation.result_id,
+          reflection_ids: [...idempotency.reflection_ids],
+          input_hash: idempotency.input_hash,
+          committed_at: reservation.created_at,
+        };
+        const metadata = store.metadata;
+        if (!metadata) throw new Error("Store metadata is unavailable");
+        metadata.committed_receipts = normalizeCommittedReceipts({
+          ...(metadata.committed_receipts ?? {}),
+          [idempotencyKeyHash(idempotency.key)]: committedReceipt,
+        });
+      }
       _storeIndexDirty = true;
     } finally {
       // Invalidate caches keyed by the previous live store (stale after mutation)
@@ -1384,12 +1548,55 @@ async function mutateStore<T>(
       _heuristicByIdCache.delete(store);
       _reflectionByIdCache.delete(store);
     }
-    await persistStoreAfterMutation(store, reflectionHint, previousReflectionCount);
+    if (reflectionHint === "none" || operationJournalMutationContext.getStore() === true) {
+      await persistStoreAfterMutation(store, reflectionHint, previousReflectionCount);
+      if (resolvedQuestionsMutator || resultFinalizer) {
+        const resolved = await loadResolvedQuestionsUnderBarrier();
+        await resolvedQuestionsMutator?.(resolved, result);
+        if (resolvedQuestionsMutator) await saveResolvedQuestions(resolved);
+        resolvedForFinalizer = structuredClone(resolved);
+        _resolvedQuestionsCache = {
+          index: resolved,
+          loadedAt: Date.now(),
+          fingerprint: await fileFingerprint(RESOLVED_QUESTIONS_PATH),
+        };
+      }
+    } else {
+      const resolved = await loadResolvedQuestionsUnderBarrier();
+      resolvedForFinalizer = structuredClone(resolved);
+      await resolvedQuestionsMutator?.(resolved, result);
+      prepareStoreIndexContent(store, true);
+      const serialized = serializeReflectionResources(store, resolved as Record<string, unknown>);
+      await commitResourceTransaction("reflection_mutation", [
+        { name: "reflections", after: serialized.reflections },
+        { name: "store_index", after: serialized.store_index },
+        { name: "resolved_questions", after: serialized.resolved_questions },
+      ], {
+        reflection_ids: store.reflections.slice(Math.max(0, previousReflectionCount - (reflectionHint === "rewrite" ? store.reflections.length : 0)))
+          .slice(0, 256).map((item) => item.id),
+        result_hash: operationResultHash(result),
+      }, reservation);
+      _resolvedQuestionsCache = {
+        index: resolved,
+        loadedAt: Date.now(),
+        fingerprint: await fileFingerprint(RESOLVED_QUESTIONS_PATH),
+      };
+    }
     // Commit the working clone only after persistence succeeds
     _mutationStore = store;
     storeCache = await refreshStoreCacheAfterMutation(store, reflectionHint, previousReflectionCount, storeCache);
-    return result;
-  }));
+    seenReflectionRecoveryGeneration = operationRecoveryGeneration();
+    if (resultFinalizer) {
+      await runAuthorityReadHookForTest("before_mutation_result_finalize");
+      result = await resultFinalizer(result, resolvedForFinalizer ?? {});
+    }
+    return committedReceipt && idempotency
+      ? idempotency.decorate(result, committedReceipt, false)
+      : result;
+  });
+  const run = mutationQueue.then(() => operationJournalMutationContext.getStore() === true
+    ? execute()
+    : withOperationJournalBarrier(execute));
 
   mutationQueue = run.then(() => undefined, (error) => {
     // Approval-queued events are normal control flow, not storage faults
@@ -1407,12 +1614,9 @@ export async function requireWriteApproval(
   operationName: string,
   operationPayload: Record<string, unknown>,
 ): Promise<void> {
-  const run = mutationQueue.then(() => withFileLock(STORE_PATH, async () => {
+  const execute = () => withFileLock(STORE_PATH, async () => {
     _mutationStore = await loadStore();
     if (_mutationStore.metadata?.write_approval !== true) return;
-    if (crossStoreOperationActive()) {
-      throw new Error("A recoverable cross-store operation is active; writing the approval queue is temporarily blocked.");
-    }
 
     const store = _mutationStore;
     const metadata = store.metadata!;
@@ -1435,7 +1639,10 @@ export async function requireWriteApproval(
     approvalError.isPendingApproval = true;
     approvalError.pendingMutationId = pendingId;
     throw approvalError;
-  }));
+  });
+  const run = mutationQueue.then(() => operationJournalMutationContext.getStore() === true
+    ? execute()
+    : withOperationJournalBarrier(execute));
 
   mutationQueue = run.then(() => undefined, (error) => {
     if (error instanceof Error && (error as Error & { isPendingApproval?: boolean }).isPendingApproval === true) return;
@@ -1450,8 +1657,14 @@ export async function withOperationJournalStoreMutation<T>(callback: () => Promi
   return operationJournalMutationContext.run(true, callback);
 }
 
+/** Narrow module-level recovery seam; not registered as an MCP tool. */
+export async function recoverReflectionTransactionsForTest(): Promise<void> {
+  await recoverPendingOperation();
+  invalidateStoreCache();
+}
+
 export async function withStoreSnapshotBarrier<T>(callback: () => Promise<T>): Promise<T> {
-  return withFileLock(STORE_PATH, callback);
+  return withOperationJournalBarrier(() => withFileLock(STORE_PATH, callback));
 }
 
 function ensureSession(store: ReflectionStore, sessionId: string, startedAt?: string): Session {
@@ -1949,7 +2162,7 @@ export async function memoryBoardWrite(
   oldText?: string,
   operationName?: string,
 ): Promise<MemoryBoardWriteResult> {
-  return mutateStore((store) => {
+  return structuredClone(await mutateStore((store) => {
     const board = store.memory_board ?? normalizeMemoryBoard(undefined);
     store.memory_board = board;
     board.used_chars = computeMemoryBoardUsedChars(board.entries);
@@ -2065,14 +2278,14 @@ export async function memoryBoardWrite(
     }
 
     throw new Error(`Unsupported memory board action: ${action}`);
-  }, "none", operationName, { action, content, old_text: oldText });
+  }, "none", operationName, { action, content, old_text: oldText }));
 }
 
 export async function memoryBoardBatchWrite(
   operations: MemoryBoardOperation[],
   operationName?: string,
 ): Promise<MemoryBoardWriteResult> {
-  return mutateStore((store) => {
+  return structuredClone(await mutateStore((store) => {
     const current = store.memory_board ?? normalizeMemoryBoard(undefined);
     const working: MemoryBoard = {
       entries: current.entries.map((entry) => ({ ...entry })),
@@ -2125,7 +2338,7 @@ export async function memoryBoardBatchWrite(
       content: operation.content,
       old_text: operation.old_text,
     })),
-  });
+  }));
 }
 
 export async function memoryBoardRead(): Promise<string> {
@@ -2148,7 +2361,7 @@ export async function userProfileWrite(
   oldText?: string,
   operationName?: string,
 ): Promise<MemoryBoardWriteResult> {
-  return mutateStore((store) => {
+  return structuredClone(await mutateStore((store) => {
     const profile = store.user_profile ?? normalizeMemoryBoard(undefined, 1800);
     store.user_profile = profile;
     profile.used_chars = computeMemoryBoardUsedChars(profile.entries);
@@ -2161,14 +2374,14 @@ export async function userProfileWrite(
       char_limit: profile.char_limit,
       note: result.note,
     };
-  }, "none", operationName, { action, content, old_text: oldText });
+  }, "none", operationName, { action, content, old_text: oldText }));
 }
 
 export async function userProfileBatchWrite(
   operations: MemoryBoardOperation[],
   operationName?: string,
 ): Promise<MemoryBoardWriteResult> {
-  return mutateStore((store) => {
+  return structuredClone(await mutateStore((store) => {
     const current = store.user_profile ?? normalizeMemoryBoard(undefined, 1800);
     const working: MemoryBoard = {
       entries: current.entries.map((entry) => ({ ...entry })),
@@ -2221,7 +2434,7 @@ export async function userProfileBatchWrite(
       content: operation.content,
       old_text: operation.old_text,
     })),
-  });
+  }));
 }
 
 export async function userProfileRead(): Promise<string> {
@@ -2253,7 +2466,8 @@ export async function getRawMemoryStores(): Promise<RawMemoryStores> {
   };
 }
 
-type ReviewCandidateDraft = Omit<ReviewCandidate, "created_at" | "state" | "mutation_id">;
+type ReviewCandidateDraft = Omit<ReviewCandidate, "created_at" | "state" | "mutation_id" | "evidence_fingerprint">
+  & Partial<Pick<ReviewCandidate, "evidence_fingerprint">>;
 
 function canonicalJsonValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalJsonValue);
@@ -2270,13 +2484,14 @@ export function pendingMutationPayloadHash(payload: Record<string, unknown>): st
 }
 
 function reviewCandidateContentHash(candidate: Pick<ReviewCandidate,
-  "id" | "scope" | "stage" | "source_fingerprint" | "source_reflection_ids" | "heuristic" | "domain" | "tags" | "confidence" | "risk_reasons"
+  "id" | "scope" | "stage" | "source_fingerprint" | "evidence_fingerprint" | "source_reflection_ids" | "heuristic" | "domain" | "tags" | "confidence" | "risk_reasons"
 >): string {
   return pendingMutationPayloadHash({
     id: candidate.id,
     scope: candidate.scope,
     stage: candidate.stage,
     source_fingerprint: candidate.source_fingerprint,
+    evidence_fingerprint: candidate.evidence_fingerprint,
     source_reflection_ids: candidate.source_reflection_ids,
     heuristic: candidate.heuristic,
     domain: candidate.domain,
@@ -2286,12 +2501,51 @@ function reviewCandidateContentHash(candidate: Pick<ReviewCandidate,
   });
 }
 
-function requireReviewCandidateDraft(draft: ReviewCandidateDraft): ReviewCandidateDraft {
+function evidenceText(value: string): string {
+  return redactSensitiveText(value, { strictHistorical: true }).trim();
+}
+
+/** Candidate-specific authoritative source projection used at generation and locked apply. */
+export function reviewCandidateEvidenceFingerprint(
+  reflections: ReflectionFrame[],
+  sourceReflectionIds: string[],
+): string {
+  const byId = new Map(reflections.map((reflection) => [reflection.id, reflection]));
+  const projection = sourceReflectionIds.map((id) => {
+    const reflection = byId.get(id);
+    if (!reflection) return { id, missing: true };
+    return {
+      id: reflection.id,
+      scope: reflection.scope,
+      outcome: reflection.task_outcome,
+      task_goal: evidenceText(reflection.task_goal),
+      summary: evidenceText(reflection.task_state.summary),
+      summary_sections: (reflection.task_state.summary_sections ?? []).map((section) => ({
+        title: evidenceText(section.title),
+        content: evidenceText(section.content),
+      })),
+      blockers: reflection.task_state.immediate_blockers.map(evidenceText),
+      lessons: reflection.lessons_learned.map(evidenceText),
+      open_questions: reflection.open_questions
+        .filter((question) => !question.resolved)
+        .map((question) => evidenceText(question.question)),
+    };
+  });
+  return pendingMutationPayloadHash({ source_reflection_ids: sourceReflectionIds, projection });
+}
+
+function fingerprintsEqual(left: string, right: string): boolean {
+  if (!/^[a-f0-9]{64}$/i.test(left) || !/^[a-f0-9]{64}$/i.test(right)) return false;
+  return timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex"));
+}
+
+function requireReviewCandidateDraft(draft: ReviewCandidateDraft): ReviewCandidateDraft & Pick<ReviewCandidate, "evidence_fingerprint"> {
   const probe = normalizeReviewCandidate({
     ...draft,
     created_at: new Date().toISOString(),
     state: "pending",
     mutation_id: randomUUID(),
+    evidence_fingerprint: draft.evidence_fingerprint ?? "0".repeat(64),
   }, new Date().toISOString());
   if (!probe) throw new Error(`Invalid review candidate: ${draft.id}`);
   return {
@@ -2299,6 +2553,7 @@ function requireReviewCandidateDraft(draft: ReviewCandidateDraft): ReviewCandida
     scope: probe.scope,
     stage: probe.stage,
     source_fingerprint: probe.source_fingerprint,
+    evidence_fingerprint: probe.evidence_fingerprint,
     source_reflection_ids: probe.source_reflection_ids,
     heuristic: probe.heuristic,
     domain: probe.domain,
@@ -2313,13 +2568,17 @@ export async function enqueueReviewCandidateRecords(drafts: ReviewCandidateDraft
   if (drafts.length > MAX_REVIEW_CANDIDATES_PER_BATCH) {
     throw new Error(`Review candidate batch exceeds ${MAX_REVIEW_CANDIDATES_PER_BATCH}`);
   }
-  const validated = drafts.map(requireReviewCandidateDraft);
   return mutateStore((store) => {
     const metadata = store.metadata;
     if (!metadata) throw new Error("Store metadata is unavailable");
     const candidates = metadata.review_candidates ?? [];
     const pending = metadata.pending_mutations ?? [];
     const saved: ReviewCandidate[] = [];
+    const validated = drafts.map((draft) => requireReviewCandidateDraft({
+      ...draft,
+      evidence_fingerprint: draft.evidence_fingerprint
+        ?? reviewCandidateEvidenceFingerprint(store.reflections, draft.source_reflection_ids),
+    }));
     for (const draft of validated) {
       const existing = candidates.find((candidate) => candidate.id === draft.id);
       if (existing) {
@@ -2347,6 +2606,7 @@ export async function enqueueReviewCandidateRecords(drafts: ReviewCandidateDraft
       const payload = {
         candidate_id: candidate.id,
         candidate_hash: reviewCandidateContentHash(candidate),
+        evidence_fingerprint: candidate.evidence_fingerprint,
       };
       candidates.push(candidate);
       pending.push({
@@ -2396,7 +2656,8 @@ export async function validateReviewCandidateMutation(mutation: PendingMutation)
   }
   const candidateId = mutation.payload.candidate_id;
   const candidateHash = mutation.payload.candidate_hash;
-  if (typeof candidateId !== "string" || typeof candidateHash !== "string") {
+  const evidenceFingerprint = mutation.payload.evidence_fingerprint;
+  if (typeof candidateId !== "string" || typeof candidateHash !== "string" || typeof evidenceFingerprint !== "string") {
     throw new Error(`Pending mutation ${mutation.id} has an invalid review candidate payload`);
   }
   const candidate = await getReviewCandidateRecord(candidateId);
@@ -2406,7 +2667,98 @@ export async function validateReviewCandidateMutation(mutation: PendingMutation)
   if (reviewCandidateContentHash(candidate) !== candidateHash) {
     throw new Error(`Review candidate ${candidateId} content hash mismatch`);
   }
+  if (!fingerprintsEqual(candidate.evidence_fingerprint, evidenceFingerprint)) {
+    throw new Error(`Review candidate ${candidateId} evidence fingerprint mismatch`);
+  }
   return candidate;
+}
+
+/**
+ * Revalidate a claimed review candidate against the current authoritative
+ * reflection set, apply it, and finalize the queue item in one store write.
+ * This is the final scope/evidence boundary; provider output and earlier
+ * engine validation are never treated as persistent authority.
+ */
+export async function applyClaimedReviewCandidateMutation(
+  mutationId: string,
+  claimToken: string,
+): Promise<{ candidate: ReviewCandidate; heuristic: Heuristic } | null> {
+  return mutateStore((store) => {
+    const metadata = store.metadata;
+    if (!metadata) return null;
+    const pending = metadata.pending_mutations ?? [];
+    const mutationIndex = pending.findIndex((item) => item.id === mutationId
+      && item.operation === "apply_review_candidate"
+      && item.state === "processing"
+      && item.claim_token === claimToken);
+    if (mutationIndex < 0) return null;
+    const mutation = pending[mutationIndex];
+    if (!mutation.payload || !mutation.payload_hash
+      || pendingMutationPayloadHash(mutation.payload) !== mutation.payload_hash) {
+      throw new Error(`Pending mutation ${mutationId} payload hash mismatch`);
+    }
+    const candidateId = mutation.payload.candidate_id;
+    const candidateHash = mutation.payload.candidate_hash;
+    const evidenceFingerprint = mutation.payload.evidence_fingerprint;
+    const candidates = metadata.review_candidates ?? [];
+    const candidateIndex = candidates.findIndex((item) => item.id === candidateId
+      && item.state === "pending" && item.mutation_id === mutationId);
+    const candidate = candidateIndex >= 0 ? candidates[candidateIndex] : undefined;
+    if (!candidate || typeof candidateHash !== "string" || typeof evidenceFingerprint !== "string"
+      || reviewCandidateContentHash(candidate) !== candidateHash) {
+      throw new Error(`Review candidate ${String(candidateId)} content hash mismatch`);
+    }
+
+    const sourceIds = candidate.source_reflection_ids;
+    const uniqueSourceIds = [...new Set(sourceIds)];
+    if (sourceIds.length === 0 || uniqueSourceIds.length !== sourceIds.length) {
+      throw new Error(`Review candidate ${candidate.id} has missing or duplicate evidence`);
+    }
+    const reflections = uniqueSourceIds.map((id) => store.reflections.find((item) => item.id === id));
+    if (reflections.some((item) => !item || item.scope !== candidate.scope)) {
+      throw new Error(`Review candidate ${candidate.id} evidence is missing or outside its scope`);
+    }
+    if (!reflections.some((item) => item?.task_outcome === "success")) {
+      throw new Error(`Review candidate ${candidate.id} has no exact-scope successful evidence`);
+    }
+    const currentEvidenceFingerprint = reviewCandidateEvidenceFingerprint(
+      reflections.filter((item): item is ReflectionFrame => item !== undefined),
+      sourceIds,
+    );
+    if (!fingerprintsEqual(candidate.evidence_fingerprint, evidenceFingerprint)
+      || !fingerprintsEqual(candidate.evidence_fingerprint, currentEvidenceFingerprint)) {
+      throw new Error(`Review candidate ${candidate.id} evidence fingerprint mismatch`);
+    }
+
+    const sourceTask = `${candidate.stage}_background_review:${candidate.source_fingerprint.slice(0, 12)}`;
+    const heuristic = upsertHeuristicMut(store, {
+      scope: candidate.scope,
+      domain: candidate.domain,
+      heuristic: candidate.heuristic,
+      source_task: sourceTask,
+      confidence: candidate.confidence,
+      tags: candidate.tags,
+      evidence: uniqueSourceIds.map((sourceReflectionId) => ({
+        id: evidenceId(`${sourceTask}:${sourceReflectionId}`, candidate.heuristic),
+        source_reflection_id: sourceReflectionId,
+        source_task: sourceTask,
+        content_hash: lessonContentHash(candidate.heuristic),
+        created_at: candidate.created_at,
+      })),
+    });
+    if (store.heuristics.length > HEURISTIC_MAX_COUNT) pruneHeuristicsMut(store);
+
+    pending.splice(mutationIndex, 1);
+    const finalized: ReviewCandidate = { ...candidate, state: "applied" };
+    candidates.splice(candidateIndex, 1);
+    candidates.push(finalized);
+    metadata.pending_mutations = pending;
+    metadata.review_candidates = boundReviewCandidateAudit(candidates);
+    return {
+      candidate: structuredClone(finalized),
+      heuristic: sanitizeHeuristicForOutput(heuristic),
+    };
+  }, "none");
 }
 
 export async function completeReviewCandidateMutation(
@@ -2420,8 +2772,13 @@ export async function completeReviewCandidateMutation(
     const index = pending.findIndex((item) => item.id === mutationId
       && item.operation === "apply_review_candidate"
       && item.state === "processing" && item.claim_token === claimToken);
-    if (index < 0) return null;
     const candidates = metadata.review_candidates ?? [];
+    // v21 replay applies and finalizes atomically. Keep this completion call
+    // idempotent for the existing public approval workflow.
+    if (index < 0) {
+      const finalized = candidates.find((item) => item.mutation_id === mutationId && item.state === "applied");
+      return finalized ? structuredClone(finalized) : null;
+    }
     const candidateIndex = candidates.findIndex((item) => item.mutation_id === mutationId && item.state === "pending");
     const candidate = candidateIndex >= 0 ? candidates[candidateIndex] : undefined;
     if (!candidate) return null;
@@ -2490,7 +2847,12 @@ export interface PendingMutationClaim {
 export async function claimPendingMutation(mutationId: string): Promise<PendingMutationClaim | null> {
   return mutateStore((store) => {
     const pending = store.metadata?.pending_mutations ?? [];
-    const mutation = pending.find((item) => item.id === mutationId && (item.state ?? "pending") === "pending");
+    const mutation = pending.find((item) => {
+      if (item.id !== mutationId) return false;
+      if ((item.state ?? "pending") === "pending") return true;
+      const receipt = committedReceiptFor(store, item.id);
+      return item.state === "processing" && !!receipt && !!item.payload_hash && receipt.input_hash === item.payload_hash;
+    });
     if (!mutation) return null;
     const claimToken = randomUUID();
     mutation.state = "processing";
@@ -2620,7 +2982,9 @@ export async function saveReflectionAndHeuristics(
   tags: string[],
   operationName?: string,
   heuristicFeedback: HeuristicFeedbackInput[] = [],
-): Promise<{ session: Session; reflectionCount: number; nearSoftLimit: boolean }> {
+  idempotency?: ReflectionIdempotencyContext,
+  normalizedInputHash?: string,
+): Promise<{ session: Session; reflectionCount: number; nearSoftLimit: boolean; receipt?: CommittedReceipt; idempotentReplay?: boolean }> {
   const reflection: ReflectionFrame = {
     ...reflectionInput,
     scope: reflectionInput.scope ?? "global",
@@ -2667,7 +3031,23 @@ export async function saveReflectionAndHeuristics(
     };
   }, "append-only", operationName, { reflection, lessons, domain, sourceTask, confidence, tags, heuristicFeedback }, (store) => {
     planHeuristicFeedback(store, reflection, heuristicFeedback, new Set(store.heuristics.map((item) => item.id)));
-  });
+  }, undefined, idempotency ? {
+    ...idempotency,
+    reflection_ids: [reflection.id],
+    replay: (store, receipt) => {
+      const committedReflection = store.reflections.find((item) => item.id === receipt.reflection_ids[0]);
+      const session = committedReflection ? store.sessions[committedReflection.session_id] : undefined;
+      if (!session || !committedReflection) {
+        throw new Error("Committed idempotency receipt does not match authoritative reflection state");
+      }
+      return {
+        session: { ...session },
+        reflectionCount: store.reflections.length,
+        nearSoftLimit: store.reflections.length >= REFLECTION_SOFT_LIMIT,
+      };
+    },
+    decorate: (result, receipt, replayed) => ({ ...result, receipt, idempotentReplay: replayed }),
+  } : undefined, normalizedInputHash);
 }
 
 export interface BatchReflectionSaveInput {
@@ -3340,7 +3720,7 @@ export async function searchReflections(
   tagMode: TagFilterMode = "and",
   scope: MemoryScope = "global",
 ): Promise<ReflectionFrame[]> {
-  const cache = await getCachedStoreEntry();
+  const { cache, resolvedIndex } = await getCachedStoreAndResolvedQuestions();
   const store = cache.store;
   const normalizedDomain = domain ? normalizeDomain(domain) : undefined;
   let candidates = store.reflections.filter((reflection) =>
@@ -3369,7 +3749,7 @@ export async function searchReflections(
 
   if (query.trim().length === 0) {
     const sliced = newestFirstSlice(candidates, limit, 0, cache.reflectionsAreAscending);
-    return Promise.all(sliced.map(sanitizeReflectionForOutput));
+    return sliced.map((reflection) => sanitizeReflectionForOutput(reflection, resolvedIndex));
   }
 
   const scored = candidates
@@ -3388,7 +3768,7 @@ export async function searchReflections(
     .filter((item): item is NonNullable<typeof item> => item !== null);
 
   scored.sort((a, b) => b.score - a.score);
-  return Promise.all(scored.slice(0, limit).map((item) => sanitizeReflectionForOutput(item.reflection)));
+  return scored.slice(0, limit).map((item) => sanitizeReflectionForOutput(item.reflection, resolvedIndex));
 }
 
 export interface ListReflectionsOptions {
@@ -3405,7 +3785,7 @@ export interface ListReflectionsOptions {
 }
 
 export async function listReflections(options: ListReflectionsOptions = {}): Promise<ReflectionFrame[]> {
-  const cache = await getCachedStoreEntry();
+  const { cache, resolvedIndex } = await getCachedStoreAndResolvedQuestions();
   const store = cache.store;
   const normalizedDomain = options.domain ? normalizeDomain(options.domain) : undefined;
   const filterTags = normalizeTags(options.tags);
@@ -3443,13 +3823,14 @@ export async function listReflections(options: ListReflectionsOptions = {}): Pro
   }
 
   const sliced = newestFirstSlice(candidates, limit, offset, cache.reflectionsAreAscending);
-  return Promise.all(sliced.map(sanitizeReflectionForOutput));
+  return sliced.map((reflection) => sanitizeReflectionForOutput(reflection, resolvedIndex));
 }
 
 function sanitizeReflectionLessonsForOutput(reflection: ReflectionFrame): ReflectionFrame {
+  const isolated = structuredClone(reflection);
   return {
-    ...reflection,
-    lessons_learned: reflection.lessons_learned.map(safeHeuristicText),
+    ...isolated,
+    lessons_learned: isolated.lessons_learned.map(safeHeuristicText),
   };
 }
 
@@ -3458,8 +3839,10 @@ function sanitizeReflectionLessonsForOutput(reflection: ReflectionFrame): Reflec
  * then sanitize lessons. Used by all reflection output paths to ensure
  * resolved questions display consistently across all retrieval functions.
  */
-async function sanitizeReflectionForOutput(reflection: ReflectionFrame): Promise<ReflectionFrame> {
-  const resolvedIndex = await getCachedResolvedQuestions();
+function sanitizeReflectionForOutput(
+  reflection: ReflectionFrame,
+  resolvedIndex: ResolvedQuestionIndex,
+): ReflectionFrame {
   const sanitized = sanitizeReflectionLessonsForOutput(reflection);
   // Apply resolved overlay to open_questions
   sanitized.open_questions = sanitized.open_questions.map((question, index) => {
@@ -3551,13 +3934,13 @@ export async function getReflectionSummary() {
     total_heuristics_archived: archivedHeuristics,
     total_affordance_gaps: activeGaps,
     total_affordance_gaps_resolved: resolvedGaps,
-    top_gaps: topGaps,
+    top_gaps: structuredClone(topGaps),
     recent_lessons: recentLessons,
     outcome_distribution: outcomeDist,
     failure_distribution: failureDist,
     domain_distribution: domainDist,
     tag_distribution: tagDist,
-    metadata: store.metadata,
+    metadata: structuredClone(store.metadata),
   };
 }
 
@@ -3570,9 +3953,9 @@ export async function getAffordanceGaps(minOccurrences = 1, includeResolved = fa
     for (const gap of filtered) {
       insertSorted(top, gap, (a, b) => b.occurrence_count - a.occurrence_count, limit);
     }
-    return top;
+    return structuredClone(top);
   }
-  return filtered.sort((a, b) => b.occurrence_count - a.occurrence_count);
+  return structuredClone(filtered.sort((a, b) => b.occurrence_count - a.occurrence_count));
 }
 
 export async function resolveAffordanceGap(
@@ -3591,19 +3974,19 @@ export async function resolveAffordanceGap(
 }
 
 export async function getRecentReflections(limit = 20, scope: MemoryScope = "global"): Promise<ReflectionFrame[]> {
-  const authoritative = await loadReflections();
-  const recent = authoritative
+  const { cache, resolvedIndex } = await getCachedStoreAndResolvedQuestions();
+  const recent = cache.store.reflections
     .filter((reflection) => reflection.scope === "global" || reflection.scope === scope)
     .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
     .slice(0, limit);
-  return Promise.all(recent.map(sanitizeReflectionForOutput));
+  return recent.map((reflection) => sanitizeReflectionForOutput(reflection, resolvedIndex));
 }
 
 export async function getSessionReflections(sessionId: string, limit = 20): Promise<ReflectionFrame[]> {
-  const cache = await getCachedStoreEntry();
+  const { cache, resolvedIndex } = await getCachedStoreAndResolvedQuestions();
   const indexes = cache.sessionIndex.get(sessionId) ?? [];
   const sliced = indexes.slice(-limit).reverse().map((index) => cache.store.reflections[index]);
-  return Promise.all(sliced.map(sanitizeReflectionForOutput));
+  return sliced.map((reflection) => sanitizeReflectionForOutput(reflection, resolvedIndex));
 }
 
 export interface ReflectionChainEntry {
@@ -3618,7 +4001,7 @@ export async function getReflectionChain(
   limit = 10,
   includeSelf = true,
 ): Promise<ReflectionChainEntry[] | null> {
-  const cache = await getCachedStoreEntry();
+  const { cache, resolvedIndex } = await getCachedStoreAndResolvedQuestions();
   const seed = cache.reflectionById.get(id);
   if (!seed) return null;
 
@@ -3633,7 +4016,7 @@ export async function getReflectionChain(
 
     if (reflection.id === id) {
       if (includeSelf) {
-        const sanitizedSeed = await sanitizeReflectionForOutput(reflection);
+        const sanitizedSeed = sanitizeReflectionForOutput(reflection, resolvedIndex);
         seedEntry = {
           reflection: sanitizedSeed,
           similarity: 1.0,
@@ -3647,7 +4030,7 @@ export async function getReflectionChain(
     const sim = similarity(seedText, rText, 1.5, 0.75, AVG_REFLECTION_DOC_LEN);
 
     if (sim >= similarityThreshold) {
-      const sanitizedOther = await sanitizeReflectionForOutput(reflection);
+      const sanitizedOther = sanitizeReflectionForOutput(reflection, resolvedIndex);
       others.push({
         reflection: sanitizedOther,
         similarity: Number(sim.toFixed(3)),
@@ -3681,9 +4064,8 @@ export interface SessionSummary {
 }
 
 export async function getSessionSummary(sessionId: string): Promise<SessionSummary | null> {
-  const cache = await getCachedStoreEntry();
+  const { cache, resolvedIndex } = await getCachedStoreAndResolvedQuestions();
   const store = cache.store;
-  const resolvedIndex = await getCachedResolvedQuestions();
   const session = getOwnSession(store.sessions, sessionId);
   if (!session) return null;
 
@@ -3746,20 +4128,21 @@ export async function getReflectionById(
   id: string,
   applyResolvedOverlay = true,
 ): Promise<ReflectionFrame | null> {
-  const cache = await getCachedStoreEntry();
+  const { cache, resolvedIndex } = await getCachedStoreAndResolvedQuestions();
   const reflection = cache.reflectionById.get(id);
   if (!reflection) return null;
   if (!applyResolvedOverlay) {
+    const isolated = structuredClone(reflection);
     return {
-      ...reflection,
-      lessons_learned: reflection.lessons_learned.map(safeHeuristicText),
+      ...isolated,
+      lessons_learned: isolated.lessons_learned.map(safeHeuristicText),
     };
   }
-  const resolvedIndex = await getCachedResolvedQuestions();
+  const isolated = structuredClone(reflection);
   return {
-    ...reflection,
-    lessons_learned: reflection.lessons_learned.map(safeHeuristicText),
-    open_questions: reflection.open_questions.map((question, index) => {
+    ...isolated,
+    lessons_learned: isolated.lessons_learned.map(safeHeuristicText),
+    open_questions: isolated.open_questions.map((question, index) => {
       const resolved = resolveQuestionOverlay(reflection.id, index, question, resolvedIndex);
       return resolved.resolved
         ? {
@@ -3818,10 +4201,10 @@ export async function updateReflection(
       }
     }
 
-    return reflection;  // B3-fix: caller applies overlay via sanitizeReflectionForOutput
-  }, "rewrite", operationName, { id, ...update });
-  if (!result) return null;
-  return sanitizeReflectionForOutput(result);
+    return reflection;
+  }, "rewrite", operationName, { id, ...update }, undefined, undefined, undefined, undefined,
+  (reflection, resolved) => reflection ? sanitizeReflectionForOutput(reflection, resolved) : null);
+  return result;
 }
 
 export interface ReflectionDiffSummary {
@@ -3852,7 +4235,7 @@ export async function diffReflections(
   idA: string,
   idB: string,
 ): Promise<{ a: ReflectionFrame; b: ReflectionFrame; diff: ReflectionDiffSummary } | null> {
-  const cache = await getCachedStoreEntry();
+  const { cache, resolvedIndex } = await getCachedStoreAndResolvedQuestions();
   const a = cache.reflectionById.get(idA);
   const b = cache.reflectionById.get(idB);
   if (!a || !b) return null;
@@ -3926,10 +4309,8 @@ export async function diffReflections(
     ? timestampB - timestampA
     : 0;
 
-  const [sanitizedA, sanitizedB] = await Promise.all([
-    sanitizeReflectionForOutput(a),
-    sanitizeReflectionForOutput(b),
-  ]);
+  const sanitizedA = sanitizeReflectionForOutput(a, resolvedIndex);
+  const sanitizedB = sanitizeReflectionForOutput(b, resolvedIndex);
 
   return {
     a: sanitizedA,
@@ -4146,7 +4527,7 @@ export async function getReflectionTimeline(
   sinceDays = 90,
   limit = 20,
 ): Promise<TimelineBucket[]> {
-  const cache = await getCachedStoreEntry();
+  const { cache, resolvedIndex } = await getCachedStoreAndResolvedQuestions();
   const store = cache.store;
   const normalizedDomain = domain ? normalizeDomain(domain) : undefined;
   const cutoff = new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000).toISOString();
@@ -4160,8 +4541,6 @@ export async function getReflectionTimeline(
     open_questions_count: number;
     domains: Set<string>;
   }>();
-
-  const resolvedIndex = await getCachedResolvedQuestions();
 
   for (const reflection of store.reflections) {
     if (reflection.timestamp < cutoff) continue;
@@ -4289,8 +4668,8 @@ export async function getOpenQuestions(
   includeResolved = false,
   scope: MemoryScope = "global",
 ): Promise<OpenQuestionSummary[]> {
-  const store = await getCachedStore();
-  const resolvedIndex = await getCachedResolvedQuestions();
+  const { cache, resolvedIndex } = await getCachedStoreAndResolvedQuestions();
+  const store = cache.store;
   const normalizedDomain = domain ? normalizeDomain(domain) : undefined;
   const cutoff = sinceDays !== undefined
     ? new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000).toISOString()
@@ -4357,7 +4736,8 @@ export async function resolveOpenQuestion(
 export type ClearCollection = "reflections" | "heuristics" | "affordance_gaps" | "sessions" | "all";
 
 export async function exportData(): Promise<ReflectionStore> {
-  return mergeResolvedQuestionsIntoStore(await getCachedStore());
+  const { cache, resolvedIndex } = await getCachedStoreAndResolvedQuestions();
+  return mergeResolvedQuestionsIntoStore(cache.store, resolvedIndex);
 }
 
 export interface StoreHealthReport {
@@ -4511,33 +4891,35 @@ export async function checkStoreHealth(): Promise<StoreHealthReport> {
 }
 
 export async function createSnapshot(outputDir?: string, label?: string): Promise<SnapshotResult> {
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const normalizedLabel = label?.replace(/[^a-zA-Z0-9_-]/g, "-").replace(/^-+|-+$/g, "");
-  const dirName = normalizedLabel ? `${timestamp}-${normalizedLabel}` : timestamp;
-  const baseDir = outputDir ?? join(STORE_DIR, "snapshots");
-  const snapshotDir = join(baseDir, dirName);
+  return withOperationJournalBarrier(() => withFileLock(STORE_PATH, async () => {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const normalizedLabel = label?.replace(/[^a-zA-Z0-9_-]/g, "-").replace(/^-+|-+$/g, "");
+    const dirName = normalizedLabel ? `${timestamp}-${normalizedLabel}` : timestamp;
+    const baseDir = outputDir ?? join(STORE_DIR, "snapshots");
+    const snapshotDir = join(baseDir, dirName);
 
-  await mkdir(snapshotDir, { recursive: true });
+    await mkdir(snapshotDir, { recursive: true });
 
-  const files: string[] = [];
-  const srcFiles = [
-    { src: STORE_PATH, name: "store.json" },
-    { src: REFLECTIONS_PATH, name: "reflections.jsonl" },
-    { src: RESOLVED_QUESTIONS_PATH, name: "resolved_questions.json" },
-  ];
+    const files: string[] = [];
+    const srcFiles = [
+      { src: STORE_PATH, name: "store.json" },
+      { src: REFLECTIONS_PATH, name: "reflections.jsonl" },
+      { src: RESOLVED_QUESTIONS_PATH, name: "resolved_questions.json" },
+    ];
 
-  for (const { src, name } of srcFiles) {
-    if (!existsSync(src)) continue;
-    const dest = join(snapshotDir, name);
-    await copyFile(src, dest);
-    files.push(dest);
-  }
+    for (const { src, name } of srcFiles) {
+      if (!existsSync(src)) continue;
+      const dest = join(snapshotDir, name);
+      await copyFile(src, dest);
+      files.push(dest);
+    }
 
-  return {
-    snapshot_dir: snapshotDir,
-    files,
-    timestamp: new Date().toISOString(),
-  };
+    return {
+      snapshot_dir: snapshotDir,
+      files,
+      timestamp: new Date().toISOString(),
+    };
+  }));
 }
 
 async function fileSize(path: string): Promise<number> {
@@ -4549,16 +4931,33 @@ async function fileSize(path: string): Promise<number> {
 }
 
 async function fileFingerprint(path: string): Promise<FileFingerprint> {
+  if (process.env.NODE_ENV === "test" && process.env.HERMES_TEST_FILE_FINGERPRINT_ERROR) {
+    const resources: Record<string, string> = {
+      store: STORE_PATH,
+      reflections: REFLECTIONS_PATH,
+      resolved_questions: RESOLVED_QUESTIONS_PATH,
+    };
+    const [resource, code, extra] = process.env.HERMES_TEST_FILE_FINGERPRINT_ERROR.split(":");
+    if (!extra && resources[resource] === path && ["EACCES", "EPERM", "EIO"].includes(code)) {
+      throw Object.assign(new Error(`injected fingerprint ${code} for ${resource}`), { code });
+    }
+  }
   try {
     const info = await stat(path);
-    return { size: info.size, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs };
-  } catch {
-    return { size: 0, mtimeMs: 0, ctimeMs: 0 };
+    return { exists: true, dev: info.dev, ino: info.ino, size: info.size, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs };
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return { exists: false, dev: 0, ino: 0, size: 0, mtimeMs: 0, ctimeMs: 0 };
+    }
+    throw error;
   }
 }
 
 function sameFingerprint(left: FileFingerprint, right: FileFingerprint): boolean {
-  return left.size === right.size
+  return left.exists === right.exists
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
     && left.mtimeMs === right.mtimeMs
     && left.ctimeMs === right.ctimeMs;
 }
@@ -4567,7 +4966,7 @@ function resolvedQuestionKey(reflectionId: string, questionIndex: number): strin
   return `${reflectionId}:${questionIndex}`;
 }
 
-async function loadResolvedQuestions(): Promise<ResolvedQuestionIndex> {
+async function loadResolvedQuestionsUnderBarrier(): Promise<ResolvedQuestionIndex> {
   const loaded = await readAuthoritativeJson<unknown>(RESOLVED_QUESTIONS_PATH, "resolved-question overlay");
   if (!loaded.exists) return {};
     const parsed = loaded.value;
@@ -4602,11 +5001,11 @@ async function saveResolvedQuestions(index: ResolvedQuestionIndex): Promise<void
 async function mutateResolvedQuestions(
   mutator: (index: ResolvedQuestionIndex) => void | Promise<void>,
 ): Promise<void> {
-  const run = resolvedQuestionsMutationQueue.then(async () => {
+  const run = resolvedQuestionsMutationQueue.then(() => withOperationJournalBarrier(async () => {
     await withFileLock(RESOLVED_QUESTIONS_PATH, async () => {
       // Reload inside the process-shared transaction so every writer merges
       // against the latest committed overlay rather than a local cache.
-      const index = await loadResolvedQuestions();
+      const index = await loadResolvedQuestionsUnderBarrier();
       await mutator(index);
       await saveResolvedQuestions(index);
       _resolvedQuestionsCache = {
@@ -4615,7 +5014,7 @@ async function mutateResolvedQuestions(
         fingerprint: await fileFingerprint(RESOLVED_QUESTIONS_PATH),
       };
     });
-  });
+  }));
   resolvedQuestionsMutationQueue = run.then(
     () => undefined,
     (error) => {
@@ -4664,11 +5063,14 @@ function resolveQuestionOverlay(
   };
 }
 
-async function mergeResolvedQuestionsIntoStore(store: ReflectionStore): Promise<ReflectionStore> {
-  const resolvedIndex = await getCachedResolvedQuestions();
+function mergeResolvedQuestionsIntoStore(
+  store: ReflectionStore,
+  resolvedIndex: ResolvedQuestionIndex,
+): ReflectionStore {
+  const isolated = structuredClone(store);
   return {
-    ...store,
-    reflections: store.reflections.map((reflection) => ({
+    ...isolated,
+    reflections: isolated.reflections.map((reflection) => ({
       ...reflection,
       open_questions: reflection.open_questions.map((question, index) => {
         const resolved = resolveQuestionOverlay(reflection.id, index, question, resolvedIndex);
@@ -4747,7 +5149,12 @@ export async function previewReplaceImportData(
   return preview;
 }
 
-export async function replaceStoreDataSnapshot(snapshot: ReflectionStore): Promise<void> {
+export interface StoreSnapshotReplacementResult {
+  store: ReflectionStore;
+  resolvedQuestions: ResolvedQuestionIndex;
+}
+
+function normalizeStoreDataSnapshotReplacement(snapshot: ReflectionStore): StoreSnapshotReplacementResult {
   assertImportObject(snapshot);
   const normalized = structuredClone(snapshot) as ReflectionStore;
   normalized.sessions = normalizeSessionsRecord(snapshot.sessions);
@@ -4762,21 +5169,26 @@ export async function replaceStoreDataSnapshot(snapshot: ReflectionStore): Promi
   );
   normalized.memory_board = normalizeMemoryBoard(snapshot.memory_board);
   normalized.user_profile = normalizeMemoryBoard(snapshot.user_profile, 1800);
-  normalized.version = typeof snapshot.version === "string" && snapshot.version ? snapshot.version : VERSION;
+  normalized.version = VERSION;
   const replacementResolvedIndex = resolvedQuestionsFromReflections(normalized.reflections);
+  return { store: normalized, resolvedQuestions: replacementResolvedIndex };
+}
+
+export async function replaceStoreDataSnapshot(snapshot: ReflectionStore): Promise<StoreSnapshotReplacementResult> {
+  const plan = normalizeStoreDataSnapshotReplacement(snapshot);
   await mutateStore((store) => {
-    store.sessions = normalized.sessions;
-    store.reflections = normalized.reflections;
-    store.heuristics = normalized.heuristics;
-    store.affordance_gaps = normalized.affordance_gaps;
-    store.memory_board = normalized.memory_board;
-    store.user_profile = normalized.user_profile;
-    store.version = normalized.version;
-  }, "rewrite");
-  await mutateResolvedQuestions(async (resolved) => {
+    store.sessions = plan.store.sessions;
+    store.reflections = plan.store.reflections;
+    store.heuristics = plan.store.heuristics;
+    store.affordance_gaps = plan.store.affordance_gaps;
+    store.memory_board = plan.store.memory_board;
+    store.user_profile = plan.store.user_profile;
+    store.version = plan.store.version;
+  }, "rewrite", undefined, undefined, undefined, async (resolved) => {
     for (const key of Object.keys(resolved)) delete resolved[key];
-    Object.assign(resolved, replacementResolvedIndex);
+    Object.assign(resolved, plan.resolvedQuestions);
   });
+  return structuredClone(plan);
 }
 
 export async function importData(
@@ -4916,26 +5328,20 @@ export async function importData(
       mergedResolvedIndex: mergedResolvedIndex ?? resolvedQuestionsFromReflections(mergedNewReflections),
       mergedNewReflections,
     };
-  }, incoming.reflections ? "rewrite" : "none", operationName, { incoming, mode });
-
-  if (mode === "replace" && incoming.reflections) {
-    await mutateResolvedQuestions(async (resolved) => {
+  }, incoming.reflections ? "rewrite" : "none", operationName, { incoming, mode }, undefined,
+  incoming.reflections ? async (resolved, result) => {
+    if (mode === "replace") {
       for (const key of Object.keys(resolved)) delete resolved[key];
-      Object.assign(resolved, mutationResult.replacementResolvedIndex ?? {});
-    });
-  }
-  if (mode === "merge" && mutationResult.mergedNewReflections.length > 0) {
-    const newResolvedEntries = mutationResult.mergedResolvedIndex ?? {};
-    if (Object.keys(newResolvedEntries).length > 0) {
-      await mutateResolvedQuestions(async (resolved) => {
+      Object.assign(resolved, result.replacementResolvedIndex ?? {});
+    } else if (result.mergedNewReflections.length > 0) {
+      const newResolvedEntries = result.mergedResolvedIndex ?? {};
+      if (Object.keys(newResolvedEntries).length > 0) {
         for (const [key, entry] of Object.entries(newResolvedEntries)) {
-          if (!resolved[key]) {
-            resolved[key] = entry;
-          }
+          if (!resolved[key]) resolved[key] = entry;
         }
-      });
+      }
     }
-  }
+  } : undefined);
 
   return mutationResult.counts;
 }
@@ -4943,12 +5349,10 @@ export async function importData(
 export async function clearData(collection: ClearCollection, operationName?: string): Promise<void> {
   await mutateStore((store) => {
     applyClearDataFields(store, collection);
-  }, collection === "reflections" || collection === "all" ? "rewrite" : "none", operationName, { collection });
-  if (collection === "reflections" || collection === "all") {
-    await mutateResolvedQuestions(async (resolved) => {
+  }, collection === "reflections" || collection === "all" ? "rewrite" : "none", operationName, { collection }, undefined,
+  collection === "reflections" || collection === "all" ? async (resolved) => {
       for (const key of Object.keys(resolved)) delete resolved[key];
-    });
-  }
+    } : undefined);
 }
 
 function applyClearDataFields(store: ReflectionStore, collection: ClearCollection): void {
@@ -5256,7 +5660,7 @@ function truncate(text: string, maxLen: number): string {
 export async function generateProjectExperienceMarkdown(
   options: ProjectExperienceMarkdownOptions = {},
 ): Promise<ProjectExperienceMarkdownResult | null> {
-  const cache = await getCachedStoreEntry();
+  const { cache, resolvedIndex } = await getCachedStoreAndResolvedQuestions();
   const store = cache.store;
   const limit = options.limit ?? 200;
 
@@ -5310,9 +5714,6 @@ export async function generateProjectExperienceMarkdown(
 
     if (selected.length === 0) return null;
   }
-
-  // Load resolved questions overlay once for filtering open questions
-  const resolvedIndex = await getCachedResolvedQuestions();
 
   // Date range from actual timestamps (min/max)
   const dateRange = computeDateRange(selected);
@@ -5738,9 +6139,8 @@ export async function getDomainSummary(
   topN = 10,
   includeOpenQuestionsDetail = false,
 ): Promise<DomainSummary | DomainSummary[]> {
-  const cache = await getCachedStoreEntry();
+  const { cache, resolvedIndex } = await getCachedStoreAndResolvedQuestions();
   const store = cache.store;
-  const resolvedIndex = await getCachedResolvedQuestions();
   const hasAnyResolved = Object.keys(resolvedIndex).length > 0;
 
   let activeGapsGlobal = 0;

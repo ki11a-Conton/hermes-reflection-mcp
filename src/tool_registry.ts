@@ -1,6 +1,7 @@
 import { z, type ZodTypeAny } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { ResponseModeSchema } from "./response_mode.js";
+import { CompactionMetadataSchema } from "./compaction_handoff.js";
 
 export type ToolProfile = "core" | "extended" | "admin";
 
@@ -141,6 +142,7 @@ export const ReflectOnTaskSchema = z.object({
   tags: nullableArray(z.string().max(100)),
   dry_run: z.boolean().default(false),
   response_mode: ResponseModeSchema,
+  idempotency_key: z.string().min(1).refine((value) => Array.from(value).length <= 128, "idempotency_key accepts at most 128 Unicode scalars.").optional(),
 });
 
 export const RetrieveHeuristicsSchema = z.object({
@@ -357,12 +359,14 @@ export const AppendSessionTurnSchema = z.object({
   role: z.enum(["user", "assistant"]),
   content: z.string().min(1).max(100000),
   timestamp: z.string().max(30).optional(),
+  project_key: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).optional(),
 });
 
 export const SearchSessionsSchema = z.object({
   query: z.string().max(1000).optional().default(""),
   limit: z.number().int().min(1).max(100).default(10),
   since_days: z.number().int().min(1).max(3650).optional(),
+  project_key: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).optional(),
   response_mode: ResponseModeSchema,
   cursor: z.string().max(4096).optional(),
 });
@@ -381,22 +385,31 @@ export const CaptureMemorySnapshotSchema = z.object({
   session_id: z.string().min(1).max(200),
 });
 
+const SessionStartMetadataSchema = z.object({
+  project_key: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).optional(),
+  model: z.string().min(1).max(100).regex(/^[^\r\n\0]+$/).optional(),
+  platform: z.string().min(1).max(100).regex(/^[^\r\n\0]+$/).optional(),
+  user_id: z.string().min(1).max(100).regex(/^[^\r\n\0]+$/).optional(),
+}).strict();
+
 export const SessionLifecycleHookSchema = z.object({
-  event: z.enum(["start", "end", "pause", "resume"]),
+  event: z.enum(["start", "end", "stop", "pause", "resume", "precompact", "postcompact"]),
   session_id: z.string().min(1).max(200),
   project_key: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).optional(),
-  metadata: z.object({
-    project_key: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).optional(),
-    model: z.string().min(1).max(100).regex(/^[^\r\n\0]+$/).optional(),
-    platform: z.string().min(1).max(100).regex(/^[^\r\n\0]+$/).optional(),
-    user_id: z.string().min(1).max(100).regex(/^[^\r\n\0]+$/).optional(),
-  }).strict().optional(),
+  metadata: z.union([SessionStartMetadataSchema, CompactionMetadataSchema]).optional(),
 }).strict().superRefine((value, context) => {
-  if (value.project_key && value.metadata?.project_key && value.project_key !== value.metadata.project_key) {
+  const metadataProjectKey = value.metadata && "project_key" in value.metadata ? value.metadata.project_key : undefined;
+  if (value.project_key && metadataProjectKey && value.project_key !== metadataProjectKey) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ["metadata", "project_key"], message: "project_key values must agree" });
   }
-  if (value.metadata && value.event !== "start") {
-    context.addIssue({ code: z.ZodIssueCode.custom, path: ["metadata"], message: "metadata is supported only for start" });
+  if (value.event === "postcompact") {
+    if (!value.metadata || !("generation" in value.metadata)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["metadata"], message: "postcompact requires bounded compaction metadata" });
+    }
+  } else if (value.metadata && value.event !== "start") {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["metadata"], message: "metadata is supported only for start or postcompact" });
+  } else if (value.event === "start" && "generation" in (value.metadata ?? {})) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["metadata"], message: "compaction metadata is not valid for start" });
   }
 });
 
@@ -411,6 +424,7 @@ export const ScrollSessionContextSchema = z.object({
   session_id: z.string().min(1).max(200),
   around_turn_index: z.number().int().min(0),
   window: z.number().int().min(1).max(50).default(5),
+  project_key: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).optional(),
   response_mode: ResponseModeSchema,
   cursor: z.string().max(4096).optional(),
 });
@@ -418,6 +432,7 @@ export const ScrollSessionContextSchema = z.object({
 export const TriggerBackgroundReviewSchema = z.object({
   action: z.enum(["run", "status"]).default("run"),
   session_id: z.string().min(1).max(200).optional(),
+  project_key: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).optional(),
   review_scope: z.enum(["recent", "full"]).default("recent"),
   review_mode: z.enum(["deterministic", "llm", "auto"]).default("deterministic"),
   auto_apply: z.boolean().default(false),
@@ -434,6 +449,7 @@ export const CompactSessionContextSchema = z.object({
   max_turns: z.number().int().min(1).max(200).default(40),
   max_chars: z.number().int().min(500).max(20000).default(6000),
   preserve_recent_user_turns: z.number().int().min(1).max(5).default(3),
+  project_key: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).optional(),
   response_mode: ResponseModeSchema,
   cursor: z.string().max(4096).optional(),
 });

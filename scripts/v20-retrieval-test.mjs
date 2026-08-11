@@ -370,8 +370,12 @@ try {
   assert.equal(betaReviewCandidate.state, "pending");
 
   const sessionStorage = await import(`../dist/session_storage.js?v20-detail=${Date.now()}`);
-  assert.equal(await sessionStorage.appendSessionTurn("detail-session", "user", "detail session turn", timestamp), true);
-  assert.equal(await sessionStorage.appendSessionTurn("beta-session", "user", "beta private session turn", timestamp), true);
+  assert.equal(await sessionStorage.appendSessionTurn(
+    "detail-session", "user", "detail session turn", timestamp, { scope: "global" },
+  ), true);
+  assert.equal(await sessionStorage.appendSessionTurn(
+    "beta-session", "user", "beta private session turn", timestamp, { scope: "project:beta" },
+  ), true);
   sessionStorage.closeSessionStorage();
   const scopeStorage = await import(`../dist/src/project_scope.js?v20-scope=${Date.now()}`);
   await scopeStorage.projectScopeRepository.bind("alpha-session", "alpha");

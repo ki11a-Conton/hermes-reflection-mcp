@@ -123,13 +123,28 @@ async function filesDigest(root) {
 async function hookCliTest(home) {
   const privateCwd = join(home, "raw-private-workspace", "project-a");
   await mkdir(privateCwd, { recursive: true });
+  const storeRoot = join(home, ".hermes-reflection");
+  const { deriveProjectKey, loadOrCreateProjectSalt } = await import("../dist/src/project_scope.js");
+  const salt = await loadOrCreateProjectSalt(join(storeRoot, "project_salt.bin"));
+  const key = deriveProjectKey(privateCwd, salt);
   const events = ["SessionStart", "Stop", "PreCompact", "PostCompact"];
+  const occurredAt = events.map(() => new Date().toISOString());
+  const compactionMetadata = {
+    generation: 1,
+    before_turn_count: 4,
+    after_turn_count: 2,
+    handoff_hash: "a".repeat(64),
+    truncated: true,
+    source_fingerprint: "b".repeat(64),
+  };
   for (let index = 0; index < events.length; index += 1) {
     const result = await runHook(home, privateCwd, JSON.stringify({
       hook_event_name: events[index],
       event_id: `event-${index}`,
       session_id: "hook-session",
-      occurred_at: new Date().toISOString(),
+      occurred_at: occurredAt[index],
+      ...(events[index] === "SessionStart" ? { scope_intent: "project", project_key: key } : {}),
+      ...(events[index] === "PostCompact" ? { metadata: compactionMetadata } : {}),
       transcript_path: join(privateCwd, "transcript-with-secret-token.txt"),
     }));
     assert.equal(result.code, 0, result.stderr);
@@ -139,17 +154,29 @@ async function hookCliTest(home) {
     assert.equal(receipt.accepted, true);
   }
 
+  const queuedEvents = (await readFile(join(storeRoot, "hook_inbox.jsonl"), "utf8"))
+    .trim()
+    .split(/\r?\n/)
+    .map((line) => JSON.parse(line));
+  assert.equal(queuedEvents.length, events.length);
+  for (const queued of queuedEvents) {
+    assert.equal(queued.project_key, key,
+      `${queued.event} did not carry the cwd-derived opaque project scope`);
+    assert.equal(queued.scope_intent, queued.event === "SessionStart" ? "project" : undefined);
+  }
+
   const duplicate = await runHook(home, privateCwd, JSON.stringify({
     hook_event_name: "SessionStart",
     event_id: "event-0",
     session_id: "hook-session",
-    occurred_at: new Date().toISOString(),
+    occurred_at: occurredAt[0],
+    scope_intent: "project",
+    project_key: key,
     transcript_path: "must-not-be-read-or-persisted",
   }));
   assert.equal(duplicate.code, 0, duplicate.stderr);
   assert.equal(JSON.parse(duplicate.stdout).duplicate, true);
 
-  const storeRoot = join(home, ".hermes-reflection");
   const beforeInvalid = await filesDigest(storeRoot);
   const malformed = await runHook(home, privateCwd, "{");
   assert.notEqual(malformed.code, 0);
@@ -193,14 +220,13 @@ async function hookCliTest(home) {
     hook_event_name: "SessionStart",
     event_id: "event-0",
     session_id: "hook-session",
-    occurred_at: new Date().toISOString(),
+    occurred_at: occurredAt[0],
+    scope_intent: "project",
+    project_key: key,
   }));
   assert.equal(completedDuplicate.code, 0, completedDuplicate.stderr);
   assert.equal(JSON.parse(completedDuplicate.stdout).duplicate, true, "completed event IDs remain idempotent");
 
-  const { deriveProjectKey, loadOrCreateProjectSalt } = await import("../dist/src/project_scope.js");
-  const salt = await loadOrCreateProjectSalt(join(storeRoot, "project_salt.bin"));
-  const key = deriveProjectKey(privateCwd, salt);
   assert.match(key, /^project:[a-f0-9]{64}$/);
   assert.equal(key, deriveProjectKey(privateCwd, salt));
   assert.notEqual(key, deriveProjectKey(join(home, "another-project"), salt));

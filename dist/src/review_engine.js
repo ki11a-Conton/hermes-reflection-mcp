@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import { exportData, safeHeuristicText, scanHeuristicThreats, } from "../storage.js";
-import { getLlmReviewReadiness, runLlmReview } from "./llm_review.js";
+import { exportData, reviewCandidateEvidenceFingerprint, safeHeuristicText, scanHeuristicThreats, } from "../storage.js";
+import { getLlmReviewReadiness, getLlmReviewSemanticFingerprint, runLlmReview, } from "./llm_review.js";
 import { redactSensitiveText } from "./redaction.js";
 import { autoApplyReviewCandidate, enqueueReviewCandidates } from "./review_queue.js";
+import { semanticReviewRiskReasons } from "./review_risk.js";
 export const MAX_RECENT_REFLECTIONS = 10;
 export const MAX_FULL_REFLECTIONS = 200;
 export const MAX_REVIEW_CANDIDATES = 50;
@@ -11,7 +12,18 @@ export function normalizeCandidateText(text) {
     return text.trim().replace(/\s+/g, " ").toLowerCase();
 }
 export function reviewSingleFlightKey(options) {
-    return `${options.session_id}:${options.stage}:${options.source_fingerprint}`;
+    return createHash("sha256").update(JSON.stringify({
+        session_id: options.session_id,
+        target_scope: options.scope,
+        review_scope: options.review_scope,
+        stage: options.stage,
+        review_mode: options.review_mode,
+        source_fingerprint: options.source_fingerprint,
+        auto_apply: options.auto_apply,
+        provider_semantic_fingerprint: options.review_mode === "deterministic"
+            ? "not-applicable"
+            : getLlmReviewSemanticFingerprint(),
+    }), "utf8").digest("hex");
 }
 export function inFlightReview(options) {
     return inFlight.get(reviewSingleFlightKey(options));
@@ -28,20 +40,6 @@ function strictDerivedText(value) {
 }
 function boundedCandidateText(value) {
     return Array.from(value).slice(0, 1_000).join("");
-}
-function semanticCandidateRisks(value) {
-    const risks = [];
-    const checks = [
-        [/\b(?:api[ _-]?key|token|password|secret|credential)s?\b|凭据|密钥|密码/i, "secret_or_credential"],
-        [/\b(?:delete|remove|erase|clear|drop|purge)\b|删除|清除/i, "deletion"],
-        [/\b(?:overwrite|replace existing|truncate)\b|覆盖/i, "overwrite"],
-        [/\b(?:identity|impersonat|user profile|memory board)\b|身份/i, "identity_change"],
-        [/\b(?:permission|privilege|administrator|sudo|chmod)\b|权限/i, "permission_change"],
-    ];
-    for (const [pattern, reason] of checks)
-        if (pattern.test(value))
-            risks.push(reason);
-    return risks;
 }
 function conflictShape(value) {
     const normalized = value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
@@ -71,7 +69,7 @@ function extractedRiskReasons(raw, sanitized, sourceIds, threats) {
     return [...new Set([
             ...(Array.from(raw).length > 1_000 ? ["oversized_payload"] : []),
             ...(rawNormalized !== safeNormalized && /\[REDACTED/i.test(sanitized) ? ["secret_or_credential"] : []),
-            ...semanticCandidateRisks(raw),
+            ...semanticReviewRiskReasons(raw),
             ...(threats.length > 0 ? ["injection_or_threat"] : []),
             ...threats.map((threat) => `threat:${threat}`),
             ...(sourceIds.length === 0 ? ["missing_evidence"] : []),
@@ -93,7 +91,7 @@ export function buildDeterministicReviewCandidates(reflections, existingHeuristi
             const threatPatterns = scanHeuristicThreats(lesson, "strict");
             candidates.push({
                 heuristic: threatPatterns.length > 0 ? safeHeuristicText(heuristic) : heuristic,
-                source_reflection_id: reflection.id,
+                source_reflection_ids: [reflection.id],
                 domain: reflection.domain,
                 confidence: 0.65,
                 tags: [...new Set([...(reflection.tags ?? []), "background-review"])],
@@ -125,7 +123,7 @@ export function reviewSourceFingerprint(reflections) {
     }));
     return createHash("sha256").update(JSON.stringify(source), "utf8").digest("hex");
 }
-function llmCandidates(llm, existingHeuristics, fallbackSourceId) {
+function llmCandidates(llm, existingHeuristics) {
     const seen = new Set(existingHeuristics);
     const candidates = [];
     for (const item of llm.candidates) {
@@ -139,7 +137,7 @@ function llmCandidates(llm, existingHeuristics, fallbackSourceId) {
         const threatPatterns = scanHeuristicThreats(heuristic, "strict");
         candidates.push({
             heuristic: threatPatterns.length > 0 ? safeHeuristicText(heuristic) : heuristic,
-            source_reflection_id: llm.source_reflection_ids[0] ?? fallbackSourceId,
+            source_reflection_ids: [...item.source_reflection_ids],
             domain: item.domain,
             confidence: item.confidence,
             tags: [...new Set([...item.tags, "background-review"])],
@@ -156,14 +154,16 @@ function sanitizeLlmAudit(result) {
 }
 export async function runReview(options) {
     const store = await exportData();
+    // Scope is an authorization boundary, not a label. Filter it before source
+    // selection, fingerprinting, provider input, or heuristic comparisons.
     const allSessionReflections = store.reflections
-        .filter((reflection) => reflection.session_id === options.session_id)
+        .filter((reflection) => reflection.session_id === options.session_id && reflection.scope === options.scope)
         .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
     const reviewedReflections = options.review_scope === "recent"
         ? allSessionReflections.slice(-MAX_RECENT_REFLECTIONS)
         : allSessionReflections.slice(-MAX_FULL_REFLECTIONS);
     const existingHeuristics = new Set(store.heuristics
-        .filter((heuristic) => !heuristic.superseded_by)
+        .filter((heuristic) => !heuristic.superseded_by && heuristic.scope === options.scope)
         .map((heuristic) => normalizeCandidateText(heuristic.heuristic)));
     const fingerprint = reviewSourceFingerprint(reviewedReflections);
     let modeUsed = "deterministic";
@@ -174,7 +174,7 @@ export async function runReview(options) {
         llmResult = await runLlmReview(reviewedReflections, { signal: options.signal });
         if (llmResult.success) {
             modeUsed = "llm";
-            candidateHeuristics = llmCandidates(llmResult, existingHeuristics, reviewedReflections.at(-1)?.id);
+            candidateHeuristics = llmCandidates(llmResult, existingHeuristics);
         }
         else if (options.review_mode === "llm") {
             return {
@@ -221,12 +221,29 @@ export async function runReview(options) {
         candidateHeuristics = buildDeterministicReviewCandidates(reviewedReflections, existingHeuristics);
     }
     candidateHeuristics = candidateHeuristics.slice(0, MAX_REVIEW_CANDIDATES);
+    const exactSources = new Map(reviewedReflections.map((reflection) => [reflection.id, reflection]));
+    const providerSources = new Set(modeUsed === "llm"
+        ? (llmResult?.source_reflection_ids ?? [])
+        : reviewedReflections.map((reflection) => reflection.id));
+    for (const candidate of candidateHeuristics) {
+        const uniqueIds = [...new Set(candidate.source_reflection_ids)];
+        const evidenceValid = candidate.source_reflection_ids.length > 0
+            && uniqueIds.length === candidate.source_reflection_ids.length
+            && uniqueIds.every((id) => providerSources.has(id)
+                && exactSources.get(id)?.scope === options.scope);
+        if (!evidenceValid) {
+            candidate.risk_reasons = [...new Set([...(candidate.risk_reasons ?? []), "missing_or_invalid_evidence"])];
+        }
+        else if (!uniqueIds.some((id) => exactSources.get(id)?.task_outcome === "success")) {
+            candidate.risk_reasons = [...new Set([...(candidate.risk_reasons ?? []), "unresolved_failure"])];
+        }
+    }
     for (const candidate of candidateHeuristics) {
         if (conflictsWithExisting(candidate.heuristic, existingHeuristics)) {
             candidate.risk_reasons = [...new Set([...(candidate.risk_reasons ?? []), "conflicting_memory"])];
         }
     }
-    const scope = options.scope ?? reviewedReflections[0]?.scope ?? "global";
+    const scope = options.scope;
     if (options.source_fingerprint && options.source_fingerprint !== fingerprint) {
         throw new Error("Review source changed before candidate generation");
     }
@@ -234,9 +251,8 @@ export async function runReview(options) {
         scope,
         stage: modeUsed,
         source_fingerprint: fingerprint,
-        source_reflection_ids: [candidate.source_reflection_id]
-            .filter((id) => typeof id === "string" && id.length > 0)
-            .slice(0, 50),
+        evidence_fingerprint: reviewCandidateEvidenceFingerprint(reviewedReflections, candidate.source_reflection_ids),
+        source_reflection_ids: candidate.source_reflection_ids.slice(0, 50),
         heuristic: candidate.heuristic,
         domain: candidate.domain,
         tags: candidate.tags,
@@ -334,10 +350,16 @@ export function runReviewSingleFlight(options) {
     inFlight.set(key, started);
     return started;
 }
-export async function getReviewSourceState(sessionId, reviewScope = "recent") {
+export async function getReviewSourceState(sessionId, reviewScope = "recent", requestedScope) {
     const store = await exportData();
-    const allSessionReflections = store.reflections
-        .filter((reflection) => reflection.session_id === sessionId)
+    const sessionReflections = store.reflections.filter((reflection) => reflection.session_id === sessionId);
+    const scopes = new Set(sessionReflections.map((reflection) => reflection.scope));
+    if (!requestedScope && scopes.size > 1) {
+        throw new Error("Review source scope is ambiguous; provide the persisted session scope");
+    }
+    const scope = requestedScope ?? sessionReflections[0]?.scope;
+    const allSessionReflections = sessionReflections
+        .filter((reflection) => reflection.scope === scope)
         .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
     const reviewed = reviewScope === "recent"
         ? allSessionReflections.slice(-MAX_RECENT_REFLECTIONS)
@@ -345,7 +367,7 @@ export async function getReviewSourceState(sessionId, reviewScope = "recent") {
     return {
         source_fingerprint: reviewSourceFingerprint(reviewed),
         reflection_count: reviewed.length,
-        ...(reviewed.at(-1)?.scope ? { scope: reviewed.at(-1).scope } : {}),
+        ...(scope ? { scope } : {}),
     };
 }
 export function getReviewReadinessStatus() {

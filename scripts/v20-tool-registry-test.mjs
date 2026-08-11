@@ -53,6 +53,7 @@ await withTempHome("registry", async (home) => {
   try {
     const listed = await peer.client.listTools();
     const instructions = peer.client.getInstructions() ?? "";
+    assert.ok(instructions.trim().length > 0, "server instructions must not be empty");
     assert.ok(Array.from(instructions).length <= 512, `server instructions=${Array.from(instructions).length}`);
     const names = listed.tools.map((tool) => tool.name);
     assert.equal(names.length, 29, "v20 complete surface must contain 29 tools");
@@ -63,11 +64,11 @@ await withTempHome("registry", async (home) => {
     assert.ok(Math.max(...listed.tools.map((tool) => Array.from(tool.description ?? "").length)) <= 512);
 
     const byName = new Map(listed.tools.map((tool) => [tool.name, tool]));
-    const coreMetadata = core.reduce((sum, name) => {
+    const coreMetadata = Array.from(instructions).length + core.reduce((sum, name) => {
       const tool = byName.get(name);
       assert.ok(tool, `core tool ${name} must be registered`);
+      assert.ok((tool.description ?? "").trim().length > 0, `core tool ${name} description must not be empty`);
       return sum
-        + Array.from(instructions).length
         + Array.from(tool.description ?? "").length
         + Array.from(JSON.stringify(tool.inputSchema)).length;
     }, 0);
@@ -76,6 +77,12 @@ await withTempHome("registry", async (home) => {
     for (const name of ["delete_heuristic", "import_data", "approve_pending_mutation", "clear_data"]) {
       assert.equal(byName.get(name)?.annotations?.destructiveHint, true, `${name} must be destructive`);
     }
+
+    const lifecycle = await peer.client.callTool({
+      name: "session_lifecycle_hook",
+      arguments: { event: "start", session_id: "schema-parity" },
+    });
+    assert.notEqual(lifecycle.isError, true, "schema parity session must have explicit global lifecycle provenance");
 
     const parityCases = [
       ["scroll_session_context", { session_id: "schema-parity", around_turn_index: 0, window: 1 }, true],

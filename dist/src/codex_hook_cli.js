@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { HookEventSchema, MAX_HOOK_INPUT_BYTES, hookInbox } from "./hook_inbox.js";
 import { deriveProjectKey, loadOrCreateProjectSalt } from "./project_scope.js";
+import { CompactionMetadataSchema } from "./compaction_handoff.js";
 const HookInputSchema = z.object({
     hook_event_name: z.enum(["SessionStart", "Stop", "SessionEnd", "PreCompact", "PostCompact"]).optional(),
     event: z.enum(["SessionStart", "Stop", "SessionEnd", "PreCompact", "PostCompact"]).optional(),
@@ -12,6 +13,7 @@ const HookInputSchema = z.object({
     timestamp: z.string().refine((value) => Number.isFinite(Date.parse(value))).optional(),
     transcript_path: z.unknown().optional(),
     cwd: z.unknown().optional(),
+    metadata: CompactionMetadataSchema.optional(),
 }).passthrough().superRefine((value, context) => {
     if (!value.hook_event_name && !value.event) {
         context.addIssue({ code: z.ZodIssueCode.custom, path: ["hook_event_name"], message: "event is required" });
@@ -38,19 +40,32 @@ async function main() {
     const raw = await readBoundedStdin();
     const input = HookInputSchema.parse(JSON.parse(raw.toString("utf8")));
     const event = input.hook_event_name ?? input.event;
+    const projectKey = deriveProjectKey(process.cwd(), await loadOrCreateProjectSalt());
+    const explicitOccurredAt = input.occurred_at ?? input.timestamp;
+    const canonicalExplicitOccurredAt = explicitOccurredAt === undefined
+        ? undefined
+        : new Date(explicitOccurredAt).toISOString();
+    const canonicalGeneratedInput = JSON.stringify({
+        schema_version: 1,
+        event,
+        session_id: input.session_id,
+        project_key: projectKey,
+        ...(canonicalExplicitOccurredAt ? { occurred_at: canonicalExplicitOccurredAt } : {}),
+        ...(event === "PostCompact" && input.metadata ? { metadata: input.metadata } : {}),
+    });
+    const generatedDigest = createHash("sha256").update(canonicalGeneratedInput, "utf8").digest("hex");
     const eventId = input.event_id
-        ?? `hook:${createHash("sha256").update(raw).digest("hex").slice(0, 40)}`;
-    const occurredAt = new Date(input.occurred_at ?? input.timestamp ?? Date.now()).toISOString();
-    const projectKey = event === "SessionStart"
-        ? deriveProjectKey(process.cwd(), await loadOrCreateProjectSalt())
-        : undefined;
+        ?? `hook:${canonicalExplicitOccurredAt ? "" : "auto:"}${generatedDigest.slice(0, 40)}`;
+    const occurredAt = canonicalExplicitOccurredAt ?? new Date().toISOString();
     const receipt = await hookInbox.enqueue(HookEventSchema.parse({
         schema_version: 1,
         event_id: eventId,
         event,
         session_id: input.session_id,
         occurred_at: occurredAt,
-        ...(projectKey ? { project_key: projectKey } : {}),
+        ...(canonicalExplicitOccurredAt === undefined ? { occurred_at_source: "received" } : {}),
+        project_key: projectKey,
+        ...(event === "PostCompact" && input.metadata ? { metadata: input.metadata } : {}),
     }));
     process.stdout.write(`${JSON.stringify({ ok: true, ...receipt })}\n`);
 }

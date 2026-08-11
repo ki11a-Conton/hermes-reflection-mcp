@@ -1,5 +1,26 @@
 # Changelog
 
+## 21.0.0 - 2026-08-09
+
+### Agent-first safety and compatibility
+
+- Preserved the exact ordered 10-tool default profile and exact 29-tool unique compatibility surface.
+- Tightened missing, conflicting, stale, and cross-project session-scope failures so they return structured errors without mutation.
+- Added optional reflection idempotency keys with durable bounded receipts, replay equivalence, conflict detection, and restart-safe garbage collection.
+
+### Lifecycle, review, and recovery
+
+- Added a bounded hook inbox pump with a verified polling contract of no more than five seconds and a default no more than one second; no throughput or end-to-end latency claim is made.
+- Added strict `PostCompact` metadata, durable hashed receipts, replay/conflict checks, restart persistence, and deterministic current-request/reverse-signal handoffs.
+- Added forward transaction recovery for reflection, heuristic, feedback, and approval writes. Committing recovery consumes a bounded durable receipt instead of replaying mutations.
+- Revalidated LLM candidates under the authoritative lock against exact scope, evidence, freshness, content identity, approval state, and fencing tokens to prevent mislearning and close TOCTOU windows.
+
+### Operations
+
+- Kept deterministic review available while LLM review, background lifecycle, and automatic persistence remain separately configurable.
+- Documented clean staging, separate code/data backup, migration validation, and matched code/data rollback while retaining the v20 compatibility layer and store schema 2.
+- Refreshed the locked `fast-uri`, `hono`, and `ip-address` transitive dependencies to audited versions that remove known production advisories.
+
 ## 20.0.0 - 2026-07-29
 
 ### Agent-first interface

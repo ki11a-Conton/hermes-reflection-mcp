@@ -1,6 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "fs/promises";
+import { mkdir, mkdtemp, readFile, rm, rmdir, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -76,39 +76,60 @@ function assertIncludes(value, needle, message) {
 async function runSessionStorageRetryRegression() {
   const bug02Home = await mkdtemp(join(tmpdir(), "hermes-smoke-bug02-"));
   const bug02StoreDir = join(bug02Home, ".hermes-reflection");
+  const bug02DbPath = join(bug02StoreDir, "sessions.db");
+  const retryIntervalMs = 20;
   const prevHome = process.env.HOME;
   const prevUserProfile = process.env.USERPROFILE;
   const prevRetry = process.env.HERMES_SESSION_RETRY_MS;
   const originalConsoleError = console.error;
   const originalConsoleWarn = console.warn;
+  let bug02Session;
 
   try {
-    await writeFile(bug02StoreDir, "blocking file to prevent mkdir/open", "utf-8");
-    process.env.HERMES_SESSION_RETRY_MS = "1";
+    await mkdir(bug02StoreDir, { recursive: true });
+    await mkdir(bug02DbPath);
+    process.env.HERMES_SESSION_RETRY_MS = String(retryIntervalMs);
     process.env.HOME = bug02Home;
     process.env.USERPROFILE = bug02Home;
     console.error = () => {};
     console.warn = () => {};
 
-    const bug02Session = await import("../dist/session_storage.js?bug02=" + Date.now());
-    const initialAppend = await bug02Session.appendSessionTurn("bug02-session", "user", "test");
-    assert(initialAppend === false, "BUG-02: appendSessionTurn should return false when db is unavailable.");
+    bug02Session = await import("../dist/session_storage.js?bug02=" + Date.now());
+    const initialAppend = await bug02Session.appendSessionTurn(
+      "bug02-session", "user", "test", undefined, { scope: "global" },
+    );
+    assert(initialAppend === false, "BUG-02: appendSessionTurn should return false when sessions.db is unavailable.");
 
     const initialSearch = await bug02Session.searchSessions("test", 5);
-    assert(initialSearch === null, "BUG-02: searchSessions should return null when db is unavailable.");
+    assert(initialSearch === null, "BUG-02: searchSessions should return null when sessions.db is unavailable.");
 
-    await rm(bug02StoreDir);
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await rmdir(bug02DbPath);
+    await new Promise((resolve) => setTimeout(resolve, retryIntervalMs + 30));
 
-    const recoveryAppend = await bug02Session.appendSessionTurn("bug02-session", "user", "recovery test");
+    const recoveryAppend = await bug02Session.appendSessionTurn(
+      "bug02-session", "user", "sqlite retry recovery token", undefined, { scope: "global" },
+    );
     assert(recoveryAppend === true, "BUG-02: appendSessionTurn should recover after retry interval.");
 
-    bug02Session.closeSessionStorage();
+    const recoverySearch = await bug02Session.searchSessions("sqlite retry recovery token", 5);
+    assert(
+      recoverySearch?.some((result) => result.session_id === "bug02-session") === true,
+      "BUG-02: searchSessions should find data written after SQLite storage recovers.",
+    );
   } finally {
+    bug02Session?.closeSessionStorage();
     console.error = originalConsoleError;
     console.warn = originalConsoleWarn;
-    process.env.HOME = prevHome;
-    process.env.USERPROFILE = prevUserProfile;
+    if (prevHome !== undefined) {
+      process.env.HOME = prevHome;
+    } else {
+      delete process.env.HOME;
+    }
+    if (prevUserProfile !== undefined) {
+      process.env.USERPROFILE = prevUserProfile;
+    } else {
+      delete process.env.USERPROFILE;
+    }
     if (prevRetry !== undefined) {
       process.env.HERMES_SESSION_RETRY_MS = prevRetry;
     } else {
@@ -303,7 +324,7 @@ try {
   clientHomes.set(client, tempHome);
 
   const serverVersion = client.getServerVersion();
-  assert(serverVersion?.version === "20.0.0", `Expected server version 20.0.0, got ${JSON.stringify(serverVersion)}.`);
+  assert(serverVersion?.version === "21.0.0", `Expected server version 21.0.0, got ${JSON.stringify(serverVersion)}.`);
 
   const { tools } = await client.listTools();
   const toolNames = tools.map((tool) => tool.name);
@@ -405,6 +426,10 @@ try {
     "bounded handoff should preserve the latest assistant anchor.",
   );
 
+  await call(client, "session_lifecycle_hook", {
+    event: "start",
+    session_id: "compact-empty-session",
+  });
   const emptyCompact = JSON.parse(text(await call(client, "compact_session_context", {
     session_id: "compact-empty-session",
     max_turns: 20,
@@ -414,6 +439,10 @@ try {
   assert(emptyCompact.success === true, "empty-session compaction should still succeed.");
   assert(emptyCompact.source.turns_considered === 0, "empty-session compaction should report zero turns.");
   assertIncludes(emptyCompact.message, "No stored turns found", "empty-session compaction should explain the empty result.");
+  await call(client, "session_lifecycle_hook", {
+    event: "end",
+    session_id: "compact-empty-session",
+  });
 
   const boardAdd = JSON.parse(text(await call(client, "memory_board_write", {
     action: "add",
@@ -475,7 +504,10 @@ try {
   assert(!unsafeBoardRead.includes("ignore previous instructions"), "memory_board_read should mask imported unsafe content.");
   const unsafeMemoryScanText = text(await call(client, "scan_memory_threats", { target: "memory", scope: "strict" }));
   const unsafeMemoryScan = JSON.parse(unsafeMemoryScanText);
-  assert(unsafeMemoryScan.threats_found >= 1, "scan_memory_threats should inspect raw imported memory entries.");
+  assert(
+    unsafeMemoryScan.threats_found >= 1,
+    `scan_memory_threats should inspect raw imported memory entries.\n${unsafeMemoryScanText}`,
+  );
   assert(unsafeMemoryScan.details.some((item) => item.entry_id === "unsafe-memory-id"), "scanner should report the real MemoryEntry id.");
   assert(unsafeMemoryScan.details.some((item) => item.entry_id === "unsafe-nfkc-id"), "scanner should normalize compatibility Unicode before matching.");
   assert(!unsafeMemoryScanText.includes("ignore previous instructions"), "scanner must not echo unsafe raw text.");
@@ -526,7 +558,7 @@ try {
   })));
   assert(
     reflectResult.success === true && reflectResult.persisted === true && typeof reflectResult.reflection_id === "string",
-    "reflect_on_task should return a persisted v20 reflection receipt.",
+    "reflect_on_task should return a persisted v21 reflection receipt.",
   );
 
   assertIncludes(text(await call(client, "get_recent_reflections", { limit: 5 })), "smoke simplified reflection task", "get_recent_reflections should include the reflection.");
@@ -724,7 +756,7 @@ try {
   assertIncludes(text(await call(client, "clear_data", { collection: "all", confirm: true })), "Cleared", "clear_data(all) should clear the store.");
   assertIncludes(text(await call(client, "memory_board_read")), "(empty)", "memory_board_read should be empty after clear_data(all).");
 
-  console.log("Smoke passed for hermes-reflection-mcp v20.0.0 core tool surface.");
+  console.log("Smoke passed for hermes-reflection-mcp v21.0.0 core tool surface.");
 } finally {
   await client.close().catch(() => {});
   process.env.HOME = originalHome;

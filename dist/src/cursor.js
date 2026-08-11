@@ -1,6 +1,12 @@
 import { Buffer } from "node:buffer";
-import { createHash } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { HermesError } from "./errors.js";
+// Cursors are process-local capabilities. A restart intentionally invalidates
+// outstanding cursors instead of accepting client-edited pagination state.
+const CURSOR_AUTH_SECRET = randomBytes(32);
+function cursorMac(payload) {
+    return createHmac("sha256", CURSOR_AUTH_SECRET).update(payload, "utf8").digest();
+}
 function canonical(value) {
     if (Array.isArray(value))
         return value.map(canonical);
@@ -17,7 +23,8 @@ export function queryHash(value) {
         .digest("hex");
 }
 export function encodeCursor(value) {
-    return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+    const payload = Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+    return `${payload}.${cursorMac(payload).toString("base64url")}`;
 }
 function stale(reason) {
     return new HermesError("CURSOR_STALE", reason, false, "Restart the query without a cursor.");
@@ -48,9 +55,28 @@ export function decodeCursor(raw, expected) {
     if (typeof raw !== "string" || raw.length === 0 || raw.length > 4_096) {
         throw stale("Cursor is invalid.");
     }
+    const separator = raw.indexOf(".");
+    if (separator <= 0 || separator !== raw.lastIndexOf("."))
+        throw stale("Cursor authentication failed.");
+    const payload = raw.slice(0, separator);
+    const encodedMac = raw.slice(separator + 1);
+    if (!/^[A-Za-z0-9_-]+$/.test(payload) || !/^[A-Za-z0-9_-]{43}$/.test(encodedMac)) {
+        throw stale("Cursor authentication failed.");
+    }
+    let suppliedMac;
+    try {
+        suppliedMac = Buffer.from(encodedMac, "base64url");
+    }
+    catch {
+        throw stale("Cursor authentication failed.");
+    }
+    const expectedMac = cursorMac(payload);
+    if (suppliedMac.length !== expectedMac.length || !timingSafeEqual(suppliedMac, expectedMac)) {
+        throw stale("Cursor authentication failed.");
+    }
     let parsed;
     try {
-        parsed = cursorPayload(JSON.parse(Buffer.from(raw, "base64url").toString("utf8")));
+        parsed = cursorPayload(JSON.parse(Buffer.from(payload, "base64url").toString("utf8")));
     }
     catch (error) {
         if (error instanceof HermesError)

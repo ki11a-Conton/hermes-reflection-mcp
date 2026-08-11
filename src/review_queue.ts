@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { MemoryScope, PendingMutation, ReviewCandidate } from "../types.js";
 import {
+  applyClaimedReviewCandidateMutation,
   completeReviewCandidateMutation,
   claimPendingMutation,
   enqueueReviewCandidateRecords,
@@ -10,8 +11,6 @@ import {
   releasePendingMutation,
   reviewCandidateCounts,
   reviewCandidateIdsExist,
-  upsertHeuristicsBatch,
-  validateReviewCandidateMutation,
 } from "../storage.js";
 
 export type ReviewCandidateInput = Omit<ReviewCandidate, "id" | "created_at" | "state" | "mutation_id">;
@@ -21,6 +20,8 @@ function candidateId(input: ReviewCandidateInput): string {
     scope: input.scope,
     stage: input.stage,
     source_fingerprint: input.source_fingerprint,
+    evidence_fingerprint: input.evidence_fingerprint,
+    source_reflection_ids: [...input.source_reflection_ids].sort(),
     heuristic: input.heuristic.trim().replace(/\s+/g, " ").toLowerCase(),
     domain: input.domain,
   }), "utf8").digest("hex");
@@ -57,17 +58,10 @@ export async function replayReviewCandidateMutation(mutation: PendingMutation): 
   candidate: ReviewCandidate;
   heuristic_id: string;
 }> {
-  const candidate = await validateReviewCandidateMutation(mutation);
-  const [saved] = await upsertHeuristicsBatch([{
-    scope: candidate.scope,
-    domain: candidate.domain,
-    heuristic: candidate.heuristic,
-    source_task: `${candidate.stage}_background_review:${candidate.source_fingerprint.slice(0, 12)}`,
-    confidence: candidate.confidence,
-    tags: candidate.tags,
-  }]);
-  if (!saved) throw new Error(`Review candidate ${candidate.id} did not produce a heuristic`);
-  return { candidate, heuristic_id: saved.id };
+  if (!mutation.claim_token) throw new Error(`Review candidate mutation ${mutation.id} is not claimed`);
+  const applied = await applyClaimedReviewCandidateMutation(mutation.id, mutation.claim_token);
+  if (!applied) throw new Error(`Review candidate mutation ${mutation.id} lost its claim`);
+  return { candidate: applied.candidate, heuristic_id: applied.heuristic.id };
 }
 
 export async function completeReviewCandidate(
@@ -87,8 +81,6 @@ export async function autoApplyReviewCandidate(candidate: ReviewCandidate): Prom
   if (!claim) return null;
   try {
     const replayed = await replayReviewCandidateMutation(claim.mutation);
-    const completed = await completeReviewCandidate(claim.mutation.id, claim.claimToken);
-    if (!completed) throw new Error(`Review candidate ${candidate.id} replayed but was not finalized`);
     return { heuristic_id: replayed.heuristic_id };
   } catch (error) {
     await releasePendingMutation(claim.mutation.id, claim.claimToken);

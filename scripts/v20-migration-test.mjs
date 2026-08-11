@@ -236,13 +236,25 @@ async function testScopeRepository() {
     assert.equal(await restarted.resolve({ session_id: "session-a" }), "project:alpha");
     assert.equal(await restarted.resolve({ session_id: "session-a", project_key: "beta" }), "project:beta");
     await assert.rejects(() => restarted.bind("unsafe/session", "alpha"), /session_id/i);
-    for (let index = 0; index < 105; index += 1) {
+    for (let index = 0; index < 99; index += 1) {
       await restarted.bind(`session-${String(index).padStart(3, "0")}`, `project-${index}`);
     }
-    const state = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(Object.keys(state.bindings).length, 100);
+    const rejectedSession = "session-overflow";
+    await assert.rejects(
+      () => restarted.bind(rejectedSession, "project-overflow"),
+      (error) => error?.code === "LIFECYCLE_NOT_READY" && /capacity.*full/i.test(error.message),
+    );
+    const fullState = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(Object.keys(fullState.bindings).length, 100);
+    assert.equal(fullState.bindings["session-a"].scope, "project:alpha");
+    assert.equal(fullState.bindings[rejectedSession], undefined);
+
     await restarted.release("session-a");
     assert.equal(await restarted.resolve({ session_id: "session-a" }), "global");
+    assert.equal(await restarted.bind(rejectedSession, "project-overflow"), "project:project-overflow");
+    const reusedState = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(Object.keys(reusedState.bindings).length, 100);
+    assert.equal(reusedState.bindings[rejectedSession].scope, "project:project-overflow");
 
     const corrupt = JSON.stringify({ schema_version: 2, bindings: {} });
     await writeFile(path, corrupt, "utf8");

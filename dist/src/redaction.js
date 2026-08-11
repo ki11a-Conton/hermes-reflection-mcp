@@ -3,6 +3,7 @@ const PROVIDER_TOKEN_RE = /\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_.-]{8
 const SECRET_ASSIGNMENT_RE = /\b(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|secret)\b\s*[:=]\s*["']?[^\s,"']{8,}["']?/gi;
 const CREDENTIAL_URI_RE = /\b([a-z][a-z0-9+.-]*:\/\/)[^\s\/@:]+:[^\s\/@]+@/gi;
 const WINDOWS_USER_RE = /\b[A-Za-z]:\\Users\\[^\\\s]+/gi;
+const AUTHORIZATION_HEADER_RE = /\b(authorization\s*:\s*(?:bearer|basic))\s+[^\s,]+/gi;
 const STRICT_URL_PARAM_NAMES = new Set([
     "access_token",
     "refresh_token",
@@ -69,7 +70,8 @@ export function redactSensitiveText(value, options = {}) {
         .replace(PROVIDER_TOKEN_RE, "[REDACTED TOKEN]")
         .replace(SECRET_ASSIGNMENT_RE, (_match, name) => `${name}=[REDACTED]`)
         .replace(CREDENTIAL_URI_RE, "$1[REDACTED]@")
-        .replace(WINDOWS_USER_RE, "C:\\Users\\<USER>");
+        .replace(WINDOWS_USER_RE, "C:\\Users\\<USER>")
+        .replace(AUTHORIZATION_HEADER_RE, "$1 [REDACTED]");
     return options.strictHistorical
         ? compatible.replaceAll(STRICT_URL_VALUE_SENTINEL, "[REDACTED]")
         : compatible;

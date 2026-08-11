@@ -59,6 +59,9 @@ jobs:
       - name: Deterministic v20 suites
         run: npm run test:v20
 
+      - name: v21 lifecycle, transaction, safety, and release suites
+        run: npm run test:v21
+
       - name: Single and cross-process concurrency
         run: npm run test:concurrency
 

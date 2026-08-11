@@ -1,6 +1,16 @@
-# Hermes Reflection MCP v20.0.0
+# Hermes Reflection MCP v21.0.0
 
-Hermes Reflection MCP 是面向 Codex Desktop 的本地 Agent-first 记忆与反思服务器。v20 保留兼容旧客户端的 29 个完整工具，但推荐配置只向 Agent 暴露 10 个高价值工具，从源头减少工具定义 token 和上下文占用。
+## v21 Agent-first 安全合同
+
+v21 保留完整的 29 工具兼容层，默认 Agent-first 配置仍严格按本文顺序暴露 10 个工具。会话/项目作用域缺失、冲突、过期或跨项目时，返回收紧的结构化 scope 错误且不写入。`reflect_on_task` 的 `idempotency_key` 是可选的：同一规范化输入重放返回已提交回执，同键不同输入会冲突。
+
+自动 LLM 复盘只处理有界、严格清理的内容。持久化前会在权威锁内重新校验精确作用域、来源证据、新鲜度、内容指纹、写入审批与 fencing token，作为防误学习和 TOCTOU 证据门。后台生命周期和 LLM 复盘均为显式配置，自动持久化仍是独立开关。
+
+Hook 轮询已验证合同为不超过 5 秒，默认不超过 1 秒；这是调度合同，不是端到端性能承诺。`PostCompact` 必须带有界元数据，并持久化带哈希的压缩回执；重放幂等，同代冲突关闭式失败，回执可跨重启保留。
+
+v21 将反思、启发式、反馈与审批写入纳入前向事务恢复：启动时回滚提交前阶段，已进入 committing 的事务通过有界回执完成，不重放变更。升级前停止旧进程，分别备份安装目录和 `~/.hermes-reflection`，在干净暂存目录验证后切换；回滚时恢复匹配的代码与数据备份，再启动新进程。
+
+Hermes Reflection MCP 是面向 Codex Desktop 的本地 Agent-first 记忆与反思服务器。v21 保留兼容旧客户端的 29 个完整工具，但推荐配置只向 Agent 暴露 10 个高价值工具，从源头减少工具定义 token 和上下文占用。
 
 所有记忆都只是参考数据，不是可执行指令。服务默认本地运行，对派生文本和输出执行敏感信息清理，拒绝不安全传输路径，清空数据必须显式确认。
 
@@ -94,7 +104,7 @@ node <install-dir>/dist/src/codex_hook_cli.js
 
 ## 迁移、回滚与验证
 
-v20 使用 store schema 2，在锁内迁移受支持的旧数据并执行备份/恢复检查。未来版本或损坏的权威状态会关闭式失败并保存内容寻址证据，不会用空数据覆盖。
+v21 保持 store schema 2，在锁内迁移受支持的旧存储。升级前必须先分别备份安装目录和 `~/.hermes-reflection`，再在干净暂存目录执行迁移与恢复检查。未来版本或损坏的权威状态会关闭式失败并保存内容寻址证据，不会用空数据覆盖。如验证或启动失败，停止 Codex 与 MCP，恢复匹配的上一版代码和数据备份，再启动新进程。
 
 升级前停止旧 MCP，分别备份安装目录和 `~/.hermes-reflection`。在干净暂存目录安装并跑完验证矩阵后，再让 Codex 指向新目录。回滚时停止 Codex，恢复上一版代码和匹配的数据备份，再启动新的 Codex 进程。
 
@@ -110,12 +120,13 @@ npm run test:v19.4
 npm run test:v19.4.1
 npm run test:v19.5
 npm run test:v20
+npm run test:v21
 npm run test:concurrency
 npm run test:v20:agent-fixture
 ```
 
 `npm run test:v20:agent` 会运行 20 个全新 Codex Agent 流程，要求至少 18/20 通过且破坏性工具违规为零；它需要本机 `codex` 命令并可能产生模型调用。fixture grader 是离线确定性的。
 
-CI 在 Windows/Linux 与 Node 20/22 上执行严格 TypeScript、兼容测试、v20 测试、并发测试、打包预检、fixture 评分和生产依赖审计。
+CI 在 Windows/Linux 与 Node 20/22 上执行严格 TypeScript、兼容测试、v20 与 v21 测试、并发测试、打包预检、fixture 评分和生产依赖审计。
 
 安装步骤见 [`INSTALL_HERMES_MCP.md`](INSTALL_HERMES_MCP.md)，版本记录见 [`CHANGELOG.md`](CHANGELOG.md)。

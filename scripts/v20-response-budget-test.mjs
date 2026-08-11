@@ -77,6 +77,27 @@ assert.deepEqual(decodeCursor(encoded, {
   revision: "revision-1",
 }), base);
 
+const [encodedBody, encodedMac] = encoded.split(".");
+assert.ok(encodedBody && encodedMac, "cursor must carry an authenticated payload and MAC");
+const tamperedPayload = JSON.parse(Buffer.from(encodedBody, "base64url").toString("utf8"));
+for (const [field, value] of [
+  ["id", "h-099"],
+  ["sort", "h-099"],
+  ["query_hash", queryHash({ domain: "attacker-selected" })],
+  ["revision", "attacker-selected-revision"],
+]) {
+  const tampered = Buffer.from(JSON.stringify({ ...tamperedPayload, [field]: value }), "utf8").toString("base64url");
+  assert.throws(
+    () => decodeCursor(`${tampered}.${encodedMac}`, {
+      family: "heuristics",
+      query_hash: base.query_hash,
+      revision: "revision-1",
+    }),
+    (error) => error instanceof HermesError && error.code === "CURSOR_STALE",
+    `cursor ${field} tampering must fail authentication`,
+  );
+}
+
 for (const expected of [
   { family: "reflections", query_hash: base.query_hash, revision: "revision-1" },
   { family: "heuristics", query_hash: queryHash({ domain: "other" }), revision: "revision-1" },
@@ -130,10 +151,12 @@ await withTempHome("response-egress", async (home) => {
   const externalExportRoot = join(home, "configured-external-exports");
   await mkdir(storeDir, { recursive: true });
   await mkdir(externalExportRoot, { recursive: true });
-  const { client, close } = await startMcp(home, {
+  const serverEnv = {
     HERMES_BACKGROUND_ENABLED: "0",
     HERMES_TRANSFER_EXPORT_ROOTS: externalExportRoot,
-  });
+  };
+  const { client, close } = await startMcp(home, serverEnv);
+  let preRestartCursor;
   try {
     const atomicReceipt = await client.callTool({
       name: "add_heuristic",
@@ -389,8 +412,40 @@ await withTempHome("response-egress", async (home) => {
     }
     const imported = await client.callTool({ name: "import_data", arguments: { input_path: "valid.json" } });
     assertBoundedResult(imported, "compact", "import");
+
+    const preRestartPage = await client.callTool({
+      name: "memory_board_read",
+      arguments: { response_mode: "compact" },
+    });
+    assertBoundedResult(preRestartPage, "compact", "pre_restart_cursor");
+    assert.equal(preRestartPage.structuredContent?.has_more, true, "restart fixture did not issue a cursor");
+    preRestartCursor = preRestartPage.structuredContent?.next_cursor;
+    assert.ok(preRestartCursor, "restart fixture omitted next_cursor");
   } finally {
     await close().catch(() => {});
+  }
+
+  const restarted = await startMcp(home, serverEnv);
+  try {
+    const rejected = await restarted.client.callTool({
+      name: "memory_board_read",
+      arguments: { response_mode: "compact", cursor: preRestartCursor },
+    });
+    assert.equal(rejected.isError, true, "a cursor signed by the previous server process survived restart");
+    assert.match(rejected.content?.[0]?.text ?? "", /CURSOR_STALE/,
+      "restart cursor failure did not preserve CURSOR_STALE UX");
+    assert.deepEqual(rejected.structuredContent?.items ?? [], [],
+      "restart cursor failure returned model-visible data");
+
+    const recovered = await restarted.client.callTool({
+      name: "memory_board_read",
+      arguments: { response_mode: "compact" },
+    });
+    assertBoundedResult(recovered, "compact", "post_restart_without_cursor");
+    assert.ok((recovered.structuredContent?.items ?? []).length > 0,
+      "retrying without the stale cursor did not recover the query");
+  } finally {
+    await restarted.close().catch(() => {});
   }
 });
 

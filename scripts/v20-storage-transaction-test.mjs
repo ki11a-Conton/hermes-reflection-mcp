@@ -12,11 +12,16 @@ import {
 const execFileAsync = promisify(execFile);
 
 const FAILPOINTS = [
-  ["after_prepare", "before"],
-  ["after_json_stage", "before"],
-  ["after_sqlite_stage", "before"],
-  ["after_json_commit", "after"],
-  ["after_sqlite_commit", "after"],
+  ["after_prepare_journal_fsync", "after"],
+  ["after_committing_journal_fsync", "after"],
+  ["after_replace:reflections", "after"],
+  ["after_replace:store_index", "after"],
+  ["after_replace:resolved_questions", "after"],
+  ["after_replace:session_storage", "after"],
+  ["after_verify:reflections", "after"],
+  ["after_verify:store_index", "after"],
+  ["after_verify:resolved_questions", "after"],
+  ["after_verify:session_storage", "after"],
 ];
 
 function payload(result) {
@@ -46,14 +51,14 @@ async function seedBeforeState(home) {
       confidence: 0.8,
       tags: ["before"],
     });
-    await callOk(server.client, "append_session_turn", {
-      session_id: "before-sqlite-session",
-      role: "user",
-      content: "before-sqlite-marker",
-    });
   } finally {
     await server.close().catch(() => undefined);
   }
+  const sessionUrl = new URL("../dist/session_storage.js", import.meta.url).href;
+  await execFileAsync(process.execPath, ["--input-type=module", "--eval", `
+    const session = await import(${JSON.stringify(sessionUrl)});
+    await session.appendSessionTurn("before-sqlite-session", "user", "before-sqlite-marker", undefined, { scope: "global" });
+  `], { env: { ...process.env, HOME: home, USERPROFILE: home }, windowsHide: true });
 }
 
 async function writeReplaceImport(home) {
@@ -109,29 +114,37 @@ function assertConverged(operation, expected, state) {
 async function assertJournalPrepared(home, operation, failpoint) {
   const journalPath = join(home, ".hermes-reflection", "operation_journal.json");
   const journal = JSON.parse(await readFile(journalPath, "utf8"));
-  assert.equal(journal.schema_version, 1);
+  assert.equal(journal.schema_version, 2);
   assert.equal(journal.operation, operation);
-  assert.match(journal.before.json, /^[a-f0-9]{64}$/);
-  assert.match(journal.before.sqlite, /^[a-f0-9]{64}$/);
-  assert.match(journal.after.json, /^[a-f0-9]{64}$/);
-  assert.match(journal.after.sqlite, /^[a-f0-9]{64}$/);
+  assert.deepEqual(journal.resources.map((resource) => resource.name), ["reflections", "store_index", "resolved_questions", "session_storage"]);
+  for (const resource of journal.resources) {
+    assert.match(resource.before_sha256, /^[a-f0-9]{64}$/);
+    assert.match(resource.after_sha256, /^[a-f0-9]{64}$/);
+    await readFile(join(home, ".hermes-reflection", ...resource.staged_after_path.split("/")), "utf8");
+  }
   const expectedPhase = {
-    after_prepare: "prepared",
-    after_json_stage: "json_staged",
-    after_sqlite_stage: "sqlite_staged",
-    after_json_commit: "committing",
-    after_sqlite_commit: "committing",
+    after_prepare_journal_fsync: "prepared",
+    after_committing_journal_fsync: "committing",
+    "after_replace:store_index": "committing",
+    "after_replace:reflections": "committing",
+    "after_replace:resolved_questions": "committing",
+    "after_replace:session_storage": "committing",
+    "after_verify:reflections": "committing",
+    "after_verify:store_index": "committing",
+    "after_verify:resolved_questions": "committing",
+    "after_verify:session_storage": "committing",
   }[failpoint];
   assert.equal(journal.phase, expectedPhase);
 }
 
 async function runInterruptedCase(operation, failpoint, expected) {
-  await withTempHome(`${operation}-${failpoint}`, async (home) => {
+  await withTempHome(`${operation}-${failpoint.replace(/[^a-z0-9_-]/gi, "-")}`, async (home) => {
     await seedBeforeState(home);
     if (operation === "replace_import") await writeReplaceImport(home);
 
     const failedServer = await startMcp(home, {
       HERMES_REFLECTION_BACKGROUND_ENABLED: "0",
+      NODE_ENV: "test",
       HERMES_TEST_OPERATION_FAILPOINT: failpoint,
     });
     try {
@@ -216,6 +229,79 @@ function testStrictJournalDecoder() {
   assert.throws(() => assertOperationPhaseTransition("committing", "sqlite_staged"), /non-monotonic/i);
 }
 
+async function runLegacyV1ArtifactFixture() {
+  for (const phase of ["prepared", "json_staged", "sqlite_staged", "committing"]) {
+    await withTempHome(`legacy-v1-${phase}`, async (home) => {
+    const root = join(home, ".hermes-reflection");
+    const legacyStore = (marker) => ({
+      sessions: {},
+      reflections: [],
+      affordance_gaps: [],
+      heuristics: [{
+        id: "legacy-h",
+        domain: "journal-test",
+        heuristic: `legacy-${marker}-json-marker`,
+        source_task: "fixture",
+        confidence: 0.8,
+        tags: [],
+      }],
+      version: "20.0.0",
+      memory_board: { entries: [], char_limit: 2200, used_chars: 0 },
+      user_profile: { entries: [], char_limit: 1800, used_chars: 0 },
+    });
+    const beforeStore = legacyStore("before");
+    const afterStore = legacyStore("after");
+    const timestamp = "2026-07-29T00:00:00.000Z";
+    const legacySnapshot = (marker) => ({
+      schema_version: 1,
+      sessions: [{ session_id: "legacy-v1-session", started_at: timestamp, turn_count: 1, last_turn_at: timestamp }],
+      turns: [{ session_id: "legacy-v1-session", turn_index: 0, role: "user", content: marker, timestamp }],
+    });
+    const beforeSqlite = legacySnapshot("legacy-before-sqlite-marker");
+    const afterSqlite = legacySnapshot("legacy-after-sqlite-marker");
+    const id = "12345678-1234-4123-8123-123456789abc";
+    const operationDir = join(root, "operations", id);
+    await mkdir(operationDir, { recursive: true });
+    await writeFile(join(operationDir, "before-json.json"), JSON.stringify(beforeStore), "utf8");
+    await writeFile(join(operationDir, "before-sqlite.json"), JSON.stringify(beforeSqlite), "utf8");
+    await writeFile(join(operationDir, "after-json.json"), JSON.stringify(afterStore), "utf8");
+    await writeFile(join(operationDir, "after-sqlite.json"), JSON.stringify(afterSqlite), "utf8");
+    const journal = {
+      schema_version: 1,
+      id,
+      operation: "clear",
+      phase,
+      created_at: timestamp,
+      before: {
+        json: "fcee48619edb5c4976e805a2766bf71e6ae34b150ecd11e5f2c644c99e4a696b",
+        sqlite: "641e2cdf74eabdec35f5c1d11e651bdc3441c8247d2d6499776df13ad08925ec",
+      },
+      after: {
+        json: "b7c6ae1e17c6586159e617fc0f74c0cbc62317f283b7a53b2d0e5aa40834cf41",
+        sqlite: "e431c9ce280ec4ddf20752316088767b69a8234679c8c696b348360602de4ad8",
+      },
+      staged_paths: [`operations/${id}/after-json.json`, `operations/${id}/after-sqlite.json`],
+      backup_paths: [`operations/${id}/before-json.json`, `operations/${id}/before-sqlite.json`],
+    };
+    await writeFile(join(root, "operation_journal.json"), JSON.stringify(journal), "utf8");
+    const expectedSide = phase === "committing" ? "after" : "before";
+    const server = await startMcp(home, { HERMES_REFLECTION_BACKGROUND_ENABLED: "0" });
+    try {
+      const items = payload(await callOk(server.client, "list_heuristics", { domain: "journal-test", limit: 20, response_mode: "full" })).items ?? [];
+      assert.equal(items.some((item) => item.heuristic === `legacy-${expectedSide}-json-marker`), true, `legacy ${phase} JSON recovery side`);
+    } finally { await server.close().catch(() => undefined); }
+    const sessionUrl = new URL("../dist/session_storage.js", import.meta.url).href;
+    const snapshotRun = await execFileAsync(process.execPath, ["--input-type=module", "--eval", `
+      const session = await import(${JSON.stringify(sessionUrl)});
+      process.stdout.write(JSON.stringify(await session.snapshotSessionStorage()));
+    `], { env: { ...process.env, HOME: home, USERPROFILE: home }, windowsHide: true });
+    const recoveredSqlite = JSON.parse(snapshotRun.stdout);
+    assert.equal(recoveredSqlite.turns[0]?.content, `legacy-${expectedSide}-sqlite-marker`, `legacy ${phase} SQLite recovery side`);
+    await assert.rejects(readFile(join(root, "operation_journal.json"), "utf8"), /ENOENT/);
+    });
+  }
+}
+
 async function enableWriteApproval(home) {
   const path = join(home, ".hermes-reflection", "store.json");
   const store = JSON.parse(await readFile(path, "utf8"));
@@ -233,7 +319,8 @@ async function runApprovalReplayCase(interrupted) {
     await enableWriteApproval(home);
     let server = await startMcp(home, {
       HERMES_REFLECTION_BACKGROUND_ENABLED: "0",
-      ...(interrupted ? { HERMES_TEST_OPERATION_FAILPOINT: "after_json_commit" } : {}),
+      ...(interrupted ? { NODE_ENV: "test" } : {}),
+      ...(interrupted ? { HERMES_TEST_OPERATION_FAILPOINT: "after_replace:store_index" } : {}),
     });
     let mutationId;
     try {
@@ -267,7 +354,11 @@ async function runApprovalReplayCase(interrupted) {
     }
 
     if (interrupted) {
-      await assertJournalPrepared(home, "clear", "after_json_commit");
+      await assert.rejects(
+        readFile(join(home, ".hermes-reflection", "operation_journal.json"), "utf8"),
+        /ENOENT/,
+        "failed approval cleanup must cross the read barrier and remove the recovered journal",
+      );
       server = await startMcp(home, { HERMES_REFLECTION_BACKGROUND_ENABLED: "0" });
       try {
         const pending = await pendingItems(server.client);
@@ -309,7 +400,7 @@ async function testJournalBypassIsAsyncLocal() {
           confidence: 0.8,
         });
       } catch (error) {
-        blocked = /pending startup recovery|temporarily blocked/i.test(String(error));
+        blocked = /pending startup recovery|temporarily blocked|operation journal/i.test(String(error));
       } finally {
         release();
         await held;
@@ -392,6 +483,7 @@ async function testConcurrentPartialReplaceImports() {
 }
 
 testStrictJournalDecoder();
+await runLegacyV1ArtifactFixture();
 await testJournalBypassIsAsyncLocal();
 await testConcurrentPartialReplaceImports();
 for (const [failpoint, expected] of FAILPOINTS) {

@@ -42,6 +42,10 @@ try {
   const listed = await client.listTools();
 
   assert.equal(listed.tools.length, 29, "public tool count changed");
+  assert.ok(instructions.trim().length > 0, "server instructions must remain discoverable");
+  for (const tool of listed.tools) {
+    assert.ok((tool.description ?? "").trim().length > 0, `${tool.name} description must remain discoverable`);
+  }
   const responseModeTools = new Set([
     "retrieve_heuristics",
     "list_heuristics",
@@ -78,8 +82,7 @@ try {
   const maxDescription = Math.max(...exposedDescriptionLengths);
   assert.ok(maxDescription <= 2_000, `max exposed description=${maxDescription}`);
 
-  const aggregate = listed.tools.reduce((sum, tool) => sum
-    + instructions.length
+  const aggregate = instructions.length + listed.tools.reduce((sum, tool) => sum
     + (tool.description?.length ?? 0)
     + JSON.stringify(tool.inputSchema).length, 0);
   assert.ok(aggregate <= 35_000, `aggregate exposed metadata=${aggregate}`);
@@ -286,12 +289,18 @@ try {
   const brokenClient = new Client({ name: "v19.5-error-test", version: "1.0.0" });
   try {
     await brokenClient.connect(brokenTransport);
+    const unavailableLifecycle = await brokenClient.callTool({
+      name: "session_lifecycle_hook",
+      arguments: { event: "start", session_id: "unavailable-session" },
+    });
+    assert.equal(unavailableLifecycle.isError, true);
+    assert.match(textOf(unavailableLifecycle), /Session storage is unavailable/);
     const unavailable = await brokenClient.callTool({
       name: "compact_session_context",
       arguments: { session_id: "unavailable-session" },
     });
     assert.equal(unavailable.isError, true);
-    assert.match(textOf(unavailable), /Session storage is unavailable/);
+    assert.match(textOf(unavailable), /LIFECYCLE_NOT_READY/);
     assert.match(textOf(unavailable), /unavailable-session/);
   } finally {
     await brokenClient.close().catch(() => {});

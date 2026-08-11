@@ -3,6 +3,8 @@
 // Inspired by NousResearch/hermes-agent & Cognitive Workbench
 // ============================================================
 
+import type { PersistedSessionScope } from "./src/session_scope.js";
+
 export type FailureMode =
   | "incorrect_task_interpretation"
   | "incorrect_world_assumption"
@@ -157,6 +159,14 @@ export interface PendingMutation {
   claimed_at?: string;
 }
 
+export interface CommittedReceipt {
+  transaction_id: string;
+  result_id: string;
+  reflection_ids: string[];
+  input_hash: string;
+  committed_at: string;
+}
+
 export type ReviewCandidateState = "pending" | "applied" | "rejected";
 
 export interface ReviewCandidate {
@@ -165,6 +175,8 @@ export interface ReviewCandidate {
   scope: MemoryScope;
   stage: "deterministic" | "llm";
   source_fingerprint: string;
+  /** Hash of the authoritative, candidate-specific source projection seen at generation time. */
+  evidence_fingerprint: string;
   source_reflection_ids: string[];
   heuristic: string;
   domain: string;
@@ -213,6 +225,14 @@ export interface SessionMeta {
   started_at: string;
   turn_count: number;
   last_turn_at?: string;
+  scope: PersistedSessionScope;
+  parent_session_id?: string;
+  start_event_id?: string;
+  end_reason?: string;
+  ended_at?: string;
+  updated_at: string;
+  compaction_generation: number;
+  last_compaction_receipt?: string;
 }
 
 export interface ReflectionStore {
@@ -231,6 +251,7 @@ export interface ReflectionStore {
     write_approval?: boolean;
     pending_mutations?: PendingMutation[];
     review_candidates?: ReviewCandidate[];
+    committed_receipts?: Record<string, CommittedReceipt>;
     external_provider?: { name: string; endpoint?: string; db_path?: string; auto_sync?: boolean };
   };
 }

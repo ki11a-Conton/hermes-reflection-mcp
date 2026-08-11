@@ -14,6 +14,7 @@ import { BackgroundLifecycle } from "../dist/src/background_lifecycle.js";
 const SINGLE_FLIGHT_CHILD = process.argv.includes("--single-flight-child");
 const MANUAL_LEASE_CHILD = process.argv.includes("--manual-lease-child");
 const MANUAL_SHUTDOWN_CHILD = process.argv.includes("--manual-shutdown-child");
+const MISSING_PROVENANCE_CHILD = process.argv.includes("--missing-provenance-child");
 
 const FINGERPRINT_A = "a".repeat(64);
 const FINGERPRINT_B = "b".repeat(64);
@@ -65,14 +66,24 @@ function providerEnvelope(candidates = [{
   domain: "software-engineering",
   confidence: 0.9,
   tags: ["single-flight"],
-}]) {
+}], sourceReflectionIds = []) {
+  const evidencedCandidates = candidates.map((candidate) => ({
+    ...candidate,
+    source_reflection_ids: sourceReflectionIds,
+  }));
   return JSON.stringify({
     choices: [{
       message: {
-        content: JSON.stringify({ summary: "Review complete.", candidates, open_questions: [] }),
+        content: JSON.stringify({ summary: "Review complete.", candidates: evidencedCandidates, open_questions: [] }),
       },
     }],
   });
+}
+
+function requestSourceReflectionIds(requestBody) {
+  const userMessage = requestBody.messages?.find((message) => message.role === "user");
+  const reviewInput = JSON.parse(userMessage?.content ?? "{}");
+  return (reviewInput.reflections ?? []).map((reflection) => reflection.id);
 }
 
 async function runSingleFlightChild() {
@@ -138,6 +149,42 @@ async function runManualLeaseChild() {
   process.stdout.write(JSON.stringify({ ok: true }));
 }
 
+async function runMissingProvenanceChild() {
+  const storage = await import("../dist/storage.js");
+  await storage.initializeStoreV20();
+  const reflection = {
+    ...reflectionFixture("missing-provenance-project-session"),
+    scope: "project:alpha",
+  };
+  await storage.saveReflectionAndHeuristics(reflection, [], reflection.domain, "missing-provenance-test", 0.65, []);
+  const state = new BackgroundStateStore(join(process.env.HOME, ".hermes-reflection", "missing-provenance-state.json"));
+  await state.markDirty(reflection.session_id, new Date(Date.now() - 10_000).toISOString());
+  let reviewCalls = 0;
+  const lifecycle = new BackgroundLifecycle({
+    enabled: true,
+    interval_ms: 60_000,
+    idle_ms: 0,
+    lease_ms: 5_000,
+    max_sessions_per_run: 1,
+    review_mode: "deterministic",
+    auto_apply: false,
+    store: state,
+    review: async () => {
+      reviewCalls += 1;
+      return {
+        success: true,
+        source_fingerprint: FINGERPRINT_A,
+        outcome_class: "success",
+        stage: "deterministic",
+        candidate_ids: [],
+      };
+    },
+  });
+  await lifecycle.runNow();
+  assert.equal(reviewCalls, 0, "missing persisted provenance inferred a project scope from reflection content");
+  await lifecycle.shutdown();
+}
+
 async function runManualShutdownChild() {
   const storage = await import("../dist/storage.js");
   const engine = await import("../dist/src/review_engine.js");
@@ -193,7 +240,8 @@ async function withMockProvider(fn) {
     let body = "";
     request.setEncoding("utf8");
     for await (const chunk of request) body += chunk;
-    requests.push(JSON.parse(body));
+    const requestBody = JSON.parse(body);
+    requests.push(requestBody);
     signalRequest();
     scenario.attempt += 1;
     if (scenario.kind === "429" && scenario.attempt === 1) {
@@ -221,7 +269,7 @@ async function withMockProvider(fn) {
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
     const candidates = scenario.kind === "secret"
-      ? [{ heuristic: "Use token ghp_abcdefghijklmnopqrstuvwxyz1234567890 in the command.", domain: "security", confidence: 0.99, tags: [] }]
+      ? [{ heuristic: "Use token ghp_TEST-ONLY-INVALID-000000000000 in the command.", domain: "security", confidence: 0.99, tags: [] }]
       : scenario.kind === "conflict"
         ? [
             { heuristic: "Always enable shared cache for build X.", domain: "build", confidence: 0.95, tags: [] },
@@ -230,7 +278,8 @@ async function withMockProvider(fn) {
         : scenario.kind === "opposite"
           ? [{ heuristic: "Never enable shared cache for build X.", domain: "build", confidence: 0.95, tags: [] }]
         : undefined;
-    response.writeHead(200, { "content-type": "application/json" }).end(providerEnvelope(candidates));
+    response.writeHead(200, { "content-type": "application/json" })
+      .end(providerEnvelope(candidates, requestSourceReflectionIds(requestBody)));
   });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
@@ -622,6 +671,25 @@ async function testCommitWaitsForDurableCandidates(home) {
   assert.equal(dirty.length, 0, "verified candidates allow the stage fingerprint to commit");
 }
 
+async function testMissingProvenanceDoesNotInferProject(home) {
+  const child = spawn(process.execPath, [process.argv[1], "--missing-provenance-child"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      HERMES_REFLECTION_BACKGROUND_ENABLED: "0",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const [code] = await once(child, "exit");
+  assert.equal(code, 0, `missing-provenance child failed: ${stderr}`);
+}
+
 async function createPreview(client, sessionId, lesson) {
   structured(await call(client, "reflect_on_task", {
     session_id: sessionId,
@@ -708,9 +776,12 @@ if (SINGLE_FLIGHT_CHILD) {
   await runManualLeaseChild();
 } else if (MANUAL_SHUTDOWN_CHILD) {
   await runManualShutdownChild();
+} else if (MISSING_PROVENANCE_CHILD) {
+  await runMissingProvenanceChild();
 } else {
   await withTempHome("background", async (home) => {
     await testBackgroundStateMigration(home);
+    await testMissingProvenanceDoesNotInferProject(home);
     await testCommitWaitsForDurableCandidates(home);
     await testDurableQueue(home);
     await testBoundedLlmAndSingleFlight(home);

@@ -6,8 +6,23 @@ import { getReviewReadinessStatus, getReviewSourceState, inFlightReview, reviewS
 import { HermesError } from "./errors.js";
 import { durableReviewCandidateIds } from "./review_queue.js";
 import { hookInbox } from "./hook_inbox.js";
+import { HookInboxPump } from "./hook_inbox_pump.js";
 import { projectScopeRepository } from "./project_scope.js";
+import { normalizeRequestedSessionScope, SessionScopeError, } from "./session_scope.js";
+import { resolvePersistedSessionAccess } from "./session_access.js";
 import { captureSessionSnapshot, releaseSessionSnapshot } from "./storage_enhanced.js";
+import { persistCompactionReceipt, persistSessionEnd, persistSessionStart, resolveSessionScope, SESSION_STORAGE_UNAVAILABLE, } from "../session_storage.js";
+async function internalPersistedScope(sessionId) {
+    try {
+        return normalizeRequestedSessionScope(await resolveSessionScope(sessionId));
+    }
+    catch (error) {
+        if (!(error instanceof SessionScopeError)
+            || (error.code !== "LIFECYCLE_NOT_READY" && error.code !== "LEGACY_SCOPE_DENIED"))
+            throw error;
+        return "global";
+    }
+}
 function truthy(value) {
     return /^(?:1|true|yes|on)$/i.test(value?.trim() ?? "");
 }
@@ -136,6 +151,7 @@ export class BackgroundLifecycle {
     candidatesDurable;
     inbox;
     processHookEvent;
+    hookPump;
     timer;
     deadlineTimer;
     nextDeadlineAt;
@@ -153,10 +169,17 @@ export class BackgroundLifecycle {
     stopping = false;
     constructor(options) {
         this.options = options;
-        this.sourceState = options.source_state ?? ((sessionId) => getReviewSourceState(sessionId, "recent"));
+        this.sourceState = options.source_state ?? (async (sessionId) => {
+            const scope = await internalPersistedScope(sessionId);
+            return getReviewSourceState(sessionId, "recent", scope);
+        });
         this.candidatesDurable = options.candidates_durable ?? durableReviewCandidateIds;
         this.inbox = options.hook_inbox ?? hookInbox;
         this.processHookEvent = options.process_hook_event ?? ((event) => this.applyHookEvent(event));
+        this.hookPump = new HookInboxPump(this.inbox, async (event) => {
+            await this.processHookEvent(event);
+            await this.rearmDeadline();
+        });
         this.review = options.review ?? (async ({ session_id, scope, stage, source_fingerprint, signal, before_apply, with_apply_lease }) => {
             const result = await runReviewSingleFlight({
                 session_id,
@@ -204,6 +227,7 @@ export class BackgroundLifecycle {
         return store.commitSession(ownerId, fencingToken, sessionId, fingerprint, outcomeClass, expectedDirtyAt, retryAfterMs);
     }
     start() {
+        this.hookPump.start();
         if (!this.options.enabled || this.started || this.stopping)
             return this.summary();
         this.started = true;
@@ -266,11 +290,27 @@ export class BackgroundLifecycle {
     async applyHookEvent(event) {
         switch (event.event) {
             case "SessionStart":
+                if (!await persistSessionStart(event.session_id, {
+                    scope: (event.project_key ?? event.scope_intent),
+                    start_event_id: event.event_id,
+                    started_at: event.occurred_at,
+                })) {
+                    throw new Error(SESSION_STORAGE_UNAVAILABLE);
+                }
                 await projectScopeRepository.bind(event.session_id, event.project_key);
                 await captureSessionSnapshot(event.session_id);
                 break;
             case "Stop":
             case "SessionEnd":
+                if (event.event === "SessionEnd") {
+                    const boundScope = await projectScopeRepository.active(event.session_id);
+                    if (!await persistSessionEnd(event.session_id, {
+                        scope: (event.project_key ?? boundScope ?? "global"),
+                        end_reason: "SessionEnd Hook",
+                        ended_at: event.occurred_at,
+                    }))
+                        throw new Error(SESSION_STORAGE_UNAVAILABLE);
+                }
                 releaseSessionSnapshot(event.session_id);
                 await this.options.store.markDirty(event.session_id, event.occurred_at);
                 await projectScopeRepository.release(event.session_id);
@@ -279,13 +319,18 @@ export class BackgroundLifecycle {
                 await captureSessionSnapshot(event.session_id);
                 break;
             case "PostCompact":
+                {
+                    const scope = await resolvePersistedSessionAccess(event.session_id, event.project_key);
+                    if (!await persistCompactionReceipt(event.session_id, event.metadata, scope)) {
+                        throw new Error(SESSION_STORAGE_UNAVAILABLE);
+                    }
+                }
+                await captureSessionSnapshot(event.session_id);
                 break;
         }
     }
     async consumeInboxNow() {
-        const result = await this.inbox.consume(this.processHookEvent);
-        await this.rearmDeadline();
-        return result;
+        return this.hookPump.poke();
     }
     rearmDeadline() {
         const run = this.deadlineRearmQueue.then(() => this.armDeadlineNow());
@@ -421,7 +466,7 @@ export class BackgroundLifecycle {
         }
     }
     async runCycle() {
-        await this.inbox.consume(this.processHookEvent);
+        await this.hookPump.drainNow();
         if (this.activeFence !== undefined || this.fenceClaiming)
             return;
         this.fenceClaiming = true;
@@ -532,14 +577,42 @@ export class BackgroundLifecycle {
             return 60 * 60_000;
         return 5 * 60_000;
     }
-    async status() {
-        return { runtime: this.summary(), durable: await this.options.store.status() };
+    async status(scope) {
+        let durable = await this.options.store.status();
+        if (scope !== undefined) {
+            const dirty = await this.options.store.dirtySessions();
+            const sessionIds = [...new Set([
+                    ...dirty.map((item) => item.session_id),
+                    ...durable.recent_runs.map((item) => item.session_id),
+                ])];
+            const scopes = new Map(await Promise.all(sessionIds.map(async (sessionId) => [
+                sessionId,
+                await internalPersistedScope(sessionId),
+            ])));
+            const visibleDirty = dirty.filter((item) => scopes.get(item.session_id) === scope);
+            durable = {
+                ...durable,
+                dirty_session_count: visibleDirty.length,
+                retrying_session_count: visibleDirty
+                    .filter((item) => item.retry_after && Date.parse(item.retry_after) > Date.now()).length,
+                dirty_session_ids: visibleDirty.map((item) => item.session_id),
+                recent_runs: durable.recent_runs.filter((item) => scopes.get(item.session_id) === scope),
+            };
+        }
+        return {
+            runtime: this.summary(),
+            durable,
+            hook_inbox: await this.hookPump.status(),
+        };
     }
     async shutdown(timeoutMs = 2_000) {
         if (this.shutdownRun)
             return this.shutdownRun;
         this.shutdownRun = (async () => {
+            const deadline = Date.now() + Math.max(0, timeoutMs);
+            const remaining = () => Math.max(0, deadline - Date.now());
             this.stopping = true;
+            await this.hookPump.shutdown(remaining());
             if (this.timer)
                 clearInterval(this.timer);
             this.timer = undefined;
@@ -553,13 +626,22 @@ export class BackgroundLifecycle {
                 ...(this.activeRun ? [this.activeRun] : []),
                 ...this.manualRuns.values(),
             ];
-            if (active.length > 0) {
+            const drainTimeout = remaining();
+            if (drainTimeout > 0) {
                 let drainTimer;
                 try {
+                    const drainActiveAndRearms = (async () => {
+                        if (active.length > 0)
+                            await Promise.allSettled(active);
+                        // Active runs enqueue their final deadline rearm from `finally`.
+                        // Read the queue only after they settle so shutdown also drains
+                        // those file-backed reads without allocating a second timeout.
+                        await this.deadlineRearmQueue;
+                    })();
                     await Promise.race([
-                        Promise.allSettled(active).then(() => undefined),
+                        drainActiveAndRearms,
                         new Promise((resolve) => {
-                            drainTimer = setTimeout(resolve, Math.max(0, timeoutMs));
+                            drainTimer = setTimeout(resolve, drainTimeout);
                             drainTimer.unref();
                         }),
                     ]);

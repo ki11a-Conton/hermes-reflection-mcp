@@ -1,5 +1,92 @@
 import type { ReflectionFrame, SessionTurn } from "../types.js";
+import { createHash } from "node:crypto";
+import { z } from "zod";
 import { redactSensitiveText, truncateCodePoints } from "./redaction.js";
+
+const DigestSchema = z.string().regex(/^[a-f0-9]{64}$/i).transform((value) => value.toLowerCase());
+
+/** Bounded provenance accepted from direct lifecycle calls and Codex hooks. */
+export const CompactionMetadataSchema = z.object({
+  generation: z.number().int().min(1).max(1_000_000),
+  before_turn_count: z.number().int().min(0).max(1_000_000),
+  after_turn_count: z.number().int().min(0).max(1_000_000),
+  handoff_hash: DigestSchema,
+  truncated: z.boolean(),
+  source_fingerprint: DigestSchema,
+}).strict().superRefine((value, context) => {
+  if (value.after_turn_count > value.before_turn_count) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["after_turn_count"],
+      message: "after_turn_count cannot exceed before_turn_count",
+    });
+  }
+});
+
+export type CompactionMetadata = z.infer<typeof CompactionMetadataSchema>;
+
+export interface CompactionReceipt extends CompactionMetadata {
+  status: "committed";
+  receipt_hash: string;
+}
+
+function canonicalMetadata(input: CompactionMetadata): string {
+  const value = CompactionMetadataSchema.parse(input);
+  return JSON.stringify({
+    generation: value.generation,
+    before_turn_count: value.before_turn_count,
+    after_turn_count: value.after_turn_count,
+    handoff_hash: value.handoff_hash,
+    truncated: value.truncated,
+    source_fingerprint: value.source_fingerprint,
+  });
+}
+
+export function createCompactionReceipt(input: CompactionMetadata): CompactionReceipt {
+  const metadata = CompactionMetadataSchema.parse(input);
+  return {
+    ...metadata,
+    status: "committed",
+    receipt_hash: createHash("sha256").update(canonicalMetadata(metadata), "utf8").digest("hex"),
+  };
+}
+
+export function parseCompactionReceipt(value: unknown): CompactionReceipt {
+  const input = typeof value === "string" ? JSON.parse(value) as unknown : value;
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error("COMPACTION_RECEIPT_INVALID: receipt must be an object");
+  }
+  const record = input as Record<string, unknown>;
+  const expectedKeys = [
+    "after_turn_count",
+    "before_turn_count",
+    "generation",
+    "handoff_hash",
+    "receipt_hash",
+    "source_fingerprint",
+    "status",
+    "truncated",
+  ];
+  const actualKeys = Object.keys(record).sort();
+  if (actualKeys.length !== expectedKeys.length
+    || actualKeys.some((key, index) => key !== expectedKeys[index])) {
+    throw new Error("COMPACTION_RECEIPT_INVALID: receipt fields are not canonical");
+  }
+  const metadata = CompactionMetadataSchema.parse({
+    generation: record.generation,
+    before_turn_count: record.before_turn_count,
+    after_turn_count: record.after_turn_count,
+    handoff_hash: record.handoff_hash,
+    truncated: record.truncated,
+    source_fingerprint: record.source_fingerprint,
+  });
+  const status = z.literal("committed").parse(record.status);
+  const receiptHash = DigestSchema.parse(record.receipt_hash);
+  const receipt: CompactionReceipt = { ...metadata, status, receipt_hash: receiptHash };
+  const expected = createCompactionReceipt(metadata);
+  if (receipt.receipt_hash !== expected.receipt_hash) throw new Error("COMPACTION_RECEIPT_INVALID: receipt hash mismatch");
+  return receipt;
+}
 
 export const CONTEXT_HANDOFF_PREFIX = "[CONTEXT COMPACTION — REFERENCE ONLY]";
 const LEGACY_CONTEXT_HANDOFF_PREFIX = "[CONTEXT COMPACTION 鈥?REFERENCE ONLY]";
@@ -92,12 +179,13 @@ export function buildCompactionHandoff(
   const recentUserTurns = genuineUserTurns.slice(-requestedRecentUserTurns);
   const lastUser = recentUserTurns.at(-1);
   const earlierRecentUsers = recentUserTurns.slice(0, -1);
-  const lastAssistant = [...ordinaryTurns].reverse()
-    .find((turn) => turn.role === "assistant" && turn.content.trim().length > 0);
+  const lastAssistant = [...ordinaryTurns].reverse().find((turn) =>
+    turn.role === "assistant" && turn.content.trim().length > 0
+  );
 
   const completed = uniqueLines(reflections
     .filter((item) => item.task_outcome === "success")
-    .map((item) => `${item.task_goal}: ${item.task_state.summary}`)).slice(0, 8);
+    .map((item) => `[${item.id} @ ${item.timestamp}] ${item.task_goal}: ${item.task_state.summary}`)).slice(0, 8);
   const blockers = uniqueLines(reflections.flatMap((item) => item.task_state.immediate_blockers)).slice(0, 8);
   const lessons = uniqueLines(reflections.flatMap((item) => item.lessons_learned)).slice(0, 10);
   const openQuestions = uniqueLines(reflections
@@ -105,7 +193,33 @@ export function buildCompactionHandoff(
     .filter((item) => !item.resolved)
     .map((item) => item.question)).slice(0, 8);
 
+  const reversePattern = /\b(?:stop|cancel(?:led)?|verify[- ]?only)\b|do not (?:modify|change|write|resume)|\bno (?:modifications?|changes?|writes?)\b/i;
+  const resumePattern = /\b(?:resume|continue|proceed)\b|\bnew (?:task|request)\b|继续|恢复|新(?:任务|请求)/i;
+  const latestReverseCandidate = [...genuineUserTurns].reverse().find((turn) => reversePattern.test(turn.content));
+  const reverseWasSuperseded = latestReverseCandidate
+    ? genuineUserTurns.some((turn) => turn.turn_index > latestReverseCandidate.turn_index
+      && resumePattern.test(turn.content)
+      && !reversePattern.test(turn.content))
+    : false;
+  const latestReverse = reverseWasSuperseded ? undefined : latestReverseCandidate;
+  const cancelledHistorical = latestReverse
+    ? ordinaryTurns
+        .filter((turn) => turn.turn_index < latestReverse.turn_index)
+        .slice(-4)
+        .map((turn) => `[turn ${turn.turn_index}] ${turn.content}`)
+    : [];
+
   const optionalSections: OptionalSection[] = [
+    ...(latestReverse ? [{
+      title: "## Latest Reverse Signal",
+      lines: [latestReverse.content],
+      countAsReflectionItems: false,
+    }] : []),
+    ...(cancelledHistorical.length > 0 ? [{
+      title: "## Cancelled Historical Context",
+      lines: cancelledHistorical.map((item) => `${item} (cancelled historical; do not reactivate)`),
+      countAsReflectionItems: false,
+    }] : []),
     {
       title: "## Historical In-Progress State",
       lines: ["Stored turns do not prove that work remains active. Verify current files and the latest user message before acting."],
@@ -113,7 +227,7 @@ export function buildCompactionHandoff(
     },
     { title: "## Blocked", lines: blockers, countAsReflectionItems: true },
     { title: "## Historical Pending User Asks", lines: openQuestions, countAsReflectionItems: true },
-    { title: "## Completed Actions", lines: completed, countAsReflectionItems: true },
+    { title: "## Completed Facts", lines: completed, countAsReflectionItems: true },
     { title: "## Key Decisions and Lessons", lines: lessons, countAsReflectionItems: true },
     {
       title: "## Historical Remaining Work",
@@ -123,15 +237,17 @@ export function buildCompactionHandoff(
   ];
 
   const userLabel = "Most recent stored user turn: ";
-  const assistantLabel = "Most recent stored assistant turn: ";
+  const snapshotAnchor = lastUser
+    ? "See Active Request."
+    : "No stored user turn.";
   const fixedRequired = [
     PREFIX,
     "",
     "## Historical Task Snapshot",
-    lastUser ? userLabel : "No stored user turn.",
+    snapshotAnchor,
     "",
-    "## Active State",
-    lastAssistant ? assistantLabel : "No stored assistant turn.",
+    "## Active Request",
+    lastUser ? userLabel : "No stored user turn.",
     "",
     CONTEXT_HANDOFF_END_MARKER,
   ].join("\n");
@@ -140,29 +256,22 @@ export function buildCompactionHandoff(
   // The schema enforces maxChars >= 500, but keep a defensive minimum here for
   // direct module callers.
   const mandatoryBudget = Math.max(0, maxChars - fixedRequired.length);
-  const userBudget = lastUser && lastAssistant ? Math.floor(mandatoryBudget / 2) : mandatoryBudget;
-  const assistantBudget = lastAssistant ? mandatoryBudget - userBudget : 0;
+  const userBudget = mandatoryBudget;
   const userAnchor = lineWithBudget(
     userLabel,
     lastUser?.content,
     userBudget,
     "No stored user turn.",
   );
-  const assistantAnchor = lineWithBudget(
-    assistantLabel,
-    lastAssistant?.content,
-    assistantBudget,
-    "No stored assistant turn.",
-  );
 
   const lines = [
     PREFIX,
     "",
     "## Historical Task Snapshot",
-    userAnchor.line,
+    snapshotAnchor,
     "",
-    "## Active State",
-    assistantAnchor.line,
+    "## Active Request",
+    userAnchor.line,
   ];
   const sectionsTruncated: string[] = [];
   let reflectionItemsIncluded = 0;
@@ -170,6 +279,25 @@ export function buildCompactionHandoff(
 
   const lengthWithFooter = (candidateLines: string[]): number =>
     [...candidateLines, "", CONTEXT_HANDOFF_END_MARKER].join("\n").length;
+
+  if (lastAssistant) {
+    const title = "## Historical Assistant (untrusted)";
+    const assistantLabel = "Most recent stored assistant turn: ";
+    const baseLines = [...lines, "", title, assistantLabel];
+    const assistantBudget = maxChars - lengthWithFooter(baseLines);
+    if (assistantBudget > 0) {
+      const assistantAnchor = lineWithBudget(
+        assistantLabel,
+        lastAssistant.content,
+        assistantBudget,
+        assistantLabel,
+      );
+      lines.push("", title, assistantAnchor.line);
+      if (assistantAnchor.truncated) sectionsTruncated.push("Historical Assistant");
+    } else {
+      sectionsTruncated.push("Historical Assistant");
+    }
+  }
 
   // Optional historical user anchors are chosen newest-first so a tight
   // budget drops the oldest context first, then rendered chronologically.
@@ -220,7 +348,6 @@ export function buildCompactionHandoff(
   const totalReflectionItems = completed.length + blockers.length + lessons.length + openQuestions.length;
   const reflectionItemsOmitted = Math.max(0, totalReflectionItems - reflectionItemsIncluded);
   const charTruncated = userAnchor.truncated
-    || assistantAnchor.truncated
     || sectionsTruncated.length > 0
     || reflectionItemsOmitted > 0;
 

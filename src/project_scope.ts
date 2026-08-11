@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { MemoryScope } from "../types.js";
 import { withFileLock } from "./file_lock.js";
+import { SessionScopeError, lifecycleNotReady } from "./session_scope.js";
 import {
   AuthoritativeStateError,
   preserveCorruptUtf8,
@@ -24,7 +25,8 @@ export interface LifecycleMetadata {
 
 export function deriveProjectKey(cwd: string, salt: Buffer): MemoryScope {
   if (salt.byteLength !== PROJECT_SALT_BYTES) throw new Error("project salt must contain exactly 32 bytes");
-  const canonical = resolve(cwd).replaceAll("\\", "/").toLowerCase();
+  const normalized = resolve(cwd).replaceAll("\\", "/");
+  const canonical = process.platform === "win32" ? normalized.toLowerCase() : normalized;
   return `project:${createHmac("sha256", salt).update(canonical, "utf8").digest("hex")}`;
 }
 
@@ -63,6 +65,7 @@ interface ScopeState {
 
 export interface ProjectScopeRepository {
   bind(sessionId: string, key?: string, metadata?: LifecycleMetadata): Promise<MemoryScope>;
+  active(sessionId: string): Promise<MemoryScope | undefined>;
   resolve(input: { session_id?: string; project_key?: string }): Promise<MemoryScope>;
   release(sessionId: string): Promise<void>;
 }
@@ -165,21 +168,32 @@ export class FileProjectScopeRepository implements ProjectScopeRepository {
     const acceptedMetadata = safeMetadata(metadata);
     await withFileLock(this.path, async () => {
       const state = await this.readUnlocked();
+      const existing = state.bindings[sessionId];
+      if (existing && existing.scope !== scope) {
+        throw new SessionScopeError(
+          "SCOPE_MISMATCH",
+          `Session ${sessionId} is already bound to ${existing.scope}, not ${scope}.`,
+        );
+      }
+      if (!existing && Object.keys(state.bindings).length >= MAX_BINDINGS) {
+        throw lifecycleNotReady(
+          `Active session scope binding capacity (${MAX_BINDINGS}) is full; end an active session before starting another.`,
+        );
+      }
       state.bindings[sessionId] = {
         scope,
         updated_at: new Date().toISOString(),
         ...(acceptedMetadata ? { metadata: acceptedMetadata } : {}),
       };
-      const oldestFirst = Object.entries(state.bindings)
-        .sort(([leftId, left], [rightId, right]) =>
-          left.updated_at.localeCompare(right.updated_at) || leftId.localeCompare(rightId));
-      while (oldestFirst.length > MAX_BINDINGS) {
-        const [oldestId] = oldestFirst.shift()!;
-        delete state.bindings[oldestId];
-      }
       await this.writeUnlocked(state);
     });
     return scope;
+  }
+
+  async active(sessionId: string): Promise<MemoryScope | undefined> {
+    validateSessionId(sessionId);
+    const state = await this.readUnlocked();
+    return state.bindings[sessionId]?.scope;
   }
 
   async resolve(input: { session_id?: string; project_key?: string }): Promise<MemoryScope> {

@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { withFileLock } from "./file_lock.js";
+import { SessionScopeError, lifecycleNotReady } from "./session_scope.js";
 import { AuthoritativeStateError, preserveCorruptUtf8, readAuthoritativeJson, } from "./authoritative_state.js";
 const PROJECT_KEY = /^[A-Za-z0-9._:-]{1,128}$/;
 const SESSION_ID = /^[A-Za-z0-9._:-]{1,200}$/;
@@ -12,7 +13,8 @@ const PROJECT_SALT_BYTES = 32;
 export function deriveProjectKey(cwd, salt) {
     if (salt.byteLength !== PROJECT_SALT_BYTES)
         throw new Error("project salt must contain exactly 32 bytes");
-    const canonical = resolve(cwd).replaceAll("\\", "/").toLowerCase();
+    const normalized = resolve(cwd).replaceAll("\\", "/");
+    const canonical = process.platform === "win32" ? normalized.toLowerCase() : normalized;
     return `project:${createHmac("sha256", salt).update(canonical, "utf8").digest("hex")}`;
 }
 export async function loadOrCreateProjectSalt(path = join(homedir(), ".hermes-reflection", "project_salt.bin")) {
@@ -146,20 +148,26 @@ export class FileProjectScopeRepository {
         const acceptedMetadata = safeMetadata(metadata);
         await withFileLock(this.path, async () => {
             const state = await this.readUnlocked();
+            const existing = state.bindings[sessionId];
+            if (existing && existing.scope !== scope) {
+                throw new SessionScopeError("SCOPE_MISMATCH", `Session ${sessionId} is already bound to ${existing.scope}, not ${scope}.`);
+            }
+            if (!existing && Object.keys(state.bindings).length >= MAX_BINDINGS) {
+                throw lifecycleNotReady(`Active session scope binding capacity (${MAX_BINDINGS}) is full; end an active session before starting another.`);
+            }
             state.bindings[sessionId] = {
                 scope,
                 updated_at: new Date().toISOString(),
                 ...(acceptedMetadata ? { metadata: acceptedMetadata } : {}),
             };
-            const oldestFirst = Object.entries(state.bindings)
-                .sort(([leftId, left], [rightId, right]) => left.updated_at.localeCompare(right.updated_at) || leftId.localeCompare(rightId));
-            while (oldestFirst.length > MAX_BINDINGS) {
-                const [oldestId] = oldestFirst.shift();
-                delete state.bindings[oldestId];
-            }
             await this.writeUnlocked(state);
         });
         return scope;
+    }
+    async active(sessionId) {
+        validateSessionId(sessionId);
+        const state = await this.readUnlocked();
+        return state.bindings[sessionId]?.scope;
     }
     async resolve(input) {
         if (input.project_key !== undefined)
