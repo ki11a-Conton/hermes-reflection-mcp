@@ -22,6 +22,7 @@
 - Refreshed the locked `fast-uri`, `hono`, and `ip-address` transitive dependencies to audited versions that remove known production advisories.
 - Updated the current regression harness to use explicit session scope, close SQLite on every exit path, and assert malformed overlay writes fail closed.
 - Made GitHub CI latest-first for v21 and kept historical compatibility suites opt-in instead of release-blocking.
+- Hardened the v21 Windows operation lock against transient `lstat` sharing violations and made the current cross-platform harness skip Windows-only probes while retrying post-exit temporary cleanup.
 
 ## 20.0.0 - 2026-07-29
 

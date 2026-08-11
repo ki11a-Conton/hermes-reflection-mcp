@@ -113,7 +113,12 @@ async function withHome(label, callback) {
   try {
     await callback(home);
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, {
+      recursive: true,
+      force: true,
+      maxRetries: process.platform === "win32" ? 10 : 0,
+      retryDelay: 50,
+    });
   }
 }
 
@@ -1094,17 +1099,19 @@ if (process.argv[2] === "--child") {
     assert.match(result.preview, new RegExp(operationName), "pending approval preview lost the public operation name");
   });
 
-  await withHome("v20-real-split", async (home) => {
-    const write = await runChild(home, "v20-split-write");
-    assert.equal(write.failed, true, "Windows held store.json must reject the v20 index replace");
-    assert.equal(write.journalPresent, true, "Windows denied replace must retain the prepared journal");
-    const state = await runChild(home, "inspect-split");
-    assert.equal(
-      state.reflectionVisible,
-      state.heuristicVisible,
-      `reflection/store business pair diverged after restart: ${JSON.stringify(state)}`,
-    );
-  });
+  if (process.platform === "win32") {
+    await withHome("v20-real-split", async (home) => {
+      const write = await runChild(home, "v20-split-write");
+      assert.equal(write.failed, true, "Windows held store.json must reject the index replace");
+      assert.equal(write.journalPresent, true, "Windows denied replace must retain the prepared journal");
+      const state = await runChild(home, "inspect-split");
+      assert.equal(
+        state.reflectionVisible,
+        state.heuristicVisible,
+        `reflection/store business pair diverged after restart: ${JSON.stringify(state)}`,
+      );
+    });
+  }
 
   await withHome("split", async (home) => {
     const result = await runChild(home, "save-and-read", "after_replace:reflections");
@@ -1196,6 +1203,14 @@ if (process.argv[2] === "--child") {
       assert.equal(permanent.store_unavailable, false, `persistent ${code} is contention, not a store-directory obstruction`);
       assert.equal(permanent.read_attempts, 3, `persistent ${code} must exhaust only the deterministic bounded retry budget`);
       assert.equal(permanent.waits, 3);
+      const statContention = await runChild(home, "lock-read-eperm-retry", undefined, {
+        V21_LOCK_EPERM_MODE: `stat-contention${suffix}`,
+      });
+      assert.equal(statContention.owner_read, false, `transient lstat ${code} must remain bounded contention`);
+      assert.match(statContention.error_message, /timed out waiting for operation journal lock/i);
+      assert.equal(statContention.error_code, "");
+      assert.equal(statContention.read_attempts, 3);
+      assert.equal(statContention.waits, 3);
     }
     const missing = await runChild(home, "lock-read-eperm-retry", undefined, { V21_LOCK_EPERM_MODE: "missing" });
     assert.equal(missing.owner_read, true, "ENOENT after EPERM lstat must retry immediately");

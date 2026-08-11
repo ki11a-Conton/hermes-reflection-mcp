@@ -937,6 +937,13 @@ async function classifyLockReadFailure(error, statTarget = () => lstat(LOCK_PATH
     catch (targetError) {
         if (targetError && typeof targetError === "object" && "code" in targetError && targetError.code === "ENOENT")
             return "missing";
+        // A Windows process may hold the lock with FileShare.None, which can make
+        // both the original operation and this lstat probe fail transiently. Do
+        // not grant ownership in that state: report contention so the bounded
+        // acquire loop waits and re-validates the target after sharing resumes.
+        if (targetError && typeof targetError === "object" && "code" in targetError
+            && (targetError.code === "EPERM" || targetError.code === "EBUSY") && platform === "win32")
+            return "contention";
         throw targetError;
     }
     if (!target.isFile() || target.isSymbolicLink())
@@ -1001,6 +1008,9 @@ export async function runLockReadEpermRetryForTest(mode) {
                 const disposition = await classifyLockReadFailure(error, async () => {
                     if (mode === "missing")
                         throw Object.assign(new Error("injected ENOENT"), { code: "ENOENT" });
+                    if (mode.startsWith("stat-contention")) {
+                        throw Object.assign(new Error(`injected lstat ${contentionCode}`), { code: contentionCode });
+                    }
                     return {
                         isFile: () => mode !== "nonregular",
                         isSymbolicLink: () => mode === "symlink",
