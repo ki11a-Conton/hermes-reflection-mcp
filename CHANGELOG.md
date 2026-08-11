@@ -20,6 +20,8 @@
 - Kept deterministic review available while LLM review, background lifecycle, and automatic persistence remain separately configurable.
 - Documented clean staging, separate code/data backup, migration validation, and matched code/data rollback while retaining the v20 compatibility layer and store schema 2.
 - Refreshed the locked `fast-uri`, `hono`, and `ip-address` transitive dependencies to audited versions that remove known production advisories.
+- Updated the current regression harness to use explicit session scope, close SQLite on every exit path, and assert malformed overlay writes fail closed.
+- Made GitHub CI latest-first for v21 and kept historical compatibility suites opt-in instead of release-blocking.
 
 ## 20.0.0 - 2026-07-29
 

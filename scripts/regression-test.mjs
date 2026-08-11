@@ -57,6 +57,7 @@ async function runDirectCacheAndSessionRegressions() {
   const home = await mkdtemp(join(tmpdir(), "hermes-regression-direct-"));
   const previousHome = process.env.HOME;
   const previousUserProfile = process.env.USERPROFILE;
+  let sessions;
   try {
     const blockedHome = join(home, "home-is-a-file");
     await writeFile(blockedHome, "blocks creation of the storage directory", "utf8");
@@ -97,17 +98,15 @@ async function runDirectCacheAndSessionRegressions() {
     const refreshed = await parent.listHeuristics({ domain: "regression" });
     assert(refreshed[0]?.contradiction_count === 1, "store cache must refresh after a same-size external mutation");
 
-    const sessions = await import(`../dist/session_storage.js?timestamp-order=${Date.now()}`);
+    sessions = await import(`../dist/session_storage.js?timestamp-order=${Date.now()}`);
     const newest = "2026-07-20T12:00:00.000Z";
     const oldest = "2020-01-01T00:00:00.000Z";
-    await sessions.appendSessionTurn("timestamp-order", "user", "newest timestamp", newest);
-    await sessions.appendSessionTurn("timestamp-order", "assistant", "oldest timestamp", oldest);
-    const metas = await sessions.listRecentSessions(10);
+    await sessions.appendSessionTurn("timestamp-order", "user", "newest timestamp", newest, { scope: "global" });
+    await sessions.appendSessionTurn("timestamp-order", "assistant", "oldest timestamp", oldest, { scope: "global" });
+    const metas = await sessions.listRecentSessionsInScope("global", 10);
     const meta = metas?.find((item) => item.session_id === "timestamp-order");
     assert(meta?.started_at === oldest, "session started_at must retain the earliest turn timestamp");
     assert(meta?.last_turn_at === newest, "session last_turn_at must retain the latest turn timestamp");
-    sessions.closeSessionStorage();
-
     const snapshots = await import(`../dist/src/memory_snapshot.js?snapshot-race=${Date.now()}`);
     const emptyBoard = { entries: [], char_limit: 2200, used_chars: 0 };
     snapshots.clearAllSnapshots();
@@ -156,9 +155,13 @@ async function runDirectCacheAndSessionRegressions() {
     assert(handoff.includes("completed-0"), "compaction must retain the newest completed reflection when bounded");
     assert(!handoff.includes("completed-9"), "compaction must discard the oldest completed reflection first when bounded");
   } finally {
-    process.env.HOME = previousHome;
-    process.env.USERPROFILE = previousUserProfile;
-    await rm(home, { recursive: true, force: true });
+    try {
+      sessions?.closeSessionStorage();
+    } finally {
+      process.env.HOME = previousHome;
+      process.env.USERPROFILE = previousUserProfile;
+      await rm(home, { recursive: true, force: true });
+    }
   }
 }
 
@@ -603,7 +606,7 @@ async function runMalformedResolvedIndexRegression() {
     const resolvedPath = join(storeDir, "resolved_questions.json");
     await writeFile(resolvedPath, "[]", "utf8");
     peer = await connect("resolved-shape-writer", home);
-    await call(peer.client, "reflect_on_task", {
+    const write = await peer.client.callTool({ name: "reflect_on_task", arguments: {
       session_id: "resolved-shape",
       task_goal: "persist resolution across restart",
       task_outcome: "success",
@@ -615,7 +618,11 @@ async function runMalformedResolvedIndexRegression() {
         priority: "high",
         requires_environment_interaction: false,
       }],
-    });
+    } });
+    assert(
+      write.isError === true && /Refusing to continue/.test(text(write)),
+      "a malformed resolved-question overlay must fail closed for writes",
+    );
     const first = await peer.client.callTool({ name: "export_data", arguments: { collection: "all" } });
     assert(
       first.isError === true && /Refusing to continue/.test(text(first)),

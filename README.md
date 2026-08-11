@@ -163,6 +163,6 @@ npm run test:v21
 
 `npm run test:v20:agent` runs 20 fresh-process Codex Agent workflows and requires at least 18/20 passes with zero destructive-tool violations. It needs the local `codex` executable and can make model calls. The fixture grader is deterministic and offline.
 
-CI runs Windows and Linux on Node 20 and 22, including strict TypeScript, compatibility tests, v20 and v21 suites, concurrency checks, package dry-run, fixture grading, and production audit.
+CI is latest-first on Windows and Linux with Node 20 and 22. It runs strict TypeScript, current base regressions, v21 lifecycle/transaction/safety/release suites, concurrency checks, package dry-run, and production audit. Historical compatibility suites remain available as opt-in local commands but do not block the v21 release.
 
 See [`INSTALL_HERMES_MCP.md`](INSTALL_HERMES_MCP.md) for installation and [`CHANGELOG.md`](CHANGELOG.md) for release history.

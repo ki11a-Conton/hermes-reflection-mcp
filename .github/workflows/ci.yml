@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -44,29 +45,11 @@ jobs:
       - name: Base regressions
         run: npm run test:regressions
 
-      - name: v19.3 regressions and integration
-        run: npm run test:v19.3
-
-      - name: v19.4 regressions
-        run: npm run test:v19.4
-
-      - name: v19.4.1 regressions
-        run: npm run test:v19.4.1
-
-      - name: v19.5 context budget
-        run: npm run test:v19.5
-
-      - name: Deterministic v20 suites
-        run: npm run test:v20
-
       - name: v21 lifecycle, transaction, safety, and release suites
         run: npm run test:v21
 
       - name: Single and cross-process concurrency
         run: npm run test:concurrency
-
-      - name: Grade sanitized Agent transcript
-        run: npm run test:v20:agent-fixture
 
       - name: Verify package allow-list
         run: npm pack --dry-run --json

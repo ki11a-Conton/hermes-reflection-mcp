@@ -127,6 +127,6 @@ npm run test:v20:agent-fixture
 
 `npm run test:v20:agent` 会运行 20 个全新 Codex Agent 流程，要求至少 18/20 通过且破坏性工具违规为零；它需要本机 `codex` 命令并可能产生模型调用。fixture grader 是离线确定性的。
 
-CI 在 Windows/Linux 与 Node 20/22 上执行严格 TypeScript、兼容测试、v20 与 v21 测试、并发测试、打包预检、fixture 评分和生产依赖审计。
+CI 采用 latest-first：在 Windows/Linux 与 Node 20/22 上执行严格 TypeScript、当前基础回归、v21 生命周期/事务/安全/发布测试、并发测试、打包预检和生产依赖审计。历史兼容套件保留为本地按需命令，但不再阻塞 v21 发布。
 
 安装步骤见 [`INSTALL_HERMES_MCP.md`](INSTALL_HERMES_MCP.md)，版本记录见 [`CHANGELOG.md`](CHANGELOG.md)。
