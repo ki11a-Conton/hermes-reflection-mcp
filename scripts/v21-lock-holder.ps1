@@ -2,7 +2,9 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$LockPath,
   [Parameter(Mandatory = $true)]
-  [string]$Token
+  [string]$Token,
+  [ValidateRange(0, 30000)]
+  [int]$HoldMilliseconds = 0
 )
 
 $stream = [System.IO.File]::Open(
@@ -19,7 +21,11 @@ try {
   $stream.Flush($true)
   [Console]::Out.WriteLine("READY")
   [Console]::Out.Flush()
-  [Console]::In.ReadLine() | Out-Null
+  if ($HoldMilliseconds -gt 0) {
+    Start-Sleep -Milliseconds $HoldMilliseconds
+  } else {
+    [Console]::In.ReadLine() | Out-Null
+  }
 } finally {
   $stream.Dispose()
 }

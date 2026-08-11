@@ -924,6 +924,11 @@ async function tryAcquireMainOnce(owner) {
     }
     return true;
 }
+async function markLockContentionForTest() {
+    const marker = process.env.HERMES_TEST_OPERATION_LOCK_CONTENTION_MARKER;
+    if (process.env.NODE_ENV === "test" && marker)
+        await writeFile(marker, "observed\n", "utf8");
+}
 async function classifyLockReadFailure(error, statTarget = () => lstat(LOCK_PATH), platform = process.platform) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT")
         return "missing";
@@ -942,12 +947,15 @@ async function classifyLockReadFailure(error, statTarget = () => lstat(LOCK_PATH
         // not grant ownership in that state: report contention so the bounded
         // acquire loop waits and re-validates the target after sharing resumes.
         if (targetError && typeof targetError === "object" && "code" in targetError
-            && (targetError.code === "EPERM" || targetError.code === "EBUSY") && platform === "win32")
+            && (targetError.code === "EPERM" || targetError.code === "EBUSY") && platform === "win32") {
+            await markLockContentionForTest();
             return "contention";
+        }
         throw targetError;
     }
     if (!target.isFile() || target.isSymbolicLink())
         throw new Error("operation lock target is not a regular file", { cause: error });
+    await markLockContentionForTest();
     return "contention";
 }
 async function acquireLock() {
@@ -960,7 +968,10 @@ async function acquireLock() {
         throw error;
     }
     const owner = { schema_version: 1, pid: process.pid, token: randomUUID() };
+    const deadline = Date.now() + 10_000;
     for (let attempt = 0; attempt < 400; attempt += 1) {
+        if (Date.now() >= deadline)
+            break;
         if (await tryAcquireMainOnce(owner))
             return async () => removeOwnedFile(LOCK_PATH, owner.token);
         try {
@@ -969,10 +980,16 @@ async function acquireLock() {
                 return async () => removeOwnedFile(LOCK_PATH, owner.token);
         }
         catch (readError) {
-            if (await classifyLockReadFailure(readError) === "missing")
+            if (await classifyLockReadFailure(readError) === "missing") {
+                if (Date.now() >= deadline)
+                    break;
                 continue;
+            }
         }
-        await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0)
+            break;
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, Math.min(25, remainingMs)));
     }
     throw new Error("timed out waiting for operation journal lock");
 }

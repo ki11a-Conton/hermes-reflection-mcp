@@ -101,6 +101,7 @@ async function runChild(home, scenario, failpoint, extraEnv = {}) {
       ...(failpoint ? { HERMES_TEST_REFLECTION_TX_FAILPOINT: failpoint } : {}),
       ...extraEnv,
     },
+    timeout: 30_000,
     windowsHide: true,
   });
   const line = stdout.trim().split(/\r?\n/).at(-1);
@@ -110,16 +111,28 @@ async function runChild(home, scenario, failpoint, extraEnv = {}) {
 
 async function withHome(label, callback) {
   const home = await mkdtemp(join(tmpdir(), `hermes-v21-${label}-`));
+  let result;
+  let callbackError;
   try {
-    await callback(home);
-  } finally {
+    result = await callback(home);
+  } catch (error) {
+    callbackError = error;
+  }
+  try {
     await rm(home, {
       recursive: true,
       force: true,
       maxRetries: process.platform === "win32" ? 10 : 0,
       retryDelay: 50,
     });
+  } catch (cleanupError) {
+    if (callbackError !== undefined) {
+      throw new AggregateError([callbackError, cleanupError], `v21 test and cleanup both failed for ${label}`);
+    }
+    throw cleanupError;
   }
+  if (callbackError !== undefined) throw callbackError;
+  return result;
 }
 
 function startProtocolChild(home, scenario, extraEnv = {}) {
@@ -186,13 +199,52 @@ async function waitForTestMarker(path, timeoutMs = 2_000) {
     catch (error) { if (error?.code !== "ENOENT") throw error; }
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
   }
-  throw new Error(`authority-read test hook did not publish marker within ${timeoutMs}ms: ${path}`);
+  throw new Error(`test hook did not publish marker within ${timeoutMs}ms: ${path}`);
 }
 
-async function startWindowsLockHolder(lockPath, token) {
+function waitForChildClose(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
+  }
+  return new Promise((resolveClose, rejectClose) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.removeListener("close", onClose);
+      child.removeListener("error", onError);
+    };
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolveClose(value);
+    };
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      rejectClose(error);
+    };
+    const onClose = (code, signal) => finish({ code, signal });
+    const onError = (error) => fail(error);
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    child.once("close", onClose);
+    child.once("error", onError);
+  });
+}
+
+async function terminateChild(child, label, timeoutMs = 3_000) {
+  if (child.exitCode === null && child.signalCode === null) child.kill();
+  const outcome = await waitForChildClose(child, timeoutMs);
+  if (outcome === null) throw new Error(`${label} did not terminate within ${timeoutMs}ms`);
+  return outcome;
+}
+
+async function startWindowsLockHolder(lockPath, token, holdMilliseconds = 0) {
   const holder = spawn("powershell.exe", [
     "-NoProfile", "-NonInteractive", "-File", WINDOWS_LOCK_HOLDER,
     "-LockPath", lockPath, "-Token", token,
+    "-HoldMilliseconds", String(holdMilliseconds),
   ], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
   let stdout = "";
   let stderr = "";
@@ -200,19 +252,45 @@ async function startWindowsLockHolder(lockPath, token) {
   holder.stderr.setEncoding("utf8");
   holder.stdout.on("data", (chunk) => { stdout += chunk; });
   holder.stderr.on("data", (chunk) => { stderr += chunk; });
-  await new Promise((resolveReady, rejectReady) => {
-    const timer = setTimeout(() => rejectReady(new Error(`timed out waiting for Windows lock holder: ${stderr}`)), 10_000);
-    const inspect = () => {
-      if (stdout.includes("READY")) { clearTimeout(timer); resolveReady(); }
-    };
-    holder.stdout.on("data", inspect);
-    holder.once("exit", (code) => {
-      if (!stdout.includes("READY")) {
+  try {
+    await new Promise((resolveReady, rejectReady) => {
+      let settled = false;
+      const cleanup = () => {
         clearTimeout(timer);
-        rejectReady(new Error(`Windows lock holder exited ${code}: ${stderr}`));
-      }
+        holder.stdout.removeListener("data", inspect);
+        holder.removeListener("close", onClose);
+        holder.removeListener("error", onError);
+      };
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        callback(value);
+      };
+      const inspect = () => {
+        if (stdout.includes("READY")) finish(resolveReady);
+      };
+      const onClose = (code, signal) => finish(
+        rejectReady,
+        new Error(`Windows lock holder exited before READY: ${code} (${signal ?? "no signal"}): ${stderr}`),
+      );
+      const onError = (error) => finish(rejectReady, error);
+      const timer = setTimeout(
+        () => finish(rejectReady, new Error(`timed out waiting for Windows lock holder: ${stderr}`)),
+        10_000,
+      );
+      holder.stdout.on("data", inspect);
+      holder.once("close", onClose);
+      holder.once("error", onError);
+      inspect();
     });
-  });
+  } catch (readyError) {
+    try { await terminateChild(holder, "failed Windows lock holder", 3_000); }
+    catch (cleanupError) {
+      throw new AggregateError([readyError, cleanupError], "Windows lock holder startup and cleanup both failed");
+    }
+    throw readyError;
+  }
   return holder;
 }
 
@@ -1235,22 +1313,27 @@ if (process.argv[2] === "--child") {
     assert.equal(relative(resolve(home), storeRoot), ".hermes-reflection");
     await mkdir(storeRoot, { recursive: true });
     const lockPath = resolve(storeRoot, "operation_journal.lock");
+    const contentionMarker = resolve(storeRoot, "test-lock-contention.marker");
     assert.equal(relative(resolve(home), lockPath), join(".hermes-reflection", "operation_journal.lock"));
-    const holder = await startWindowsLockHolder(lockPath, "32345678-1234-4123-8123-123456789abc");
+    const holder = await startWindowsLockHolder(lockPath, "32345678-1234-4123-8123-123456789abc", 10_000);
     try {
-      const recovering = runChild(home, "recover-lock-contention");
-      await new Promise((resolveWait) => setTimeout(resolveWait, 500));
-      holder.stdin.end("\n");
-      const result = await recovering;
+      const recovering = runChild(home, "recover-lock-contention", undefined, {
+        HERMES_TEST_OPERATION_LOCK_CONTENTION_MARKER: contentionMarker,
+      }).then((value) => ({ value }), (error) => ({ error }));
+      await waitForTestMarker(contentionMarker, 5_000);
+      await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+      await terminateChild(holder, "Windows FileShare.None holder");
+      const outcome = await recovering;
+      if (outcome.error) throw outcome.error;
+      const result = outcome.value;
       assert.equal(result.recovered, true, `actual Windows FileShare.None contention must recover: ${result.error}`);
       assert.equal(result.store_unavailable, false);
-      assert.ok(result.elapsed_ms >= 100, "real OS probe must observe contention before the holder releases");
+      assert.ok(result.elapsed_ms >= 100, "contention marker must precede holder release by a measurable interval");
+      assert.ok(result.elapsed_ms < 5_000, `real OS contention recovery exceeded its wall-clock budget: ${result.elapsed_ms}ms`);
     } finally {
-      if (!holder.stdin.destroyed) holder.stdin.end("\n");
-      await new Promise((resolveExit) => {
-        if (holder.exitCode !== null) resolveExit();
-        else holder.once("exit", resolveExit);
-      });
+      if (holder.exitCode === null && holder.signalCode === null) {
+        await terminateChild(holder, "Windows FileShare.None holder");
+      }
     }
   });
 
