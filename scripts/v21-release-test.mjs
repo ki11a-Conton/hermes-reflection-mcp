@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const EXPECTED_VERSION = "21.0.0";
+const EXPECTED_VERSION = "21.1.0";
 const runtimeRequested = process.argv.includes("--runtime") || Boolean(process.env.HERMES_SERVER_ENTRY);
 const explicitProjectRoot = process.env.HERMES_PROJECT_ROOT;
 
@@ -81,6 +81,12 @@ const v21Tests = [
   "scripts/v21-model-visible-safety-test.mjs",
   "scripts/v21-compaction-test.mjs",
   "scripts/v21-release-test.mjs",
+  "scripts/v21.1-hook-contract-test.mjs",
+  "scripts/v21.1-session-storage-test.mjs",
+  "scripts/v21.1-lifecycle-test.mjs",
+  "scripts/v21.1-context-review-test.mjs",
+  "scripts/v21.1-hooks-install-test.mjs",
+  "scripts/install-codex-hooks.mjs",
 ];
 
 const retainedLegacyTests = [

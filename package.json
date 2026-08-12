@@ -1,6 +1,6 @@
 {
   "name": "hermes-reflection-mcp",
-  "version": "21.0.0",
+  "version": "21.1.0",
   "description": "Hermes-inspired local reflection, heuristic, memory, and session MCP server",
   "type": "module",
   "main": "dist/index.js",
@@ -39,6 +39,12 @@
     "scripts/v21-model-visible-safety-test.mjs",
     "scripts/v21-compaction-test.mjs",
     "scripts/v21-release-test.mjs",
+    "scripts/v21.1-hook-contract-test.mjs",
+    "scripts/v21.1-session-storage-test.mjs",
+    "scripts/v21.1-lifecycle-test.mjs",
+    "scripts/v21.1-context-review-test.mjs",
+    "scripts/v21.1-hooks-install-test.mjs",
+    "scripts/install-codex-hooks.mjs",
     "evals/v20-agent-workflows.json",
     "evals/v20-agent-transcript.jsonl",
     "scripts/background-worker-child.mjs",
@@ -86,7 +92,8 @@
     "test:v21:safety": "npm run build && node scripts/v21-model-visible-safety-test.mjs",
     "test:v21:compaction": "npm run build && node scripts/v21-compaction-test.mjs",
     "test:v21:release": "npm run build && node scripts/v21-release-test.mjs --runtime",
-    "test:v21": "npm run test:v21:scope && node scripts/v21-hook-pump-test.mjs && node scripts/v21-idempotency-test.mjs && node scripts/v21-reflection-transaction-test.mjs && node scripts/v21-review-safety-test.mjs && node scripts/v21-model-visible-safety-test.mjs && node scripts/v21-compaction-test.mjs && node scripts/v21-release-test.mjs --runtime",
+    "test:v21.1": "npm run build && node scripts/v21.1-hook-contract-test.mjs && node scripts/v21.1-session-storage-test.mjs && node scripts/v21.1-lifecycle-test.mjs && node scripts/v21.1-context-review-test.mjs --context && node scripts/v21.1-context-review-test.mjs --review && node scripts/v21.1-hooks-install-test.mjs",
+    "test:v21": "npm run test:v21:scope && node scripts/v21-hook-pump-test.mjs && node scripts/v21-idempotency-test.mjs && node scripts/v21-reflection-transaction-test.mjs && node scripts/v21-review-safety-test.mjs && node scripts/v21-model-visible-safety-test.mjs && node scripts/v21-compaction-test.mjs && node scripts/v21.1-hook-contract-test.mjs && node scripts/v21.1-session-storage-test.mjs && node scripts/v21.1-lifecycle-test.mjs && node scripts/v21.1-context-review-test.mjs --context && node scripts/v21.1-context-review-test.mjs --review && node scripts/v21.1-hooks-install-test.mjs && node scripts/v21-release-test.mjs --runtime",
     "start": "node dist/index.js"
   },
   "dependencies": {

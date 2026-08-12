@@ -93,7 +93,7 @@ async function runSingleFlightChild() {
   await storage.initializeStoreV20();
   const reflection = reflectionFixture("single-flight-session");
   await storage.saveReflectionAndHeuristics(reflection, [], reflection.domain, "single-flight-test", 0.65, []);
-  const source = await engine.getReviewSourceState(reflection.session_id, "recent");
+  const source = await engine.getReviewSourceState(reflection.session_id, "recent", undefined, "llm");
   const lifecycle = lifecycleModule.backgroundLifecycle;
   await lifecycle.notifyReflectionSaved(reflection.session_id);
   await lifecycle.options.store.markDirty(reflection.session_id, new Date(Date.now() - 10_000).toISOString());
@@ -121,7 +121,7 @@ async function runManualLeaseChild() {
   await storage.initializeStoreV20();
   const reflection = reflectionFixture("manual-lease-session");
   await storage.saveReflectionAndHeuristics(reflection, [], reflection.domain, "manual-lease-test", 0.65, []);
-  const source = await engine.getReviewSourceState(reflection.session_id, "recent");
+  const source = await engine.getReviewSourceState(reflection.session_id, "recent", undefined, "llm");
   const state = new BackgroundStateStore(join(process.env.HOME, ".hermes-reflection", "manual-lease-state.json"));
   await state.markDirty(reflection.session_id, new Date(Date.now() - 10_000).toISOString());
   const lifecycle = new BackgroundLifecycle({
@@ -191,7 +191,7 @@ async function runManualShutdownChild() {
   await storage.initializeStoreV20();
   const reflection = reflectionFixture("manual-shutdown-session");
   await storage.saveReflectionAndHeuristics(reflection, [], reflection.domain, "manual-shutdown-test", 0.65, []);
-  const source = await engine.getReviewSourceState(reflection.session_id, "recent");
+  const source = await engine.getReviewSourceState(reflection.session_id, "recent", undefined, "llm");
   const state = new BackgroundStateStore(join(process.env.HOME, ".hermes-reflection", "manual-shutdown-state.json"));
   await state.markDirty(reflection.session_id, new Date(Date.now() - 10_000).toISOString());
   const lifecycle = new BackgroundLifecycle({

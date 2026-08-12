@@ -118,7 +118,7 @@ export const RetrieveHeuristicsSchema = z.object({
     session_id: z.string().min(1).max(200).optional(),
     project_key: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).optional(),
     domain: optionalDomainSchema,
-    limit: z.number().int().min(1).max(50).default(10),
+    limit: z.number().int().min(1).max(50).default(3),
     tags: nullableArray(z.string().max(100)),
     tag_mode: z.enum(["and", "or"]).default("and"),
     show_scores: z.boolean().default(false),
@@ -414,7 +414,7 @@ function register(name, description, input, annotations) {
 register("reflect_on_task", "Store a scoped post-task reflection; optionally extract safe heuristics. Compact by default.", ReflectOnTaskSchema, MUTATING);
 register("search_reflections", "Search scoped reflections. Compact by default; use full for detail.", SearchReflectionsSchema, READ_ONLY);
 register("list_reflections", "List stored reflections with deterministic filters and pagination. Compact by default; use response_mode:'full' for detail.", ListReflectionsSchema, READ_ONLY);
-register("retrieve_heuristics", "Retrieve scoped lessons read-only. Compact by default; use full for scores.", RetrieveHeuristicsSchema, READ_ONLY);
+register("retrieve_heuristics", "Use when prior lessons may materially change substantial work. Compact by default; get_memory_item drills into an ID. Skip trivial edits, repeated same-task lookup, sufficient prompts, or tasks where current files/URLs/live sources can be inspected first.", RetrieveHeuristicsSchema, READ_ONLY);
 register("list_heuristics", "List stored heuristics with deterministic filters. Compact by default; use response_mode:'full' for detail.", ListHeuristicsSchema, READ_ONLY);
 register("search_heuristics", "Search stored heuristics by relevance. Compact by default; use response_mode:'full' for detail.", SearchHeuristicsSchema, READ_ONLY);
 register("add_heuristic", "Add or reinforce one validated heuristic.", AddHeuristicSchema, MUTATING);

@@ -4,9 +4,15 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdirSync } from "fs";
 import { join } from "path";
 import { STORE_DIR } from "./storage.js";
-import type { SessionSearchResult, SessionMeta, SessionTurn } from "./types.js";
+import type {
+  CapturedTurnSide,
+  CompactionObservation,
+  SessionSearchResult,
+  SessionMeta,
+  SessionTurn,
+} from "./types.js";
 import { withFileLock } from "./src/file_lock.js";
-import { redactSensitiveText } from "./src/redaction.js";
+import { codePointLength, redactSensitiveText } from "./src/redaction.js";
 import { OperationJournalStoreUnavailableError } from "./src/operation_journal.js";
 import {
   createCompactionReceipt,
@@ -57,6 +63,19 @@ export interface SessionEndProvenance {
 
 export interface SessionAppendProvenance {
   scope?: RequestedSessionScope;
+}
+
+export interface CapturedTurnSideInput extends CapturedTurnSide {
+  scope: RequestedSessionScope;
+}
+
+export interface CapturedTurnStageResult {
+  state: "staged" | "committed" | "duplicate";
+  turn_indexes?: [number, number];
+}
+
+export interface CompactionObservationInput extends CompactionObservation {
+  scope: RequestedSessionScope;
 }
 let _db: Database.Database | null = null;
 let _dbLoadPromise: Promise<Database.Database | null> | null = null;
@@ -117,6 +136,42 @@ function initializeSessionSchema(db: Database.Database): void {
     db.prepare(
       "UPDATE session_meta SET updated_at = COALESCE(last_turn_at, started_at) WHERE updated_at = ''",
     ).run();
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS pending_turn_sides (
+        session_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        side TEXT NOT NULL CHECK (side IN ('user', 'assistant')),
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        occurred_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        original_code_points INTEGER NOT NULL,
+        content_truncated INTEGER NOT NULL CHECK (content_truncated IN (0, 1)),
+        content_blocked INTEGER NOT NULL CHECK (content_blocked IN (0, 1)),
+        PRIMARY KEY (session_id, turn_id, side)
+      );
+      CREATE INDEX IF NOT EXISTS pending_turn_expiry_idx
+        ON pending_turn_sides(expires_at);
+      CREATE TABLE IF NOT EXISTS committed_turn_pairs (
+        session_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        user_hash TEXT NOT NULL,
+        assistant_hash TEXT NOT NULL,
+        committed_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, turn_id)
+      );
+      CREATE TABLE IF NOT EXISTS compaction_observations (
+        event_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        phase TEXT NOT NULL CHECK (phase IN ('pre', 'post')),
+        trigger TEXT NOT NULL CHECK (trigger IN ('auto', 'manual')),
+        occurred_at TEXT NOT NULL,
+        scope TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS compaction_observation_session_idx
+        ON compaction_observations(session_id, occurred_at);
+    `);
   });
   migrate.immediate();
 }
@@ -464,6 +519,296 @@ export async function appendSessionTurn(
     if (error instanceof OperationJournalStoreUnavailableError) return false;
     throw error;
   }
+}
+
+type PendingTurnSideRow = Omit<CapturedTurnSide, "content_truncated" | "content_blocked"> & {
+  content_truncated: number;
+  content_blocked: number;
+};
+
+type CommittedTurnPairRow = {
+  user_hash: string;
+  assistant_hash: string;
+};
+
+function safeCoordinationId(value: unknown, label: string): string {
+  const text = boundedString(value, label, 200);
+  if (!/^[A-Za-z0-9._:-]+$/.test(text)) {
+    throw new Error(`${label} must contain only safe identifier characters`);
+  }
+  return text;
+}
+
+function sha256Digest(value: unknown, label: string): string {
+  const digest = boundedString(value, label, 64).toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(digest)) throw new Error(`${label} must be a SHA-256 digest`);
+  return digest;
+}
+
+function capturedBoolean(value: unknown, label: string): boolean {
+  if (typeof value !== "boolean") throw new Error(`${label} must be a boolean`);
+  return value;
+}
+
+function capturedCount(value: unknown, label: string): number {
+  if (!Number.isInteger(value) || (value as number) < 0 || (value as number) > 1_000_000) {
+    throw new Error(`${label} must be an integer between 0 and 1000000`);
+  }
+  return value as number;
+}
+
+function validateCapturedTurnSide(input: CapturedTurnSideInput): CapturedTurnSideInput {
+  const content = boundedString(input.content, "content", 24_000, true);
+  if (codePointLength(content) > 12_000) {
+    throw new Error("content must contain at most 12000 Unicode code points");
+  }
+  if (input.side !== "user" && input.side !== "assistant") {
+    throw new Error("side must be user or assistant");
+  }
+  const occurredAt = isoTimestamp(input.occurred_at, "occurred_at");
+  const expiresAt = isoTimestamp(input.expires_at, "expires_at");
+  if (expiresAt <= occurredAt) throw new Error("expires_at must be later than occurred_at");
+  return {
+    session_id: safeCoordinationId(input.session_id, "session_id"),
+    turn_id: safeCoordinationId(input.turn_id, "turn_id"),
+    side: input.side,
+    content,
+    content_hash: sha256Digest(input.content_hash, "content_hash"),
+    occurred_at: occurredAt,
+    expires_at: expiresAt,
+    original_code_points: capturedCount(input.original_code_points, "original_code_points"),
+    content_truncated: capturedBoolean(input.content_truncated, "content_truncated"),
+    content_blocked: capturedBoolean(input.content_blocked, "content_blocked"),
+    scope: normalizeRequestedSessionScope(input.scope),
+  };
+}
+
+function pendingSideFromRow(row: PendingTurnSideRow): CapturedTurnSide {
+  return {
+    ...row,
+    side: row.side as "user" | "assistant",
+    content_truncated: row.content_truncated === 1,
+    content_blocked: row.content_blocked === 1,
+  };
+}
+
+function sameCapturedProjection(left: CapturedTurnSide, right: CapturedTurnSide): boolean {
+  return left.content_hash === right.content_hash
+    && left.content === right.content
+    && left.original_code_points === right.original_code_points
+    && left.content_truncated === right.content_truncated
+    && left.content_blocked === right.content_blocked;
+}
+
+function maxTimestamp(...values: Array<string | undefined>): string {
+  return values.filter((value): value is string => value !== undefined).sort().at(-1)!;
+}
+
+function minTimestamp(...values: Array<string | undefined>): string {
+  return values.filter((value): value is string => value !== undefined).sort().at(0)!;
+}
+
+export async function stageCapturedTurnSide(
+  rawInput: CapturedTurnSideInput,
+): Promise<CapturedTurnStageResult> {
+  return withCoordinatorMutationBarrier(async () => {
+    const input = validateCapturedTurnSide(rawInput);
+    const db = await getDb();
+    if (!db) throw new Error(SESSION_STORAGE_UNAVAILABLE);
+    return withSessionWriteLock(async () => {
+      let result: CapturedTurnStageResult = { state: "staged" };
+      const stage = db.transaction(() => {
+        const meta = readSessionMeta(db, input.session_id);
+        if (!meta) throw lifecycleNotReady(`Session lifecycle metadata is not ready for ${input.session_id}.`);
+        assertSessionScopeVisibility(meta.scope, input.scope);
+
+        const committed = db.prepare(`
+          SELECT user_hash, assistant_hash FROM committed_turn_pairs
+          WHERE session_id = ? AND turn_id = ?
+        `).get(input.session_id, input.turn_id) as CommittedTurnPairRow | undefined;
+        if (committed) {
+          const canonicalHash = input.side === "user" ? committed.user_hash : committed.assistant_hash;
+          if (canonicalHash !== input.content_hash) {
+            throw new Error("CAPTURED_TURN_CONFLICT: committed turn side has different content");
+          }
+          result = { state: "duplicate" };
+          return;
+        }
+
+        const existingRow = db.prepare(`
+          SELECT session_id, turn_id, side, content, content_hash, occurred_at, expires_at,
+                 original_code_points, content_truncated, content_blocked
+          FROM pending_turn_sides WHERE session_id = ? AND turn_id = ? AND side = ?
+        `).get(input.session_id, input.turn_id, input.side) as PendingTurnSideRow | undefined;
+        if (existingRow) {
+          const existing = pendingSideFromRow(existingRow);
+          if (!sameCapturedProjection(existing, input)) {
+            throw new Error("CAPTURED_TURN_CONFLICT: pending turn side has different content or safety projection");
+          }
+        } else {
+          db.prepare(`
+            INSERT INTO pending_turn_sides (
+              session_id, turn_id, side, content, content_hash, occurred_at, expires_at,
+              original_code_points, content_truncated, content_blocked
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            input.session_id,
+            input.turn_id,
+            input.side,
+            input.content,
+            input.content_hash,
+            input.occurred_at,
+            input.expires_at,
+            input.original_code_points,
+            input.content_truncated ? 1 : 0,
+            input.content_blocked ? 1 : 0,
+          );
+        }
+
+        const rows = db.prepare(`
+          SELECT session_id, turn_id, side, content, content_hash, occurred_at, expires_at,
+                 original_code_points, content_truncated, content_blocked
+          FROM pending_turn_sides WHERE session_id = ? AND turn_id = ? ORDER BY side
+        `).all(input.session_id, input.turn_id) as PendingTurnSideRow[];
+        const userRow = rows.find((row) => row.side === "user");
+        const assistantRow = rows.find((row) => row.side === "assistant");
+        if (!userRow || !assistantRow) {
+          result = { state: "staged" };
+          return;
+        }
+        const user = pendingSideFromRow(userRow);
+        const assistant = pendingSideFromRow(assistantRow);
+        const userIndex = meta.turn_count;
+        const assistantIndex = userIndex + 1;
+        const insertTurn = db.prepare(
+          "INSERT INTO sessions_fts (session_id, turn_index, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+        );
+        insertTurn.run(input.session_id, userIndex, "user", user.content, user.occurred_at);
+        insertTurn.run(input.session_id, assistantIndex, "assistant", assistant.content, assistant.occurred_at);
+        const updatedAt = maxTimestamp(meta.updated_at, user.occurred_at, assistant.occurred_at);
+        const lastTurnAt = maxTimestamp(meta.last_turn_at, user.occurred_at, assistant.occurred_at);
+        const startedAt = minTimestamp(meta.started_at, user.occurred_at, assistant.occurred_at);
+        db.prepare(`
+          UPDATE session_meta SET turn_count = turn_count + 2, started_at = ?, last_turn_at = ?, updated_at = ?
+          WHERE session_id = ?
+        `).run(startedAt, lastTurnAt, updatedAt, input.session_id);
+        db.prepare(`
+          INSERT INTO committed_turn_pairs (session_id, turn_id, user_hash, assistant_hash, committed_at)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(input.session_id, input.turn_id, user.content_hash, assistant.content_hash, updatedAt);
+        db.prepare("DELETE FROM pending_turn_sides WHERE session_id = ? AND turn_id = ?")
+          .run(input.session_id, input.turn_id);
+        result = { state: "committed", turn_indexes: [userIndex, assistantIndex] };
+      });
+      await withSqliteContentionRetry(() => stage.immediate());
+      return result;
+    });
+  });
+}
+
+export async function cleanupPendingTurnSides(options: {
+  session_id?: string;
+  now?: string;
+} = {}): Promise<number> {
+  return withCoordinatorMutationBarrier(async () => {
+    const sessionId = options.session_id === undefined
+      ? undefined
+      : safeCoordinationId(options.session_id, "session_id");
+    const now = options.now === undefined ? new Date().toISOString() : isoTimestamp(options.now, "now");
+    const db = await getDb();
+    if (!db) throw new Error(SESSION_STORAGE_UNAVAILABLE);
+    return withSessionWriteLock(async () => {
+      let removed = 0;
+      const clean = db.transaction(() => {
+        const info = sessionId === undefined
+          ? db.prepare("DELETE FROM pending_turn_sides WHERE expires_at <= ?").run(now)
+          : db.prepare("DELETE FROM pending_turn_sides WHERE session_id = ?").run(sessionId);
+        removed = info.changes;
+      });
+      await withSqliteContentionRetry(() => clean.immediate());
+      return removed;
+    });
+  });
+}
+
+function validateCompactionObservation(input: CompactionObservationInput): CompactionObservationInput {
+  if (input.phase !== "pre" && input.phase !== "post") throw new Error("phase must be pre or post");
+  if (input.trigger !== "auto" && input.trigger !== "manual") throw new Error("trigger must be auto or manual");
+  return {
+    event_id: safeCoordinationId(input.event_id, "event_id"),
+    session_id: safeCoordinationId(input.session_id, "session_id"),
+    turn_id: safeCoordinationId(input.turn_id, "turn_id"),
+    phase: input.phase,
+    trigger: input.trigger,
+    occurred_at: isoTimestamp(input.occurred_at, "occurred_at"),
+    scope: normalizeRequestedSessionScope(input.scope),
+  };
+}
+
+function sameCompactionObservation(left: CompactionObservation, right: CompactionObservation): boolean {
+  return left.event_id === right.event_id
+    && left.session_id === right.session_id
+    && left.turn_id === right.turn_id
+    && left.phase === right.phase
+    && left.trigger === right.trigger
+    && left.occurred_at === right.occurred_at
+    && left.scope === right.scope;
+}
+
+export async function persistCompactionObservation(
+  rawInput: CompactionObservationInput,
+): Promise<"inserted" | "duplicate"> {
+  return withCoordinatorMutationBarrier(async () => {
+    const input = validateCompactionObservation(rawInput);
+    const db = await getDb();
+    if (!db) throw new Error(SESSION_STORAGE_UNAVAILABLE);
+    return withSessionWriteLock(async () => {
+      let result: "inserted" | "duplicate" = "inserted";
+      const persist = db.transaction(() => {
+        const meta = readSessionMeta(db, input.session_id);
+        if (!meta) throw lifecycleNotReady(`Session lifecycle metadata is not ready for ${input.session_id}.`);
+        assertSessionScopeVisibility(meta.scope, input.scope);
+        const existing = db.prepare(`
+          SELECT event_id, session_id, turn_id, phase, trigger, occurred_at, scope
+          FROM compaction_observations WHERE event_id = ?
+        `).get(input.event_id) as CompactionObservation | undefined;
+        if (existing) {
+          if (!sameCompactionObservation(existing, input)) {
+            throw new Error("COMPACTION_OBSERVATION_CONFLICT: event_id is already bound to different input");
+          }
+          result = "duplicate";
+          return;
+        }
+        db.prepare(`
+          INSERT INTO compaction_observations (
+            event_id, session_id, turn_id, phase, trigger, occurred_at, scope
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          input.event_id,
+          input.session_id,
+          input.turn_id,
+          input.phase,
+          input.trigger,
+          input.occurred_at,
+          input.scope,
+        );
+      });
+      await withSqliteContentionRetry(() => persist.immediate());
+      return result;
+    });
+  });
+}
+
+export async function listCompactionObservations(sessionId: string): Promise<CompactionObservation[]> {
+  return withCoordinatorReadBarrier(async () => {
+    const canonicalSessionId = safeCoordinationId(sessionId, "session_id");
+    const db = await getDb();
+    if (!db) throw new Error(SESSION_STORAGE_UNAVAILABLE);
+    return db.prepare(`
+      SELECT event_id, session_id, turn_id, phase, trigger, occurred_at, scope
+      FROM compaction_observations WHERE session_id = ? ORDER BY occurred_at, event_id
+    `).all(canonicalSessionId) as CompactionObservation[];
+  });
 }
 
 function quoteFtsTerm(term: string): string {

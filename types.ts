@@ -220,6 +220,29 @@ export interface SessionTurn {
   original_content_chars?: number;
 }
 
+export interface CapturedTurnSide {
+  session_id: string;
+  turn_id: string;
+  side: "user" | "assistant";
+  content: string;
+  content_hash: string;
+  occurred_at: string;
+  expires_at: string;
+  original_code_points: number;
+  content_truncated: boolean;
+  content_blocked: boolean;
+}
+
+export interface CompactionObservation {
+  event_id: string;
+  session_id: string;
+  turn_id: string;
+  phase: "pre" | "post";
+  trigger: "auto" | "manual";
+  occurred_at: string;
+  scope: MemoryScope;
+}
+
 export interface SessionMeta {
   session_id: string;
   started_at: string;

@@ -1,4 +1,4 @@
-# Installing Hermes Reflection MCP v21.0.0
+# Installing Hermes Reflection MCP v21.1.0
 
 This guide installs the local stdio MCP with the Agent-first 10-tool Codex profile. Node.js 20 or newer is required.
 
@@ -63,15 +63,25 @@ HERMES_REFLECTION_LLM_API_KEY=<dedicated-provider-key>
 
 Do not commit provider keys. The MCP never obtains or reuses Codex authentication. Keep auto-apply false until deterministic and LLM preview results are reviewed. Auto-apply remains blocked when write approval is enabled.
 
-## Optional Codex lifecycle hook
+## Codex lifecycle hooks
 
-Configure the client to pass JSON hook events to:
+Use the included structural installer after building or installing the package:
+
+```powershell
+node scripts/install-codex-hooks.mjs --hooks "$env:USERPROFILE\.codex\hooks.json" --install-dir "$env:USERPROFILE\.codex\mcp\hermes-reflection-mcp"
+```
+
+It creates a timestamped sibling backup, validates and reparses the JSON, removes only recognized Hermes commands, preserves all unrelated handlers/order, and installs `SessionStart`, `SessionEnd`, `PreCompact`, and `PostCompact`. Use `--dry-run` to preview whether a change is needed.
+
+The configured command is:
 
 ```text
 node <install-dir>/dist/src/codex_hook_cli.js
 ```
 
-Supported events are `SessionStart`, `Stop`, `SessionEnd`, `PreCompact`, and `PostCompact`. `PostCompact` requires bounded metadata and produces a durable hashed receipt that survives restart; identical replay is idempotent and a conflicting same-generation receipt fails closed. The hook writes a bounded durable inbox and exits promptly. The MCP process consumes those events; the hook does not control Codex execution state. Direct integrations may call `session_lifecycle_hook` instead.
+`Stop` is a turn boundary and never ends/releases the session. Only `SessionEnd` performs teardown. Official `PostCompact` requires no Hermes-private metadata: it records an observation and refreshes the frozen snapshot, while a trustworthy receipt is written only when a direct integration supplies complete validated extension metadata. The hook writes a bounded durable inbox and exits promptly; it does not control Codex execution state.
+
+Turn capture is disabled by default. To enable it deliberately, set `HERMES_REFLECTION_CODEX_TURN_CAPTURE=true` for the MCP/hook environment and rerun the installer with `--capture`. That adds Hermes handlers for `UserPromptSubmit` and `Stop`. Only `prompt` and `last_assistant_message` are read; `transcript_path` is ignored. Content is capped, redacted, threat-checked, paired atomically, and excluded from automatic LLM review. Rerun without `--capture` to remove only those Hermes capture handlers.
 
 ## Validation
 
@@ -91,11 +101,12 @@ npm run test:v20
 npm run test:concurrency
 npm run test:v20:agent-fixture
 npm run test:v21
+npm run test:v21.1
 npm pack --dry-run --json
 npm audit --omit=dev
 ```
 
-Expected v21 gates:
+Expected v21.1 gates:
 
 - exactly 29 complete public tools;
 - exact 10-tool core profile;
@@ -126,7 +137,7 @@ v21 migrates supported older stores to schema 2 under a lock. It fails closed on
 1. Stop Codex Desktop and any standalone MCP process.
 2. Back up the current installed code directory to a dated sibling path.
 3. Back up `~/.hermes-reflection` separately; never put it into the release directory.
-4. Install the v21 release into a clean staging directory and run validation.
+4. Install the v21.1 release into a clean staging directory and run validation.
 5. Switch the stable install path or Codex configuration only after validation passes.
 6. Start a fresh Codex Desktop process and confirm the 10-tool surface.
 

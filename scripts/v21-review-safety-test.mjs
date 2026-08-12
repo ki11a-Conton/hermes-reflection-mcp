@@ -202,7 +202,7 @@ async function testScopeBeforeEveryReviewPhase(storage, engine, provider) {
     },
   ]);
   provider.resetRequests();
-  const expectedFingerprint = engine.reviewSourceFingerprint([alpha]);
+  const expectedFingerprint = engine.reviewSourceFingerprint([alpha], "llm");
   let result;
   let thrown;
   try {
@@ -247,7 +247,7 @@ async function testSemanticSingleFlight(storage, engine, provider) {
   const beta = fixture({ ...common, scope: "project:beta" });
   await save(storage, alpha);
   await save(storage, beta);
-  const fingerprint = engine.reviewSourceFingerprint([alpha]);
+  const fingerprint = engine.reviewSourceFingerprint([alpha], "llm");
   provider.setCandidates([]);
   provider.setDelay(120);
 
@@ -371,7 +371,7 @@ async function testEvidenceAndAntiMislearning(storage, engine, provider) {
   provider.setCandidates(candidateSpecs);
   provider.resetRequests();
   const exactSources = [alphaOne, alphaTwo, alphaPartial, alphaFailure];
-  const fingerprint = engine.reviewSourceFingerprint(exactSources);
+  const fingerprint = engine.reviewSourceFingerprint(exactSources, "llm");
   const first = await runOptions(engine, {
     sessionId,
     scope: "project:alpha",
@@ -462,7 +462,7 @@ async function testTransientFailureAntiMislearning(storage, engine, provider) {
   const result = await runOptions(engine, {
     sessionId,
     scope: "project:alpha",
-    fingerprint: engine.reviewSourceFingerprint([source]),
+    fingerprint: engine.reviewSourceFingerprint([source], "llm"),
     autoApply: true,
   });
   const byText = new Map(result.candidate_heuristics.map((candidate) => [candidate.heuristic, candidate]));
@@ -502,7 +502,7 @@ async function testEvidenceFingerprintClosesApplyRace(storage, engine, provider)
     runOptions(engine, {
       sessionId,
       scope: "project:alpha",
-      fingerprint: engine.reviewSourceFingerprint([source]),
+      fingerprint: engine.reviewSourceFingerprint([source], "llm"),
       autoApply: true,
       beforeApply: async () => {
         const changed = await storage.updateReflection(source.id, {

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { exportData, reviewCandidateEvidenceFingerprint, safeHeuristicText, scanHeuristicThreats, } from "../storage.js";
-import { getLlmReviewReadiness, getLlmReviewSemanticFingerprint, runLlmReview, } from "./llm_review.js";
+import { getLlmReviewReadiness, getLlmReviewSemanticFingerprint, getLlmReviewSourceFingerprint, runLlmReview, } from "./llm_review.js";
 import { redactSensitiveText } from "./redaction.js";
 import { autoApplyReviewCandidate, enqueueReviewCandidates } from "./review_queue.js";
 import { semanticReviewRiskReasons } from "./review_risk.js";
@@ -103,7 +103,9 @@ export function buildDeterministicReviewCandidates(reflections, existingHeuristi
     }
     return candidates;
 }
-export function reviewSourceFingerprint(reflections) {
+export function reviewSourceFingerprint(reflections, stage = "deterministic") {
+    if (stage === "llm")
+        return getLlmReviewSourceFingerprint(reflections);
     const source = reflections.map((item) => ({
         id: item.id,
         timestamp: item.timestamp,
@@ -165,7 +167,10 @@ export async function runReview(options) {
     const existingHeuristics = new Set(store.heuristics
         .filter((heuristic) => !heuristic.superseded_by && heuristic.scope === options.scope)
         .map((heuristic) => normalizeCandidateText(heuristic.heuristic)));
-    const fingerprint = reviewSourceFingerprint(reviewedReflections);
+    const requestedStage = options.review_mode === "deterministic"
+        ? "deterministic"
+        : options.stage;
+    const fingerprint = reviewSourceFingerprint(reviewedReflections, requestedStage);
     let modeUsed = "deterministic";
     let fallbackReason;
     let llmResult;
@@ -350,7 +355,7 @@ export function runReviewSingleFlight(options) {
     inFlight.set(key, started);
     return started;
 }
-export async function getReviewSourceState(sessionId, reviewScope = "recent", requestedScope) {
+export async function getReviewSourceState(sessionId, reviewScope = "recent", requestedScope, stage = "deterministic") {
     const store = await exportData();
     const sessionReflections = store.reflections.filter((reflection) => reflection.session_id === sessionId);
     const scopes = new Set(sessionReflections.map((reflection) => reflection.scope));
@@ -365,7 +370,7 @@ export async function getReviewSourceState(sessionId, reviewScope = "recent", re
         ? allSessionReflections.slice(-MAX_RECENT_REFLECTIONS)
         : allSessionReflections.slice(-MAX_FULL_REFLECTIONS);
     return {
-        source_fingerprint: reviewSourceFingerprint(reviewed),
+        source_fingerprint: reviewSourceFingerprint(reviewed, stage),
         reflection_count: reviewed.length,
         ...(scope ? { scope } : {}),
     };

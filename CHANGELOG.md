@@ -1,5 +1,26 @@
 # Changelog
 
+## 21.1.0 - 2026-08-12
+
+### Codex lifecycle and privacy
+
+- Corrected `Stop` to be a turn boundary only; `SessionEnd` is now the sole teardown and background-review scheduling event.
+- Accepted official `PreCompact`/`PostCompact` shapes without private metadata, separated observations from trustworthy receipts, and refreshed frozen context only after `PostCompact`.
+- Strengthened derived event identity with turn IDs, triggers/status, and normalized content hashes while keeping lifecycle mutations replay-safe.
+- Added explicitly opt-in, 12,000-code-point per-side prompt/assistant capture with strict redaction/threat blocking, atomic pairing, replay/conflict handling, expiry cleanup, and no `transcript_path` reads.
+
+### Agent cost and review lifecycle
+
+- Reduced omitted-limit heuristic retrieval from ten to three compact records, removed redundant compact projection fields, and tightened first-512 server guidance around live-source priority and negative-use cases.
+- Limited automatic LLM input to the latest ten scoped reflections and 24,000 serialized characters; captured turns are excluded.
+- Added provider-semantic review fingerprints, unchanged source/model suppression, explicit LLM-mode configuration cooldowns, bounded retry/cancellation, and shutdown lease release. Candidates remain approval-pending by default.
+
+### Installation and compatibility
+
+- Added a structural Codex `hooks.json` installer with dry-run, timestamped backup, atomic replacement, exact Hermes command cleanup, and preservation of unrelated handlers/order.
+- Kept the exact ordered 10-tool Agent-first profile, all 29 compatibility tools, main store schema 2, and in-place v21 session database migration.
+- Added focused v21.1 hook, storage, lifecycle, context/review, and installer regressions plus release-package coverage.
+
 ## 21.0.0 - 2026-08-09
 
 ### Agent-first safety and compatibility

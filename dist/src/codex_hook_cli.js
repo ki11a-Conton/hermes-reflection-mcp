@@ -1,14 +1,31 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { HookEventSchema, MAX_HOOK_INPUT_BYTES, hookInbox } from "./hook_inbox.js";
 import { deriveProjectKey, loadOrCreateProjectSalt } from "./project_scope.js";
 import { CompactionMetadataSchema } from "./compaction_handoff.js";
+import { codexTurnCaptureEnabled, prepareTurnContent } from "./turn_capture.js";
+const HookEventNameSchema = z.enum([
+    "SessionStart",
+    "UserPromptSubmit",
+    "Stop",
+    "SessionEnd",
+    "PreCompact",
+    "PostCompact",
+]);
+const SafeIdSchema = z.string().min(1).max(200).regex(/^[A-Za-z0-9._:-]+$/);
 const HookInputSchema = z.object({
-    hook_event_name: z.enum(["SessionStart", "Stop", "SessionEnd", "PreCompact", "PostCompact"]).optional(),
-    event: z.enum(["SessionStart", "Stop", "SessionEnd", "PreCompact", "PostCompact"]).optional(),
-    event_id: z.string().min(1).max(200).regex(/^[A-Za-z0-9._:-]+$/).optional(),
-    session_id: z.string().min(1).max(200).regex(/^[A-Za-z0-9._:-]+$/),
+    hook_event_name: HookEventNameSchema.optional(),
+    event: HookEventNameSchema.optional(),
+    event_id: SafeIdSchema.optional(),
+    session_id: SafeIdSchema,
+    turn_id: SafeIdSchema.optional(),
+    trigger: z.enum(["auto", "manual"]).optional(),
+    source: z.enum(["startup", "resume", "clear", "compact"]).optional(),
+    reason: z.string().min(1).max(200).optional(),
+    prompt: z.string().optional(),
+    last_assistant_message: z.string().optional(),
+    stop_hook_active: z.boolean().optional(),
     occurred_at: z.string().refine((value) => Number.isFinite(Date.parse(value))).optional(),
     timestamp: z.string().refine((value) => Number.isFinite(Date.parse(value))).optional(),
     transcript_path: z.unknown().optional(),
@@ -40,6 +57,20 @@ async function main() {
     const raw = await readBoundedStdin();
     const input = HookInputSchema.parse(JSON.parse(raw.toString("utf8")));
     const event = input.hook_event_name ?? input.event;
+    if ((event === "UserPromptSubmit" || event === "Stop") && !codexTurnCaptureEnabled()) {
+        process.stdout.write(`${JSON.stringify({
+            ok: true,
+            accepted: false,
+            duplicate: false,
+            status: "capture_disabled",
+        })}\n`);
+        return;
+    }
+    const captured = event === "UserPromptSubmit"
+        ? { side: "user", ...prepareTurnContent(input.prompt ?? "") }
+        : event === "Stop"
+            ? { side: "assistant", ...prepareTurnContent(input.last_assistant_message ?? "") }
+            : undefined;
     const projectKey = deriveProjectKey(process.cwd(), await loadOrCreateProjectSalt());
     const explicitOccurredAt = input.occurred_at ?? input.timestamp;
     const canonicalExplicitOccurredAt = explicitOccurredAt === undefined
@@ -50,21 +81,34 @@ async function main() {
         event,
         session_id: input.session_id,
         project_key: projectKey,
-        ...(canonicalExplicitOccurredAt ? { occurred_at: canonicalExplicitOccurredAt } : {}),
+        ...(input.turn_id ? { turn_id: input.turn_id } : {}),
+        ...(input.trigger ? { trigger: input.trigger } : {}),
+        ...(input.stop_hook_active !== undefined ? { stop_hook_active: input.stop_hook_active } : {}),
+        ...(captured ? { content_hash: captured.content_hash } : {}),
         ...(event === "PostCompact" && input.metadata ? { metadata: input.metadata } : {}),
     });
     const generatedDigest = createHash("sha256").update(canonicalGeneratedInput, "utf8").digest("hex");
-    const eventId = input.event_id
-        ?? `hook:${canonicalExplicitOccurredAt ? "" : "auto:"}${generatedDigest.slice(0, 40)}`;
+    const hasTurnIdentity = input.turn_id !== undefined
+        && (event === "UserPromptSubmit" || event === "Stop" || event === "PreCompact" || event === "PostCompact");
+    const eventId = input.event_id ?? (hasTurnIdentity
+        ? `hook:turn:${generatedDigest.slice(0, 40)}`
+        : `hook:event:${randomUUID()}`);
     const occurredAt = canonicalExplicitOccurredAt ?? new Date().toISOString();
     const receipt = await hookInbox.enqueue(HookEventSchema.parse({
         schema_version: 1,
         event_id: eventId,
+        ...(input.event_id === undefined ? { event_id_source: "generated" } : {}),
         event,
         session_id: input.session_id,
         occurred_at: occurredAt,
         ...(canonicalExplicitOccurredAt === undefined ? { occurred_at_source: "received" } : {}),
         project_key: projectKey,
+        ...(input.turn_id ? { turn_id: input.turn_id } : {}),
+        ...(input.trigger ? { trigger: input.trigger } : {}),
+        ...(input.source ? { source: input.source } : {}),
+        ...(input.reason ? { reason: input.reason } : {}),
+        ...(input.stop_hook_active !== undefined ? { stop_hook_active: input.stop_hook_active } : {}),
+        ...(captured ? { captured } : {}),
         ...(event === "PostCompact" && input.metadata ? { metadata: input.metadata } : {}),
     }));
     process.stdout.write(`${JSON.stringify({ ok: true, ...receipt })}\n`);

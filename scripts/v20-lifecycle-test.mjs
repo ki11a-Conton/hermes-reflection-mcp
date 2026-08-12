@@ -127,7 +127,7 @@ async function hookCliTest(home) {
   const { deriveProjectKey, loadOrCreateProjectSalt } = await import("../dist/src/project_scope.js");
   const salt = await loadOrCreateProjectSalt(join(storeRoot, "project_salt.bin"));
   const key = deriveProjectKey(privateCwd, salt);
-  const events = ["SessionStart", "Stop", "PreCompact", "PostCompact"];
+  const events = ["SessionStart", "PreCompact", "PostCompact", "SessionEnd"];
   const occurredAt = events.map(() => new Date().toISOString());
   const compactionMetadata = {
     generation: 1,
@@ -144,7 +144,11 @@ async function hookCliTest(home) {
       session_id: "hook-session",
       occurred_at: occurredAt[index],
       ...(events[index] === "SessionStart" ? { scope_intent: "project", project_key: key } : {}),
+      ...(events[index] === "PreCompact" || events[index] === "PostCompact"
+        ? { turn_id: `turn-${index}`, trigger: "auto" }
+        : {}),
       ...(events[index] === "PostCompact" ? { metadata: compactionMetadata } : {}),
+      ...(events[index] === "SessionEnd" ? { reason: "complete" } : {}),
       transcript_path: join(privateCwd, "transcript-with-secret-token.txt"),
     }));
     assert.equal(result.code, 0, result.stderr);
@@ -213,8 +217,12 @@ async function hookCliTest(home) {
   const dedup = JSON.parse(dedupText);
   assert.deepEqual(dedup.completed.map((item) => item.event), events);
   assert.doesNotMatch(dedupText, /raw-private-workspace|transcript/i);
-  const backgroundState = JSON.parse(await readFile(join(storeRoot, "background_lifecycle.json"), "utf8"));
-  assert.ok(backgroundState.dirty_sessions["hook-session"], "Stop hook must mark the session dirty");
+  const backgroundState = JSON.parse(await readFile(
+    join(storeRoot, "background_lifecycle.json"),
+    "utf8",
+  ).catch(() => '{"dirty_sessions":{}}'));
+  assert.equal(backgroundState.dirty_sessions["hook-session"], undefined,
+    "lifecycle hooks without reflection material must not mark the session dirty");
 
   const completedDuplicate = await runHook(home, privateCwd, JSON.stringify({
     hook_event_name: "SessionStart",

@@ -108,10 +108,25 @@ export async function handleSessionLifecycleHook(args: any): Promise<string> {
       }, null, 2);
     }
 
-    case "end":
-    case "stop": {
+    case "stop":
+    case "precompact": {
       const scope = await resolvePersistedSessionAccess(session_id, resolvedProjectKey);
-      const persisted = await persistSessionEnd(session_id, { scope, end_reason: event === "stop" ? "client_stop" : "client_end" });
+      return JSON.stringify({
+        success: true,
+        event,
+        session_id,
+        scope,
+        snapshot_changed: false,
+        message: event === "stop"
+          ? "Turn boundary recorded. The session remains active until an explicit end event."
+          : "Pre-compaction boundary recorded. The frozen snapshot remains unchanged until postcompact.",
+        background_lifecycle: (await backgroundLifecycle.status()).runtime,
+      }, null, 2);
+    }
+
+    case "end": {
+      const scope = await resolvePersistedSessionAccess(session_id, resolvedProjectKey);
+      const persisted = await persistSessionEnd(session_id, { scope, end_reason: "client_end" });
       if (!persisted) throw new Error(SESSION_STORAGE_UNAVAILABLE);
       const releaseResult = releaseSessionSnapshot(session_id);
       let backgroundNotificationError: string | undefined;
@@ -150,18 +165,6 @@ export async function handleSessionLifecycleHook(args: any): Promise<string> {
         message: `Client lifecycle event recorded: ${event}. Codex execution state is not controlled by this MCP.`,
         background_lifecycle: (await backgroundLifecycle.status()).runtime,
       }, null, 2);
-
-    case "precompact": {
-      const scope = await resolvePersistedSessionAccess(session_id, resolvedProjectKey);
-      const captureResult = await captureSessionSnapshot(session_id);
-      return JSON.stringify({
-        success: captureResult.success,
-        event,
-        session_id,
-        scope,
-        snapshot_info: captureResult.snapshot_info,
-      }, null, 2);
-    }
 
     case "postcompact": {
       const scope = await resolvePersistedSessionAccess(session_id, resolvedProjectKey);
@@ -394,12 +397,13 @@ export async function handleTriggerBackgroundReview(args: any): Promise<string> 
       },
     }, null, 2);
   }
-  const source = await getReviewSourceState(session_id!, review_scope, scope);
   const readiness = getReviewReadinessStatus();
+  const stage = review_mode === "deterministic" ? "deterministic" : (review_mode === "llm" || readiness.ready ? "llm" : "deterministic");
+  const source = await getReviewSourceState(session_id!, review_scope, scope, stage);
   return JSON.stringify(await backgroundLifecycle.runNow({
     session_id: session_id!,
     scope: scope!,
-    stage: review_mode === "deterministic" ? "deterministic" : (readiness.ready ? "llm" : "deterministic"),
+    stage,
     source_fingerprint: source.source_fingerprint,
     review_scope,
     review_mode,

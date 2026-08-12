@@ -1371,8 +1371,8 @@ if (process.argv[2] === "--child") {
 
   await withHome("snapshot-replacement-result-isolated", async (home) => {
     const result = await runChild(home, "snapshot-replacement-result-isolated");
-    assert.equal(result.returned_version, "21.0.0", "replacement result must represent writer VERSION intent");
-    assert.equal(result.actual_version, "21.0.0");
+    assert.equal(result.returned_version, "21.1.0", "replacement result must represent writer VERSION intent");
+    assert.equal(result.actual_version, "21.1.0");
     assert.equal(result.leaked_entry, false, "mutating the returned replacement plan must not leak into storage state");
   });
 

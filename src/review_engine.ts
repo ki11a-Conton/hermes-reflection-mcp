@@ -9,6 +9,7 @@ import {
 import {
   getLlmReviewReadiness,
   getLlmReviewSemanticFingerprint,
+  getLlmReviewSourceFingerprint,
   runLlmReview,
   type LlmReviewResult,
 } from "./llm_review.js";
@@ -191,7 +192,11 @@ export function buildDeterministicReviewCandidates(
   return candidates;
 }
 
-export function reviewSourceFingerprint(reflections: ReflectionFrame[]): string {
+export function reviewSourceFingerprint(
+  reflections: ReflectionFrame[],
+  stage: "deterministic" | "llm" = "deterministic",
+): string {
+  if (stage === "llm") return getLlmReviewSourceFingerprint(reflections);
   const source = reflections.map((item) => ({
     id: item.id,
     timestamp: item.timestamp,
@@ -261,7 +266,10 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewEngine
       .filter((heuristic) => !heuristic.superseded_by && heuristic.scope === options.scope)
       .map((heuristic) => normalizeCandidateText(heuristic.heuristic)),
   );
-  const fingerprint = reviewSourceFingerprint(reviewedReflections);
+  const requestedStage: "deterministic" | "llm" = options.review_mode === "deterministic"
+    ? "deterministic"
+    : options.stage;
+  const fingerprint = reviewSourceFingerprint(reviewedReflections, requestedStage);
   let modeUsed: "deterministic" | "llm" = "deterministic";
   let fallbackReason: string | undefined;
   let llmResult: LlmReviewResult | undefined;
@@ -447,6 +455,7 @@ export async function getReviewSourceState(
   sessionId: string,
   reviewScope: "recent" | "full" = "recent",
   requestedScope?: MemoryScope,
+  stage: "deterministic" | "llm" = "deterministic",
 ): Promise<{ source_fingerprint: string; reflection_count: number; scope?: MemoryScope }> {
   const store = await exportData();
   const sessionReflections = store.reflections.filter((reflection) => reflection.session_id === sessionId);
@@ -462,7 +471,7 @@ export async function getReviewSourceState(
     ? allSessionReflections.slice(-MAX_RECENT_REFLECTIONS)
     : allSessionReflections.slice(-MAX_FULL_REFLECTIONS);
   return {
-    source_fingerprint: reviewSourceFingerprint(reviewed),
+    source_fingerprint: reviewSourceFingerprint(reviewed, stage),
     reflection_count: reviewed.length,
     ...(scope ? { scope } : {}),
   };

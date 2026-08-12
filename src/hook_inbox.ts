@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { z } from "zod";
 import { withFileLock } from "./file_lock.js";
 import { CompactionMetadataSchema } from "./compaction_handoff.js";
+import { codePointLength } from "./redaction.js";
+import { MAX_CAPTURE_CODE_POINTS } from "./turn_capture.js";
 
 const MAX_HOOK_INPUT_BYTES = 64 * 1024;
 const MAX_QUEUED_EVENTS = 1_000;
@@ -14,16 +16,34 @@ const MAX_DEDUP_BYTES = 4 * 1024 * 1024;
 const HOOK_FILE_LOCK_OPTIONS = { timeout_ms: 4_000, retry_ms: 25, stale_ms: 500 } as const;
 
 const SafeIdSchema = z.string().min(1).max(200).regex(/^[A-Za-z0-9._:-]+$/);
+const CapturedTurnSchema = z.object({
+  side: z.enum(["user", "assistant"]),
+  content: z.string().refine(
+    (value) => codePointLength(value) <= MAX_CAPTURE_CODE_POINTS,
+    `captured content exceeds ${MAX_CAPTURE_CODE_POINTS} Unicode code points`,
+  ),
+  content_hash: z.string().regex(/^[a-f0-9]{64}$/),
+  original_code_points: z.number().int().min(0).max(1_000_000),
+  content_truncated: z.boolean(),
+  content_blocked: z.boolean(),
+}).strict();
 
 const HookEventObjectSchema = z.object({
   schema_version: z.literal(1),
   event_id: SafeIdSchema,
-  event: z.enum(["SessionStart", "Stop", "SessionEnd", "PreCompact", "PostCompact"]),
+  event_id_source: z.literal("generated").optional(),
+  event: z.enum(["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd", "PreCompact", "PostCompact"]),
   session_id: SafeIdSchema,
   occurred_at: z.string().refine((value) => Number.isFinite(Date.parse(value)), "invalid occurred_at"),
   occurred_at_source: z.literal("received").optional(),
   project_key: z.string().regex(/^project:[a-f0-9]{64}$/).optional(),
   scope_intent: z.enum(["global", "project"]).optional(),
+  turn_id: SafeIdSchema.optional(),
+  trigger: z.enum(["auto", "manual"]).optional(),
+  source: z.enum(["startup", "resume", "clear", "compact"]).optional(),
+  reason: z.string().min(1).max(200).optional(),
+  stop_hook_active: z.boolean().optional(),
+  captured: CapturedTurnSchema.optional(),
   metadata: CompactionMetadataSchema.optional(),
 }).strict();
 
@@ -64,11 +84,45 @@ export const HookEventSchema = HookEventObjectSchema.superRefine((value, context
       message: "compaction metadata is valid only for PostCompact",
     });
   }
-  if (value.event === "PostCompact" && value.metadata === undefined) {
+  if (value.captured !== undefined) {
+    const expectedSide = value.event === "UserPromptSubmit"
+      ? "user"
+      : value.event === "Stop"
+        ? "assistant"
+        : undefined;
+    if (!expectedSide || value.captured.side !== expectedSide) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["captured", "side"],
+        message: "captured content side conflicts with the hook event",
+      });
+    }
+    if (!value.turn_id) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["turn_id"],
+        message: "captured turn content requires turn_id",
+      });
+    }
+  }
+  if (value.trigger !== undefined && value.event !== "PreCompact" && value.event !== "PostCompact") {
     context.addIssue({
       code: z.ZodIssueCode.custom,
-      path: ["metadata"],
-      message: "PostCompact requires bounded compaction metadata",
+      path: ["trigger"],
+      message: "trigger is valid only for compaction hooks",
+    });
+  }
+  if (value.source !== undefined && value.event !== "SessionStart") {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["source"], message: "source is valid only for SessionStart" });
+  }
+  if (value.reason !== undefined && value.event !== "SessionEnd") {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["reason"], message: "reason is valid only for SessionEnd" });
+  }
+  if (value.stop_hook_active !== undefined && value.event !== "Stop") {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["stop_hook_active"],
+      message: "stop_hook_active is valid only for Stop",
     });
   }
 });
@@ -134,6 +188,7 @@ function canonicalEvent(event: HookEvent): string {
   return JSON.stringify({
     schema_version: 1,
     event_id: event.event_id,
+    ...(event.event_id_source ? { event_id_source: event.event_id_source } : {}),
     event: event.event,
     session_id: event.session_id,
     occurred_at: new Date(event.occurred_at).toISOString(),
@@ -141,6 +196,12 @@ function canonicalEvent(event: HookEvent): string {
     ...(event.project_key ? { project_key: event.project_key } : {}),
     ...(event.event === "SessionStart" && event.project_key ? { scope_intent: "project" } : {}),
     ...(!event.project_key && event.scope_intent === "global" ? { scope_intent: "global" } : {}),
+    ...(event.turn_id ? { turn_id: event.turn_id } : {}),
+    ...(event.trigger ? { trigger: event.trigger } : {}),
+    ...(event.source ? { source: event.source } : {}),
+    ...(event.reason ? { reason: event.reason } : {}),
+    ...(event.stop_hook_active !== undefined ? { stop_hook_active: event.stop_hook_active } : {}),
+    ...(event.captured ? { captured: event.captured } : {}),
     ...(event.metadata ? { metadata: event.metadata } : {}),
   });
 }
@@ -150,12 +211,19 @@ function canonicalEventIdentity(event: HookEvent): string {
   return JSON.stringify({
     schema_version: 1,
     event_id: event.event_id,
+    ...(event.event_id_source ? { event_id_source: event.event_id_source } : {}),
     event: event.event,
     session_id: event.session_id,
     occurred_at_source: "received",
     ...(event.project_key ? { project_key: event.project_key } : {}),
     ...(event.event === "SessionStart" && event.project_key ? { scope_intent: "project" } : {}),
     ...(!event.project_key && event.scope_intent === "global" ? { scope_intent: "global" } : {}),
+    ...(event.turn_id ? { turn_id: event.turn_id } : {}),
+    ...(event.trigger ? { trigger: event.trigger } : {}),
+    ...(event.source ? { source: event.source } : {}),
+    ...(event.reason ? { reason: event.reason } : {}),
+    ...(event.stop_hook_active !== undefined ? { stop_hook_active: event.stop_hook_active } : {}),
+    ...(event.captured ? { captured: event.captured } : {}),
     ...(event.metadata ? { metadata: event.metadata } : {}),
   });
 }

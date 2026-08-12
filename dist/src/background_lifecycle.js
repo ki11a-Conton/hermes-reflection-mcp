@@ -11,7 +11,7 @@ import { projectScopeRepository } from "./project_scope.js";
 import { normalizeRequestedSessionScope, SessionScopeError, } from "./session_scope.js";
 import { resolvePersistedSessionAccess } from "./session_access.js";
 import { captureSessionSnapshot, releaseSessionSnapshot } from "./storage_enhanced.js";
-import { persistCompactionReceipt, persistSessionEnd, persistSessionStart, resolveSessionScope, SESSION_STORAGE_UNAVAILABLE, } from "../session_storage.js";
+import { persistCompactionReceipt, persistCompactionObservation, cleanupPendingTurnSides, persistSessionEnd, persistSessionStart, resolveSessionScope, SESSION_STORAGE_UNAVAILABLE, stageCapturedTurnSide, } from "../session_storage.js";
 async function internalPersistedScope(sessionId) {
     try {
         return normalizeRequestedSessionScope(await resolveSessionScope(sessionId));
@@ -151,6 +151,7 @@ export class BackgroundLifecycle {
     candidatesDurable;
     inbox;
     processHookEvent;
+    turnCaptureEnabled;
     hookPump;
     timer;
     deadlineTimer;
@@ -169,12 +170,13 @@ export class BackgroundLifecycle {
     stopping = false;
     constructor(options) {
         this.options = options;
-        this.sourceState = options.source_state ?? (async (sessionId) => {
+        this.sourceState = options.source_state ?? (async (sessionId, stage = "deterministic") => {
             const scope = await internalPersistedScope(sessionId);
-            return getReviewSourceState(sessionId, "recent", scope);
+            return getReviewSourceState(sessionId, "recent", scope, stage);
         });
         this.candidatesDurable = options.candidates_durable ?? durableReviewCandidateIds;
         this.inbox = options.hook_inbox ?? hookInbox;
+        this.turnCaptureEnabled = options.turn_capture_enabled ?? truthy(process.env.HERMES_REFLECTION_CODEX_TURN_CAPTURE);
         this.processHookEvent = options.process_hook_event ?? ((event) => this.applyHookEvent(event));
         this.hookPump = new HookInboxPump(this.inbox, async (event) => {
             await this.processHookEvent(event);
@@ -245,6 +247,10 @@ export class BackgroundLifecycle {
         await this.rearmDeadline();
     }
     async notifySessionEnd(sessionId) {
+        const requestedStage = this.requestedStage();
+        const current = await this.sourceState(sessionId, requestedStage);
+        if (current.reflection_count === 0)
+            return;
         await this.options.store.markDirty(sessionId);
         await this.rearmDeadline();
         if (this.options.enabled && !this.stopping) {
@@ -252,6 +258,13 @@ export class BackgroundLifecycle {
                 console.error("[hermes] background review cycle failed:", error instanceof Error ? error.message : "unknown error");
             });
         }
+    }
+    requestedStage() {
+        if (this.options.review_mode === "deterministic")
+            return "deterministic";
+        if (this.options.review_mode === "llm")
+            return "llm";
+        return getReviewReadinessStatus().ready ? "llm" : "deterministic";
     }
     runNow(request) {
         if (request) {
@@ -290,42 +303,87 @@ export class BackgroundLifecycle {
     async applyHookEvent(event) {
         switch (event.event) {
             case "SessionStart":
-                if (!await persistSessionStart(event.session_id, {
-                    scope: (event.project_key ?? event.scope_intent),
-                    start_event_id: event.event_id,
-                    started_at: event.occurred_at,
-                })) {
-                    throw new Error(SESSION_STORAGE_UNAVAILABLE);
-                }
-                await projectScopeRepository.bind(event.session_id, event.project_key);
-                await captureSessionSnapshot(event.session_id);
-                break;
-            case "Stop":
-            case "SessionEnd":
-                if (event.event === "SessionEnd") {
-                    const boundScope = await projectScopeRepository.active(event.session_id);
-                    if (!await persistSessionEnd(event.session_id, {
-                        scope: (event.project_key ?? boundScope ?? "global"),
-                        end_reason: "SessionEnd Hook",
-                        ended_at: event.occurred_at,
-                    }))
+                {
+                    const immutableStart = event.source !== "resume" && event.source !== "compact";
+                    if (!await persistSessionStart(event.session_id, {
+                        scope: (event.project_key ?? event.scope_intent),
+                        ...(immutableStart && event.event_id_source !== "generated" ? { start_event_id: event.event_id } : {}),
+                        ...(immutableStart && event.occurred_at_source !== "received" ? { started_at: event.occurred_at } : {}),
+                    })) {
                         throw new Error(SESSION_STORAGE_UNAVAILABLE);
+                    }
+                    await projectScopeRepository.bind(event.session_id, event.project_key);
+                    await captureSessionSnapshot(event.session_id);
+                    break;
                 }
-                releaseSessionSnapshot(event.session_id);
-                await this.options.store.markDirty(event.session_id, event.occurred_at);
-                await projectScopeRepository.release(event.session_id);
+            case "UserPromptSubmit":
+            case "Stop":
+                if (this.turnCaptureEnabled && event.captured && event.turn_id) {
+                    const scope = await resolvePersistedSessionAccess(event.session_id, event.project_key);
+                    const expiresAt = new Date(Date.parse(event.occurred_at) + 24 * 60 * 60_000).toISOString();
+                    await stageCapturedTurnSide({
+                        session_id: event.session_id,
+                        turn_id: event.turn_id,
+                        side: event.captured.side,
+                        content: event.captured.content,
+                        content_hash: event.captured.content_hash,
+                        occurred_at: event.occurred_at,
+                        expires_at: expiresAt,
+                        original_code_points: event.captured.original_code_points,
+                        content_truncated: event.captured.content_truncated,
+                        content_blocked: event.captured.content_blocked,
+                        scope,
+                    });
+                }
                 break;
             case "PreCompact":
-                await captureSessionSnapshot(event.session_id);
+                if (event.turn_id && event.trigger) {
+                    const scope = await resolvePersistedSessionAccess(event.session_id, event.project_key);
+                    await persistCompactionObservation({
+                        event_id: event.event_id,
+                        session_id: event.session_id,
+                        turn_id: event.turn_id,
+                        phase: "pre",
+                        trigger: event.trigger,
+                        occurred_at: event.occurred_at,
+                        scope,
+                    });
+                }
                 break;
             case "PostCompact":
                 {
                     const scope = await resolvePersistedSessionAccess(event.session_id, event.project_key);
-                    if (!await persistCompactionReceipt(event.session_id, event.metadata, scope)) {
+                    if (event.turn_id && event.trigger) {
+                        await persistCompactionObservation({
+                            event_id: event.event_id,
+                            session_id: event.session_id,
+                            turn_id: event.turn_id,
+                            phase: "post",
+                            trigger: event.trigger,
+                            occurred_at: event.occurred_at,
+                            scope,
+                        });
+                    }
+                    if (event.metadata && !await persistCompactionReceipt(event.session_id, event.metadata, scope)) {
                         throw new Error(SESSION_STORAGE_UNAVAILABLE);
                     }
                 }
                 await captureSessionSnapshot(event.session_id);
+                break;
+            case "SessionEnd":
+                {
+                    const scope = await resolvePersistedSessionAccess(event.session_id, event.project_key);
+                    if (!await persistSessionEnd(event.session_id, {
+                        scope,
+                        end_reason: event.reason ?? "SessionEnd Hook",
+                        ...(event.occurred_at_source !== "received" ? { ended_at: event.occurred_at } : {}),
+                    }))
+                        throw new Error(SESSION_STORAGE_UNAVAILABLE);
+                    await cleanupPendingTurnSides({ session_id: event.session_id });
+                    releaseSessionSnapshot(event.session_id);
+                    await this.notifySessionEnd(event.session_id);
+                    await projectScopeRepository.release(event.session_id);
+                }
                 break;
         }
     }
@@ -512,10 +570,8 @@ export class BackgroundLifecycle {
                     break;
                 if (!await refresher.refreshNow())
                     break;
-                const current = await this.sourceState(item.session_id);
-                const requestedStage = this.options.review_mode === "deterministic"
-                    ? "deterministic"
-                    : (getReviewReadinessStatus().ready ? "llm" : "deterministic");
+                const requestedStage = this.requestedStage();
+                const current = await this.sourceState(item.session_id, requestedStage);
                 const reviewedFingerprint = item[requestedStage]?.fingerprint;
                 if (current.reflection_count === 0 || current.source_fingerprint === reviewedFingerprint) {
                     await this.commitStage(this.ownerId, lease.fencing_token, item.session_id, requestedStage, current.source_fingerprint, current.reflection_count === 0 ? "no_reflections" : "unchanged", [], item.dirty_at);

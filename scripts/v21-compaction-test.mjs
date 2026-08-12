@@ -66,11 +66,11 @@ function contentFromPage(result) {
   return resultText(result);
 }
 
-async function runHookCli(home, input) {
+async function runHookCli(home, input, env = {}) {
   return new Promise((resolveResult, reject) => {
     const child = spawn(process.execPath, [resolve("dist/src/codex_hook_cli.js")], {
       cwd: home,
-      env: { ...process.env, HOME: home, USERPROFILE: home },
+      env: { ...process.env, HOME: home, USERPROFILE: home, ...env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -108,26 +108,30 @@ await withTempHome("v21-compaction", async (home) => {
 
   const hookRoot = join(home, "hook-schema-red");
   const isolatedInbox = new HookInbox(hookRoot);
-  await assert.rejects(
-    isolatedInbox.enqueue({
-      schema_version: 1,
-      event_id: "postcompact-missing-metadata",
-      event: "PostCompact",
-      session_id: "schema-session",
-      occurred_at: "2026-08-09T00:00:00.000Z",
-    }),
-    /metadata|PostCompact/i,
-    "PostCompact without bounded metadata was accepted",
-  );
-  assert.deepEqual(await isolatedInbox.status(), { queued: 0, processing: 0, deduplicated: 0 },
-    "rejected PostCompact changed queue or completion dedup state");
+  assert.deepEqual(await isolatedInbox.enqueue({
+    schema_version: 1,
+    event_id: "postcompact-missing-metadata",
+    event: "PostCompact",
+    session_id: "schema-session",
+    turn_id: "schema-turn",
+    trigger: "auto",
+    occurred_at: "2026-08-09T00:00:00.000Z",
+  }), {
+    accepted: true,
+    duplicate: false,
+    event_id: "postcompact-missing-metadata",
+  });
+  assert.deepEqual(await isolatedInbox.status(), { queued: 1, processing: 0, deduplicated: 0 },
+    "official PostCompact observation was not queued");
   assert.equal(HookEventSchema.safeParse({
     schema_version: 1,
     event_id: "postcompact-missing-metadata-parse",
     event: "PostCompact",
     session_id: "schema-session",
+    turn_id: "schema-turn",
+    trigger: "auto",
     occurred_at: "2026-08-09T00:00:00.000Z",
-  }).success, false, "HookEventSchema accepted PostCompact without metadata");
+  }).success, true, "HookEventSchema rejected official PostCompact without extension metadata");
 
   const metadataConflictInbox = new HookInbox(join(home, "hook-metadata-conflict-red"));
   const metadataConflictBase = {
@@ -213,7 +217,12 @@ await withTempHome("v21-compaction", async (home) => {
     "wrong-project background PostCompact changed persisted receipt state");
   await earlyScopeLifecycle.shutdown();
 
-  const stableCliInput = JSON.stringify({ event: "PreCompact", session_id: "stable-cli-session" });
+  const stableCliInput = JSON.stringify({
+    event: "PreCompact",
+    session_id: "stable-cli-session",
+    turn_id: "stable-turn",
+    trigger: "auto",
+  });
   const receivedAt = Date.now();
   const cliFirst = await runHookCli(home, stableCliInput);
   const cliSecond = await runHookCli(home, stableCliInput);
@@ -226,10 +235,16 @@ await withTempHome("v21-compaction", async (home) => {
   assert.ok(Math.abs(Date.parse(queuedStableEvent.occurred_at) - receivedAt) < 10_000,
     `generated occurred_at was not a real reception time: ${queuedStableEvent.occurred_at}`);
 
-  const concurrentCliInput = JSON.stringify({ event: "Stop", session_id: "stable-concurrent-cli-session" });
+  const concurrentCliInput = JSON.stringify({
+    event: "Stop",
+    session_id: "stable-concurrent-cli-session",
+    turn_id: "stable-stop-turn",
+    stop_hook_active: false,
+    last_assistant_message: "stable answer",
+  });
   const concurrentReceipts = await Promise.all([
-    runHookCli(home, concurrentCliInput),
-    runHookCli(home, concurrentCliInput),
+    runHookCli(home, concurrentCliInput, { HERMES_REFLECTION_CODEX_TURN_CAPTURE: "true" }),
+    runHookCli(home, concurrentCliInput, { HERMES_REFLECTION_CODEX_TURN_CAPTURE: "true" }),
   ]);
   assert.deepEqual(concurrentReceipts.map((item) => item.code).sort(), [0, 0],
     `concurrent no-time replay conflicted: ${JSON.stringify(concurrentReceipts)}`);
@@ -240,17 +255,21 @@ await withTempHome("v21-compaction", async (home) => {
   const explicitTimeOne = await runHookCli(home, JSON.stringify({
     event: "PreCompact",
     session_id: "explicit-time-cli-session",
+    turn_id: "explicit-time-turn-1",
+    trigger: "auto",
     occurred_at: "2026-08-09T01:00:00.000Z",
   }));
   const explicitTimeTwo = await runHookCli(home, JSON.stringify({
     event: "PreCompact",
     session_id: "explicit-time-cli-session",
+    turn_id: "explicit-time-turn-2",
+    trigger: "auto",
     timestamp: "2026-08-09T01:00:01.000Z",
   }));
   assert.equal(explicitTimeOne.code, 0, explicitTimeOne.stderr);
   assert.equal(explicitTimeTwo.code, 0, explicitTimeTwo.stderr);
   assert.notEqual(explicitTimeOne.payload.event_id, explicitTimeTwo.payload.event_id,
-    "different explicit event times collapsed to one generated identity");
+    "different official turn IDs collapsed to one generated identity");
   assert.equal(explicitTimeOne.payload.accepted, true);
   assert.equal(explicitTimeTwo.payload.accepted, true);
 

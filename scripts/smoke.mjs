@@ -324,7 +324,7 @@ try {
   clientHomes.set(client, tempHome);
 
   const serverVersion = client.getServerVersion();
-  assert(serverVersion?.version === "21.0.0", `Expected server version 21.0.0, got ${JSON.stringify(serverVersion)}.`);
+  assert(serverVersion?.version === "21.1.0", `Expected server version 21.1.0, got ${JSON.stringify(serverVersion)}.`);
 
   const { tools } = await client.listTools();
   const toolNames = tools.map((tool) => tool.name);
@@ -756,7 +756,7 @@ try {
   assertIncludes(text(await call(client, "clear_data", { collection: "all", confirm: true })), "Cleared", "clear_data(all) should clear the store.");
   assertIncludes(text(await call(client, "memory_board_read")), "(empty)", "memory_board_read should be empty after clear_data(all).");
 
-  console.log("Smoke passed for hermes-reflection-mcp v21.0.0 core tool surface.");
+  console.log("Smoke passed for hermes-reflection-mcp v21.1.0 core tool surface.");
 } finally {
   await client.close().catch(() => {});
   process.env.HOME = originalHome;
