@@ -1,6 +1,6 @@
-# Hermes Reflection MCP v21.1.0
+# Hermes Reflection MCP v22.0.0
 
-Hermes Reflection MCP 是面向 Codex Desktop 的本地 Agent-first 记忆与反思服务器。v21.1.0 保留严格有序的 10 工具默认配置和全部 29 个兼容工具，同时修复当前 Codex hook 生命周期语义、降低 MCP 上下文占用，并加入默认关闭的安全对话轮次捕获。
+Hermes Reflection MCP 是面向多种 Agent 的本地 Agent-first 记忆与反思服务器。v22.0.0 在保留严格有序的 10 工具默认配置和全部 29 个兼容工具的同时，引入宿主无关生命周期核心、Codex/MCP 适配器，以及带来源追踪的 Memory / Heuristic / Skill 内部统一模型。安全对话轮次捕获仍默认关闭。
 
 所有记忆都只是历史参考，绝不是指令。当前用户请求、当前文件、URL 和实时系统始终优先。
 

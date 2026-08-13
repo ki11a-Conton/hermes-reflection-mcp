@@ -1,10 +1,10 @@
-# Hermes Reflection MCP v21.1.0
+# Hermes Reflection MCP v22.0.0
 
 Hermes Reflection MCP is a local, Agent-first memory and reflection server for Codex Desktop. It keeps the v19-compatible 29-tool surface, but the recommended Codex profile exposes only 10 high-value tools to reduce tool metadata and context usage.
 
 All memory is reference data, never instructions. The server is local-first, rejects unsafe transfer paths, redacts sensitive derived/output text, and requires explicit confirmation for destructive reset.
 
-v21.1 aligns lifecycle handling with the current Codex hook contract: `Stop` is a turn boundary, only `SessionEnd` tears down a session, and an official `PostCompact` event is valid without Hermes-only metadata. Optional turn capture is bounded, redacted, paired atomically, and disabled by default. The compatibility layer remains exactly 29 unique tools, and the default Agent-first profile remains the exact ordered 10-tool list below.
+v22.0 adds a host-independent lifecycle and learning core while preserving v21.1 behavior. Codex and direct MCP events now map into one canonical dispatcher; Memory, Heuristic, and Skill are distinct internal objects with provenance, and skill candidates cannot bypass explicit state transitions. Optional turn capture remains bounded, redacted, paired atomically, and disabled by default. The compatibility layer remains exactly 29 unique tools, and the default Agent-first profile remains the exact ordered 10-tool list below.
 
 ## Agent-first core profile
 

@@ -19,6 +19,7 @@ import {
   listSessionTurns,
   listSessionTurnsAround,
   getSessionMeta,
+  cleanupPendingTurnSides,
   persistCompactionReceipt,
   persistSessionEnd,
   persistSessionStart,
@@ -47,6 +48,9 @@ import {
 import { projectScopeRepository } from "./project_scope.js";
 import { resolvePersistedSessionAccess } from "./session_access.js";
 import { SessionScopeError, type RequestedSessionScope } from "./session_scope.js";
+import { mapMcpLifecycleEvent } from "./adapters/mcp/event_mapper.js";
+import { dispatchLifecycleEvent, type LifecycleDispatcherPorts } from "./lifecycle/dispatcher.js";
+import type { CanonicalLifecycleEvent, LifecycleHostMetadata } from "./lifecycle/events.js";
 
 // ============================================================
 // Tool Implementations
@@ -70,6 +74,62 @@ export async function handleCaptureMemorySnapshot(args: any): Promise<string> {
 /**
  * session_lifecycle_hook - Session lifecycle event handler
  */
+async function dispatchDirectLifecycle(
+  canonical: CanonicalLifecycleEvent,
+  resolvedProjectKey: string | undefined,
+  acceptedMetadata: LifecycleHostMetadata | undefined,
+) {
+  let snapshotResult: Awaited<ReturnType<typeof captureSessionSnapshot>> | undefined;
+  let releaseResult: ReturnType<typeof releaseSessionSnapshot> | undefined;
+  let compactionReceipt: Awaited<ReturnType<typeof persistCompactionReceipt>> | undefined;
+  let backgroundNotificationError: string | undefined;
+  const ports: LifecycleDispatcherPorts = {
+    persist_session_start: (event) => persistSessionStart(event.session_id, { scope: event.scope }),
+    bind_scope: async (event) => {
+      await projectScopeRepository.bind(event.session_id, resolvedProjectKey, acceptedMetadata);
+    },
+    capture_snapshot: async (sessionId) => {
+      snapshotResult = await captureSessionSnapshot(sessionId);
+    },
+    stage_turn_side: async () => undefined,
+    persist_compaction_observation: async () => undefined,
+    persist_compaction_receipt: async (event) => {
+      if (!event.payload.trusted_receipt) return true;
+      compactionReceipt = await persistCompactionReceipt(
+        event.session_id,
+        event.payload.trusted_receipt,
+        event.scope,
+      );
+      return Boolean(compactionReceipt);
+    },
+    persist_session_end: (event) => persistSessionEnd(event.session_id, {
+      scope: event.scope,
+      end_reason: event.payload.reason,
+    }),
+    cleanup_pending_turn_sides: async (sessionId) => {
+      await cleanupPendingTurnSides({ session_id: sessionId });
+    },
+    release_snapshot: (sessionId) => {
+      releaseResult = releaseSessionSnapshot(sessionId);
+    },
+    notify_session_end: async (sessionId) => {
+      try {
+        await backgroundLifecycle.notifySessionEnd(sessionId);
+      } catch {
+        backgroundNotificationError = "background_state_unavailable";
+      }
+    },
+    release_scope: (sessionId) => projectScopeRepository.release(sessionId),
+  };
+  await dispatchLifecycleEvent(canonical, ports).catch((error) => {
+    if (error instanceof Error && error.message.startsWith("LIFECYCLE_PERSISTENCE_UNAVAILABLE")) {
+      throw new Error(SESSION_STORAGE_UNAVAILABLE);
+    }
+    throw error;
+  });
+  return { snapshotResult, releaseResult, compactionReceipt, backgroundNotificationError };
+}
+
 export async function handleSessionLifecycleHook(args: any): Promise<string> {
   const { event, session_id, project_key, metadata } = SessionLifecycleHookSchema.parse(args);
   const startMetadata = metadata && !("generation" in metadata) ? metadata : undefined;
@@ -83,108 +143,109 @@ export async function handleSessionLifecycleHook(args: any): Promise<string> {
     : undefined;
   
   const actions: string[] = [];
-  
-  switch (event) {
-    case "start": {
-      const requestedScope = resolvedProjectKey?.startsWith("project:")
-        ? resolvedProjectKey as RequestedSessionScope
-        : resolvedProjectKey ? `project:${resolvedProjectKey}` as RequestedSessionScope : "global";
-      const persisted = await persistSessionStart(session_id, { scope: requestedScope });
-      if (!persisted) throw new Error(SESSION_STORAGE_UNAVAILABLE);
-      const scope = await projectScopeRepository.bind(session_id, resolvedProjectKey, acceptedMetadata);
-      const captureResult = await captureSessionSnapshot(session_id);
-      actions.push("Captured or refreshed memory snapshot");
-      const background = await backgroundLifecycle.status();
 
-      return JSON.stringify({
-        success: captureResult.success,  // A13-fix: use actual result instead of hardcoded true
-        event,
-        session_id,
-        scope,
-        ...(acceptedMetadata ? { metadata: acceptedMetadata } : {}),
-        actions_performed: actions,
-        snapshot_info: captureResult.snapshot_info,
-        background_lifecycle: background.runtime,
-      }, null, 2);
-    }
-
-    case "stop":
-    case "precompact": {
-      const scope = await resolvePersistedSessionAccess(session_id, resolvedProjectKey);
-      return JSON.stringify({
-        success: true,
-        event,
-        session_id,
-        scope,
-        snapshot_changed: false,
-        message: event === "stop"
-          ? "Turn boundary recorded. The session remains active until an explicit end event."
-          : "Pre-compaction boundary recorded. The frozen snapshot remains unchanged until postcompact.",
-        background_lifecycle: (await backgroundLifecycle.status()).runtime,
-      }, null, 2);
-    }
-
-    case "end": {
-      const scope = await resolvePersistedSessionAccess(session_id, resolvedProjectKey);
-      const persisted = await persistSessionEnd(session_id, { scope, end_reason: "client_end" });
-      if (!persisted) throw new Error(SESSION_STORAGE_UNAVAILABLE);
-      const releaseResult = releaseSessionSnapshot(session_id);
-      let backgroundNotificationError: string | undefined;
-      try {
-        await backgroundLifecycle.notifySessionEnd(session_id);
-      } catch {
-        backgroundNotificationError = "background_state_unavailable";
-      }
-      await projectScopeRepository.release(session_id);
-      // J3-fix: only push "Released" actions if release actually succeeded
-      if (releaseResult.success) {
-        actions.push("Released memory snapshot");
-        actions.push("Session cleanup completed");
-      } else {
-        actions.push(`No active snapshot: ${releaseResult.message}`);
-      }
-
-      return JSON.stringify({
-        success: releaseResult.success,  // C4: use actual result
-        event,
-        session_id,
-        message: releaseResult.message,
-        actions_performed: actions,
-        background_lifecycle: (await backgroundLifecycle.status()).runtime,
-        background_notification_error: backgroundNotificationError,
-      }, null, 2);
-    }
-
-    case "pause":
-    case "resume":
-      return JSON.stringify({
-        success: true,
-        event,
-        session_id,
-        snapshot_changed: false,
-        message: `Client lifecycle event recorded: ${event}. Codex execution state is not controlled by this MCP.`,
-        background_lifecycle: (await backgroundLifecycle.status()).runtime,
-      }, null, 2);
-
-    case "postcompact": {
-      const scope = await resolvePersistedSessionAccess(session_id, resolvedProjectKey);
-      const receipt = await persistCompactionReceipt(session_id, metadata as CompactionMetadata, scope);
-      if (!receipt) throw new Error(SESSION_STORAGE_UNAVAILABLE);
-      const captureResult = await captureSessionSnapshot(session_id);
-      if (!captureResult.success) throw new Error(captureResult.message);
-      return JSON.stringify({
-        success: true,
-        event,
-        session_id,
-        scope,
-        compaction_receipt: receipt,
-        snapshot_info: captureResult.snapshot_info,
-      }, null, 2);
-    }
-      
-    default:
-      throw new Error(`Unknown event: ${event}`);
+  if (event === "start") {
+    const requestedScope = resolvedProjectKey?.startsWith("project:")
+      ? resolvedProjectKey as RequestedSessionScope
+      : resolvedProjectKey ? `project:${resolvedProjectKey}` as RequestedSessionScope : "global";
+    const canonical = mapMcpLifecycleEvent({
+      event,
+      session_id,
+      scope: requestedScope,
+      host_metadata: acceptedMetadata,
+    });
+    const { snapshotResult: captureResult } = await dispatchDirectLifecycle(
+      canonical,
+      resolvedProjectKey,
+      acceptedMetadata,
+    );
+    if (!captureResult) throw new Error("Lifecycle snapshot result is unavailable");
+    actions.push("Captured or refreshed memory snapshot");
+    const background = await backgroundLifecycle.status();
+    return JSON.stringify({
+      success: captureResult.success,
+      event,
+      session_id,
+      scope: requestedScope,
+      ...(acceptedMetadata ? { metadata: acceptedMetadata } : {}),
+      actions_performed: actions,
+      snapshot_info: captureResult.snapshot_info,
+      background_lifecycle: background.runtime,
+    }, null, 2);
   }
+
+  if (event === "stop" || event === "precompact") {
+    const scope = await resolvePersistedSessionAccess(session_id, resolvedProjectKey);
+    return JSON.stringify({
+      success: true,
+      event,
+      session_id,
+      scope,
+      snapshot_changed: false,
+      message: event === "stop"
+        ? "Turn boundary recorded. The session remains active until an explicit end event."
+        : "Pre-compaction boundary recorded. The frozen snapshot remains unchanged until postcompact.",
+      background_lifecycle: (await backgroundLifecycle.status()).runtime,
+    }, null, 2);
+  }
+
+  if (event === "end") {
+    const scope = await resolvePersistedSessionAccess(session_id, resolvedProjectKey);
+    const canonical = mapMcpLifecycleEvent({ event, session_id, scope });
+    const effects = await dispatchDirectLifecycle(canonical, resolvedProjectKey, acceptedMetadata);
+    const releaseResult = effects.releaseResult;
+    if (!releaseResult) throw new Error("Lifecycle release result is unavailable");
+    if (releaseResult.success) {
+      actions.push("Released memory snapshot");
+      actions.push("Session cleanup completed");
+    } else {
+      actions.push(`No active snapshot: ${releaseResult.message}`);
+    }
+    return JSON.stringify({
+      success: releaseResult.success,
+      event,
+      session_id,
+      message: releaseResult.message,
+      actions_performed: actions,
+      background_lifecycle: (await backgroundLifecycle.status()).runtime,
+      background_notification_error: effects.backgroundNotificationError,
+    }, null, 2);
+  }
+
+  if (event === "pause" || event === "resume") {
+    return JSON.stringify({
+      success: true,
+      event,
+      session_id,
+      snapshot_changed: false,
+      message: `Client lifecycle event recorded: ${event}. Codex execution state is not controlled by this MCP.`,
+      background_lifecycle: (await backgroundLifecycle.status()).runtime,
+    }, null, 2);
+  }
+
+  if (event === "postcompact") {
+    const scope = await resolvePersistedSessionAccess(session_id, resolvedProjectKey);
+    const canonical = mapMcpLifecycleEvent({
+      event,
+      session_id,
+      scope,
+      compaction_metadata: metadata as CompactionMetadata,
+    });
+    const effects = await dispatchDirectLifecycle(canonical, resolvedProjectKey, acceptedMetadata);
+    if (!effects.compactionReceipt) throw new Error(SESSION_STORAGE_UNAVAILABLE);
+    if (!effects.snapshotResult) throw new Error("Lifecycle snapshot result is unavailable");
+    if (!effects.snapshotResult.success) throw new Error(effects.snapshotResult.message);
+    return JSON.stringify({
+      success: true,
+      event,
+      session_id,
+      scope,
+      compaction_receipt: effects.compactionReceipt,
+      snapshot_info: effects.snapshotResult.snapshot_info,
+    }, null, 2);
+  }
+
+  throw new Error(`Unknown event: ${event}`);
 }
 
 /**

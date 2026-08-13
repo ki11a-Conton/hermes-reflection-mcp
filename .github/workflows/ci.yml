@@ -45,6 +45,9 @@ jobs:
       - name: Base regressions
         run: npm run test:regressions
 
+      - name: v22 portable lifecycle and learning core
+        run: npm run test:v22
+
       - name: v21 lifecycle, transaction, safety, and release suites
         run: npm run test:v21
 

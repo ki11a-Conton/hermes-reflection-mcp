@@ -15,6 +15,7 @@ import {
 const execFileAsync = promisify(execFile);
 const SELF = fileURLToPath(import.meta.url);
 const WINDOWS_LOCK_HOLDER = fileURLToPath(new URL("./v21-lock-holder.ps1", import.meta.url));
+const packageVersion = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).version;
 
 function testV2CoordinatorContract() {
   const transactionId = "12345678-1234-4123-8123-123456789abc";
@@ -1371,8 +1372,8 @@ if (process.argv[2] === "--child") {
 
   await withHome("snapshot-replacement-result-isolated", async (home) => {
     const result = await runChild(home, "snapshot-replacement-result-isolated");
-    assert.equal(result.returned_version, "21.1.0", "replacement result must represent writer VERSION intent");
-    assert.equal(result.actual_version, "21.1.0");
+    assert.equal(result.returned_version, packageVersion, "replacement result must represent writer VERSION intent");
+    assert.equal(result.actual_version, packageVersion);
     assert.equal(result.leaked_entry, false, "mutating the returned replacement plan must not leak into storage state");
   });
 

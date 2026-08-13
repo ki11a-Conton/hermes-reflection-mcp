@@ -328,11 +328,12 @@ export const ApprovePendingMutationSchema = z.object({
 export const CaptureMemorySnapshotSchema = z.object({
     session_id: z.string().min(1).max(200),
 });
+const SessionMetadataTextSchema = z.string().min(1).max(100).refine((value) => !value.includes("\r") && !value.includes("\n") && !value.includes("\0"), { message: "Must not contain CR, LF, or NUL" });
 const SessionStartMetadataSchema = z.object({
     project_key: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).optional(),
-    model: z.string().min(1).max(100).regex(/^[^\r\n\0]+$/).optional(),
-    platform: z.string().min(1).max(100).regex(/^[^\r\n\0]+$/).optional(),
-    user_id: z.string().min(1).max(100).regex(/^[^\r\n\0]+$/).optional(),
+    model: SessionMetadataTextSchema.optional(),
+    platform: SessionMetadataTextSchema.optional(),
+    user_id: SessionMetadataTextSchema.optional(),
 }).strict();
 export const SessionLifecycleHookSchema = z.object({
     event: z.enum(["start", "end", "stop", "pause", "resume", "precompact", "postcompact"]),

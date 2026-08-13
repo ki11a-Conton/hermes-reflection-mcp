@@ -1,4 +1,4 @@
-# Installing Hermes Reflection MCP v21.1.0
+# Installing Hermes Reflection MCP v22.0.0
 
 This guide installs the local stdio MCP with the Agent-first 10-tool Codex profile. Node.js 20 or newer is required.
 

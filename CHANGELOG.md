@@ -1,5 +1,19 @@
 # Changelog
 
+## 22.0.0 - 2026-08-13
+
+### Portable learning core
+
+- Added a strict host-independent lifecycle event model, deterministic identity hashing, replay/conflict classification, and an injected side-effect dispatcher.
+- Moved Codex hook mapping and direct MCP lifecycle mapping behind adapters while preserving the 10-tool Agent-first and 29-tool compatibility profiles.
+- Added a unified internal Memory / Heuristic / Skill model with traceable evidence, evidence-aware confidence projection, and a persistence-free skill-candidate state machine.
+
+### Compatibility and safety
+
+- Replaced provider-incompatible public metadata regex patterns with runtime refinements, fixing OpenCode/provider schema rejection without weakening CR/LF/NUL validation.
+- Added frozen public-tool compatibility, provider-schema, fake-host lifecycle parity, learning-model, fingerprint-integrity, and candidate-transition tests.
+- Kept v21 storage formats and public MCP behavior compatible; skill candidates are internal only and cannot apply or execute learned content.
+
 ## 21.1.0 - 2026-08-12
 
 ### Codex lifecycle and privacy

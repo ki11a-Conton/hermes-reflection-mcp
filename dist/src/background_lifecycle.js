@@ -7,6 +7,8 @@ import { HermesError } from "./errors.js";
 import { durableReviewCandidateIds } from "./review_queue.js";
 import { hookInbox } from "./hook_inbox.js";
 import { HookInboxPump } from "./hook_inbox_pump.js";
+import { isActionableCodexHookEvent, mapCodexHookEvent, } from "./adapters/codex/event_mapper.js";
+import { dispatchLifecycleEvent, } from "./lifecycle/dispatcher.js";
 import { projectScopeRepository } from "./project_scope.js";
 import { normalizeRequestedSessionScope, SessionScopeError, } from "./session_scope.js";
 import { resolvePersistedSessionAccess } from "./session_access.js";
@@ -301,91 +303,95 @@ export class BackgroundLifecycle {
         return wrapped;
     }
     async applyHookEvent(event) {
-        switch (event.event) {
-            case "SessionStart":
-                {
-                    const immutableStart = event.source !== "resume" && event.source !== "compact";
-                    if (!await persistSessionStart(event.session_id, {
-                        scope: (event.project_key ?? event.scope_intent),
-                        ...(immutableStart && event.event_id_source !== "generated" ? { start_event_id: event.event_id } : {}),
-                        ...(immutableStart && event.occurred_at_source !== "received" ? { started_at: event.occurred_at } : {}),
-                    })) {
-                        throw new Error(SESSION_STORAGE_UNAVAILABLE);
-                    }
-                    await projectScopeRepository.bind(event.session_id, event.project_key);
-                    await captureSessionSnapshot(event.session_id);
-                    break;
-                }
-            case "UserPromptSubmit":
-            case "Stop":
-                if (this.turnCaptureEnabled && event.captured && event.turn_id) {
-                    const scope = await resolvePersistedSessionAccess(event.session_id, event.project_key);
-                    const expiresAt = new Date(Date.parse(event.occurred_at) + 24 * 60 * 60_000).toISOString();
-                    await stageCapturedTurnSide({
-                        session_id: event.session_id,
-                        turn_id: event.turn_id,
-                        side: event.captured.side,
-                        content: event.captured.content,
-                        content_hash: event.captured.content_hash,
-                        occurred_at: event.occurred_at,
-                        expires_at: expiresAt,
-                        original_code_points: event.captured.original_code_points,
-                        content_truncated: event.captured.content_truncated,
-                        content_blocked: event.captured.content_blocked,
-                        scope,
-                    });
-                }
-                break;
-            case "PreCompact":
-                if (event.turn_id && event.trigger) {
-                    const scope = await resolvePersistedSessionAccess(event.session_id, event.project_key);
-                    await persistCompactionObservation({
-                        event_id: event.event_id,
-                        session_id: event.session_id,
-                        turn_id: event.turn_id,
-                        phase: "pre",
-                        trigger: event.trigger,
-                        occurred_at: event.occurred_at,
-                        scope,
-                    });
-                }
-                break;
-            case "PostCompact":
-                {
-                    const scope = await resolvePersistedSessionAccess(event.session_id, event.project_key);
-                    if (event.turn_id && event.trigger) {
-                        await persistCompactionObservation({
-                            event_id: event.event_id,
-                            session_id: event.session_id,
-                            turn_id: event.turn_id,
-                            phase: "post",
-                            trigger: event.trigger,
-                            occurred_at: event.occurred_at,
-                            scope,
-                        });
-                    }
-                    if (event.metadata && !await persistCompactionReceipt(event.session_id, event.metadata, scope)) {
-                        throw new Error(SESSION_STORAGE_UNAVAILABLE);
-                    }
-                }
-                await captureSessionSnapshot(event.session_id);
-                break;
-            case "SessionEnd":
-                {
-                    const scope = await resolvePersistedSessionAccess(event.session_id, event.project_key);
-                    if (!await persistSessionEnd(event.session_id, {
-                        scope,
-                        end_reason: event.reason ?? "SessionEnd Hook",
-                        ...(event.occurred_at_source !== "received" ? { ended_at: event.occurred_at } : {}),
-                    }))
-                        throw new Error(SESSION_STORAGE_UNAVAILABLE);
-                    await cleanupPendingTurnSides({ session_id: event.session_id });
-                    releaseSessionSnapshot(event.session_id);
-                    await this.notifySessionEnd(event.session_id);
-                    await projectScopeRepository.release(event.session_id);
-                }
-                break;
-        }
+        if (!isActionableCodexHookEvent(event, this.turnCaptureEnabled))
+            return;
+        const isStart = event.event === "SessionStart";
+        const needsPersistedScope = !isStart
+            && (event.event === "SessionEnd"
+                || event.event === "PostCompact"
+                || (event.event === "PreCompact" && Boolean(event.turn_id && event.trigger))
+                || (this.turnCaptureEnabled
+                    && (event.event === "UserPromptSubmit" || event.event === "Stop")
+                    && Boolean(event.captured && event.turn_id)));
+        const resolvedScope = needsPersistedScope
+            ? await resolvePersistedSessionAccess(event.session_id, event.project_key)
+            : undefined;
+        const mapped = mapCodexHookEvent(event, {
+            ...(resolvedScope ? { resolved_scope: resolvedScope } : {}),
+        });
+        const ports = {
+            persist_session_start: async (canonical) => {
+                const immutableStart = event.source !== "resume" && event.source !== "compact";
+                return persistSessionStart(canonical.session_id, {
+                    scope: canonical.scope,
+                    ...(canonical.payload.parent_session_id
+                        ? { parent_session_id: canonical.payload.parent_session_id }
+                        : {}),
+                    ...(immutableStart && canonical.identity.source !== "generated"
+                        ? { start_event_id: canonical.identity.key }
+                        : {}),
+                    ...(immutableStart && canonical.occurred_at_source !== "received"
+                        ? { started_at: canonical.occurred_at }
+                        : {}),
+                });
+            },
+            bind_scope: async (canonical) => {
+                await projectScopeRepository.bind(canonical.session_id, event.project_key, canonical.host_metadata);
+            },
+            capture_snapshot: async (sessionId) => {
+                await captureSessionSnapshot(sessionId);
+            },
+            stage_turn_side: async (canonical) => {
+                if (!this.turnCaptureEnabled || !canonical.payload.capture)
+                    return;
+                const expiresAt = new Date(Date.parse(canonical.occurred_at) + 24 * 60 * 60_000).toISOString();
+                await stageCapturedTurnSide({
+                    session_id: canonical.session_id,
+                    turn_id: canonical.turn_id,
+                    ...canonical.payload.capture,
+                    occurred_at: canonical.occurred_at,
+                    expires_at: expiresAt,
+                    scope: canonical.scope,
+                });
+            },
+            persist_compaction_observation: async (canonical, phase) => {
+                if (!canonical.turn_id || !canonical.payload.observation)
+                    return;
+                await persistCompactionObservation({
+                    event_id: canonical.identity.key,
+                    session_id: canonical.session_id,
+                    turn_id: canonical.turn_id,
+                    phase,
+                    trigger: canonical.payload.observation.trigger,
+                    occurred_at: canonical.occurred_at,
+                    scope: canonical.scope,
+                });
+            },
+            persist_compaction_receipt: async (canonical) => {
+                if (!canonical.payload.trusted_receipt)
+                    return true;
+                return Boolean(await persistCompactionReceipt(canonical.session_id, canonical.payload.trusted_receipt, canonical.scope));
+            },
+            persist_session_end: (canonical) => persistSessionEnd(canonical.session_id, {
+                scope: canonical.scope,
+                end_reason: canonical.payload.reason,
+                ...(canonical.occurred_at_source !== "received" ? { ended_at: canonical.occurred_at } : {}),
+            }),
+            cleanup_pending_turn_sides: async (sessionId) => {
+                await cleanupPendingTurnSides({ session_id: sessionId });
+            },
+            release_snapshot: (sessionId) => {
+                releaseSessionSnapshot(sessionId);
+            },
+            notify_session_end: (sessionId) => this.notifySessionEnd(sessionId),
+            release_scope: (sessionId) => projectScopeRepository.release(sessionId),
+        };
+        await dispatchLifecycleEvent(mapped, ports).catch((error) => {
+            if (error instanceof Error && error.message.startsWith("LIFECYCLE_PERSISTENCE_UNAVAILABLE")) {
+                throw new Error(SESSION_STORAGE_UNAVAILABLE);
+            }
+            throw error;
+        });
     }
     async consumeInboxNow() {
         return this.hookPump.poke();

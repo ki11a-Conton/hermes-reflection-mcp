@@ -91,7 +91,7 @@ async function main() {
 
   const directory = dirname(hooksPath);
   await mkdir(directory, { recursive: true });
-  const backupPath = `${hooksPath}.pre-hermes-v21.1.0-${timestamp()}.bak`;
+  const backupPath = `${hooksPath}.pre-hermes-v22.0.0-${timestamp()}.bak`;
   const tempPath = join(directory, `.${randomUUID()}.hermes-hooks.tmp`);
   let handle;
   try {
