@@ -1,25 +1,16 @@
 import { Buffer } from "node:buffer";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { HermesError } from "./errors.js";
+import { canonicalizeStable } from "./stable_order.js";
 // Cursors are process-local capabilities. A restart intentionally invalidates
 // outstanding cursors instead of accepting client-edited pagination state.
 const CURSOR_AUTH_SECRET = randomBytes(32);
 function cursorMac(payload) {
     return createHmac("sha256", CURSOR_AUTH_SECRET).update(payload, "utf8").digest();
 }
-function canonical(value) {
-    if (Array.isArray(value))
-        return value.map(canonical);
-    if (value && typeof value === "object") {
-        return Object.fromEntries(Object.entries(value)
-            .sort(([a], [b]) => a.localeCompare(b))
-            .map(([key, item]) => [key, canonical(item)]));
-    }
-    return value;
-}
 export function queryHash(value) {
     return createHash("sha256")
-        .update(JSON.stringify(canonical(value)) ?? "null", "utf8")
+        .update(JSON.stringify(canonicalizeStable(value)) ?? "null", "utf8")
         .digest("hex");
 }
 export function encodeCursor(value) {

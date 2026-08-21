@@ -263,7 +263,7 @@ export const ResolveOpenQuestionSchema = z.object({
 });
 
 export const GetMemoryItemSchema = z.object({
-  kind: z.enum(["heuristic", "reflection", "session_turn", "review_candidate"]),
+  kind: z.enum(["heuristic", "reflection", "session_turn", "review_candidate", "skill", "skill_candidate"]),
   id: z.string().min(1).max(300),
   session_id: z.string().min(1).max(200).optional(),
   project_key: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).optional(),
@@ -378,7 +378,7 @@ export const ListPendingMutationsSchema = z.object({
 
 export const ApprovePendingMutationSchema = z.object({
   mutation_id: z.string().max(100),
-  decision: z.enum(["approve", "reject"]),
+  decision: z.enum(["approve", "reject", "rollback"]),
 });
 
 export const CaptureMemorySnapshotSchema = z.object({
@@ -505,7 +505,7 @@ register("scan_memory_threats", "Scan Memory Board or User Profile entries for s
 register("scroll_session_context", "Read indexed turns around one anchor. Compact by default; use response_mode:'full' for larger excerpts.", ScrollSessionContextSchema, READ_ONLY);
 register("trigger_background_review", "Run or inspect bounded session review. Compact by default; use full for detail.", TriggerBackgroundReviewSchema, MUTATING);
 register("list_pending_mutations", "List memory mutations waiting for manual approval. Compact by default; use response_mode:'full' for detail.", ListPendingMutationsSchema, READ_ONLY);
-register("approve_pending_mutation", "Approve and replay, or reject, one queued mutation; replay may be destructive.", ApprovePendingMutationSchema, DESTRUCTIVE);
+register("approve_pending_mutation", "Approve and replay, reject, or roll back one reviewed mutation; replay and rollback may be destructive.", ApprovePendingMutationSchema, DESTRUCTIVE);
 register("compact_session_context", "Build a bounded session handoff. Compact by default; use full for diagnostics.", CompactSessionContextSchema, READ_ONLY);
 
 if (tools.size !== 29) throw new Error(`Tool registry must contain 29 tools, got ${tools.size}.`);

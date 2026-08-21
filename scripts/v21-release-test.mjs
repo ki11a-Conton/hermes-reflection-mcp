@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const EXPECTED_VERSION = "22.0.0";
+const EXPECTED_VERSION = "22.1.0";
 const runtimeRequested = process.argv.includes("--runtime") || Boolean(process.env.HERMES_SERVER_ENTRY);
 const explicitProjectRoot = process.env.HERMES_PROJECT_ROOT;
 
@@ -91,6 +91,12 @@ const v21Tests = [
   "scripts/v22-lifecycle-core-test.mjs",
   "scripts/v22-lifecycle-dispatcher-test.mjs",
   "scripts/v22-learning-model-test.mjs",
+  "scripts/v22.1-skill-model-test.mjs",
+  "scripts/v22.1-skill-promotion-test.mjs",
+  "scripts/v22.1-skill-synthesis-test.mjs",
+  "scripts/v22.1-skill-storage-test.mjs",
+  "scripts/v22.1-skill-lifecycle-test.mjs",
+  "scripts/v22.1-skill-mcp-test.mjs",
 ];
 
 const retainedLegacyTests = [

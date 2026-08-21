@@ -1,4 +1,4 @@
-# Installing Hermes Reflection MCP v22.0.0
+# Installing Hermes Reflection MCP v22.1.0
 
 This guide installs the local stdio MCP with the Agent-first 10-tool Codex profile. Node.js 20 or newer is required.
 
@@ -13,7 +13,7 @@ This guide installs the local stdio MCP with the Agent-first 10-tool Codex profi
 npm ci --omit=dev
 ```
 
-The release contains `dist/`; production installation does not need TypeScript. Never reuse `node_modules` from another OS, Node version, computer, or older installation. v21 keeps the exact ordered 10-tool default profile and exact 29-tool compatibility surface.
+The release contains `dist/`; production installation does not need TypeScript. Never reuse `node_modules` from another OS, Node version, computer, or older installation. v22.1 keeps the exact ordered 10-tool default profile and exact 29-tool compatibility surface.
 
 Suggested install directories:
 
@@ -63,6 +63,8 @@ HERMES_REFLECTION_LLM_API_KEY=<dedicated-provider-key>
 
 Do not commit provider keys. The MCP never obtains or reuses Codex authentication. Keep auto-apply false until deterministic and LLM preview results are reviewed. Auto-apply remains blocked when write approval is enabled.
 
+Eligible repeated procedures may also produce MCP-managed Skill candidates. They remain local pending mutations and never create external skill/script files. Inspect them with `get_memory_item` (`kind: "skill_candidate"`), then use `approve_pending_mutation` with `decision: "approve"`, `"reject"`, or `"rollback"`. Rollback uses the original applied mutation ID and refuses to replace a newer revision.
+
 ## Codex lifecycle hooks
 
 Use the included structural installer after building or installing the package:
@@ -87,6 +89,8 @@ Turn capture is disabled by default. To enable it deliberately, set `HERMES_REFL
 
 For a source checkout or staging install with development dependencies:
 
+On Windows, invoke the commands explicitly through `C:\Users\<YOU>\AppData\Local\Microsoft\WindowsApps\pwsh.exe`; replace `<YOU>` or use your own PowerShell 7 path.
+
 ```powershell
 npm ci
 npm run test:strict
@@ -102,11 +106,12 @@ npm run test:concurrency
 npm run test:v20:agent-fixture
 npm run test:v21
 npm run test:v21.1
+npm run test:v22.1
 npm pack --dry-run --json
 npm audit --omit=dev
 ```
 
-Expected v21.1 gates:
+Expected v22.1 gates:
 
 - exactly 29 complete public tools;
 - exact 10-tool core profile;
@@ -137,7 +142,7 @@ v21 migrates supported older stores to schema 2 under a lock. It fails closed on
 1. Stop Codex Desktop and any standalone MCP process.
 2. Back up the current installed code directory to a dated sibling path.
 3. Back up `~/.hermes-reflection` separately; never put it into the release directory.
-4. Install the v21.1 release into a clean staging directory and run validation.
+4. Install the v22.1 release into a clean staging directory and run validation.
 5. Switch the stable install path or Codex configuration only after validation passes.
 6. Start a fresh Codex Desktop process and confirm the 10-tool surface.
 

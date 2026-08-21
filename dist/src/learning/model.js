@@ -6,6 +6,26 @@ const ScopeSchema = z.union([
 ]);
 const TimestampSchema = z.string().datetime({ offset: true });
 const ConfidenceSchema = z.number().min(0).max(1);
+function codePointLength(value) {
+    return Array.from(value).length;
+}
+function boundedCodePoints(minimum, maximum, label) {
+    return z.string().superRefine((value, context) => {
+        const length = codePointLength(value);
+        if (length < minimum || length > maximum) {
+            context.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: `${label} must contain ${minimum}-${maximum} Unicode code points`,
+            });
+        }
+        if (value.trim().length === 0) {
+            context.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: `${label} must contain non-whitespace text`,
+            });
+        }
+    });
+}
 const SharedLearningFields = {
     id: z.string().min(1).max(200),
     scope: ScopeSchema,
@@ -32,16 +52,33 @@ export const HeuristicLearningItemSchema = z.object({
         tags: z.array(z.string().min(1).max(100)).max(50),
     }).strict(),
 }).strict();
+export const SkillProcedureContentSchema = z.object({
+    kind: z.literal("procedure"),
+    title: boundedCodePoints(1, 200, "title"),
+    summary: boundedCodePoints(1, 2_000, "summary"),
+    steps: z.array(boundedCodePoints(1, 1_500, "step")).min(1).max(40),
+    domain: boundedCodePoints(1, 200, "domain").default("general"),
+    tags: z.array(boundedCodePoints(1, 100, "tag")).max(50).default([]),
+}).strict().superRefine((content, context) => {
+    const procedureLength = [
+        content.title,
+        content.summary,
+        ...content.steps,
+        content.domain,
+        ...content.tags,
+    ].reduce((total, value) => total + codePointLength(value), 0);
+    if (procedureLength > 24_000) {
+        context.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "complete procedure content must not exceed 24,000 Unicode code points",
+        });
+    }
+});
 export const SkillLearningItemSchema = z.object({
     ...SharedLearningFields,
     type: z.literal("skill"),
     provenance: z.array(EvidenceReferenceSchema).min(1).max(100),
-    content: z.object({
-        kind: z.literal("procedure"),
-        title: z.string().min(1).max(200),
-        summary: z.string().min(1).max(2_000),
-        steps: z.array(z.string().min(1).max(2_000)).min(1).max(100),
-    }).strict(),
+    content: SkillProcedureContentSchema,
 }).strict();
 export const LearningItemSchema = z.discriminatedUnion("type", [
     MemoryLearningItemSchema,

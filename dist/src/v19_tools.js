@@ -5,7 +5,7 @@
 //        trigger_background_review
 // ============================================================
 import { captureSessionSnapshot, releaseSessionSnapshot, } from "./storage_enhanced.js";
-import { getSessionReflections, getRawMemoryStores, safeHeuristicText, scanHeuristicThreats, } from "../storage.js";
+import { getSessionReflections, getRawMemoryStores, listSkillCandidateRecords, safeHeuristicText, scanHeuristicThreats, skillPromotionScopeStates, } from "../storage.js";
 import { listSessionTurns, listSessionTurnsAround, getSessionMeta, cleanupPendingTurnSides, persistCompactionReceipt, persistSessionEnd, persistSessionStart, SESSION_STORAGE_UNAVAILABLE, } from "../session_storage.js";
 import { buildCompactionHandoff, parseCompactionReceipt, } from "./compaction_handoff.js";
 import { getReviewReadinessStatus, getReviewSourceState } from "./review_engine.js";
@@ -20,6 +20,8 @@ import { resolvePersistedSessionAccess } from "./session_access.js";
 import { SessionScopeError } from "./session_scope.js";
 import { mapMcpLifecycleEvent } from "./adapters/mcp/event_mapper.js";
 import { dispatchLifecycleEvent } from "./lifecycle/dispatcher.js";
+import { compareStableText } from "./stable_order.js";
+import { isSkillPromotionScopeDirty } from "./learning/skill_candidate.js";
 // ============================================================
 // Tool Implementations
 // ============================================================
@@ -359,8 +361,18 @@ export async function handleTriggerBackgroundReview(args) {
         ? await resolveManualReviewScope(session_id, project_key)
         : await projectScopeRepository.resolve({ project_key });
     if (action === "status") {
-        const background = await backgroundLifecycle.status(scope);
-        const queue = await reviewQueueCounts(scope);
+        const [background, queue, promotionStates, promotionCandidates] = await Promise.all([
+            backgroundLifecycle.status(scope),
+            reviewQueueCounts(scope),
+            skillPromotionScopeStates(),
+            listSkillCandidateRecords(scope),
+        ]);
+        const scopedPromotionStates = promotionStates.filter((item) => item.scope === scope);
+        const recentPromotion = [...scopedPromotionStates]
+            .filter((item) => item.completed_at !== undefined && item.last_outcome_class !== undefined)
+            .sort((left, right) => Date.parse(right.completed_at ?? "") - Date.parse(left.completed_at ?? "")
+            || compareStableText(left.scope, right.scope))[0];
+        const pendingSkillCandidates = promotionCandidates.filter((candidate) => candidate.state === "pending" || candidate.state === "approved").length;
         return JSON.stringify({
             success: true,
             action,
@@ -381,6 +393,22 @@ export async function handleTriggerBackgroundReview(args) {
                     lease: background.durable.lease,
                     recent_runs: background.durable.recent_runs,
                 },
+            },
+            skill_promotion: {
+                dirty_scope_count: scopedPromotionStates.filter(isSkillPromotionScopeDirty).length,
+                pending_candidate_count: pendingSkillCandidates,
+                ...(recentPromotion
+                    ? {
+                        recent_outcome: {
+                            scope: recentPromotion.scope,
+                            completed_at: recentPromotion.completed_at,
+                            outcome_class: recentPromotion.last_outcome_class,
+                        },
+                    }
+                    : {}),
+                ...(pendingSkillCandidates > 0
+                    ? { admin_hint: "Use list_pending_mutations, then approve_pending_mutation to approve, reject, or roll back a skill candidate." }
+                    : {}),
             },
         }, null, 2);
     }

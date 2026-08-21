@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { STORE_DIR } from "../storage.js";
+import { dirtySkillPromotionScopes, skillCandidateIdsExist, STORE_DIR, } from "../storage.js";
 import { BackgroundStateStore } from "./background_state.js";
 import { getReviewReadinessStatus, getReviewSourceState, inFlightReview, reviewSingleFlightKey, runReviewSingleFlight, } from "./review_engine.js";
 import { HermesError } from "./errors.js";
 import { durableReviewCandidateIds } from "./review_queue.js";
+import { runSkillPromotionSingleFlight, } from "./skill_promotion_coordinator.js";
 import { hookInbox } from "./hook_inbox.js";
 import { HookInboxPump } from "./hook_inbox_pump.js";
 import { isActionableCodexHookEvent, mapCodexHookEvent, } from "./adapters/codex/event_mapper.js";
@@ -13,6 +14,7 @@ import { projectScopeRepository } from "./project_scope.js";
 import { normalizeRequestedSessionScope, SessionScopeError, } from "./session_scope.js";
 import { resolvePersistedSessionAccess } from "./session_access.js";
 import { captureSessionSnapshot, releaseSessionSnapshot } from "./storage_enhanced.js";
+import { compareStableText } from "./stable_order.js";
 import { persistCompactionReceipt, persistCompactionObservation, cleanupPendingTurnSides, persistSessionEnd, persistSessionStart, resolveSessionScope, SESSION_STORAGE_UNAVAILABLE, stageCapturedTurnSide, } from "../session_storage.js";
 async function internalPersistedScope(sessionId) {
     try {
@@ -151,6 +153,10 @@ export class BackgroundLifecycle {
     review;
     sourceState;
     candidatesDurable;
+    promotionDirtyScopes;
+    promote;
+    promotionCandidatesDurable;
+    manualReview;
     inbox;
     processHookEvent;
     turnCaptureEnabled;
@@ -161,6 +167,7 @@ export class BackgroundLifecycle {
     deadlineBackoffUntil = 0;
     deadlineArmGeneration = 0;
     deadlineRearmQueue = Promise.resolve();
+    promotionWakePending = false;
     activeRun;
     activeReviewReady;
     activeController;
@@ -177,6 +184,10 @@ export class BackgroundLifecycle {
             return getReviewSourceState(sessionId, "recent", scope, stage);
         });
         this.candidatesDurable = options.candidates_durable ?? durableReviewCandidateIds;
+        this.promotionDirtyScopes = options.promotion_dirty_scopes ?? dirtySkillPromotionScopes;
+        this.promote = options.promote ?? runSkillPromotionSingleFlight;
+        this.promotionCandidatesDurable = options.promotion_candidates_durable ?? skillCandidateIdsExist;
+        this.manualReview = options.manual_review ?? runReviewSingleFlight;
         this.inbox = options.hook_inbox ?? hookInbox;
         this.turnCaptureEnabled = options.turn_capture_enabled ?? truthy(process.env.HERMES_REFLECTION_CODEX_TURN_CAPTURE);
         this.processHookEvent = options.process_hook_event ?? ((event) => this.applyHookEvent(event));
@@ -247,6 +258,22 @@ export class BackgroundLifecycle {
     async notifyReflectionSaved(sessionId) {
         await this.options.store.markDirty(sessionId);
         await this.rearmDeadline();
+        this.notifySkillPromotionDirty();
+    }
+    /** Wake the existing fenced background runner after a committed learning mutation. */
+    notifySkillPromotionDirty() {
+        if (!this.options.enabled || this.stopping)
+            return;
+        this.promotionWakePending = true;
+        this.wakePendingSkillPromotions();
+    }
+    wakePendingSkillPromotions() {
+        if (!this.promotionWakePending || !this.options.enabled || this.stopping
+            || this.activeRun !== undefined || this.activeFence !== undefined || this.fenceClaiming)
+            return;
+        void this.runNow().catch((error) => {
+            console.error("[hermes] background skill promotion failed:", error instanceof Error ? error.message : "unknown error");
+        });
     }
     async notifySessionEnd(sessionId) {
         const requestedStage = this.requestedStage();
@@ -268,6 +295,37 @@ export class BackgroundLifecycle {
             return "llm";
         return getReviewReadinessStatus().ready ? "llm" : "deterministic";
     }
+    async runSkillPromotions(signal, beforeApply, withApplyLease, onlyScope) {
+        const dirty = (await this.promotionDirtyScopes())
+            .filter((item) => onlyScope === undefined || item.scope === onlyScope)
+            .sort((left, right) => Date.parse(left.dirty_at) - Date.parse(right.dirty_at)
+            || compareStableText(left.scope, right.scope))
+            .slice(0, Math.max(1, this.options.max_sessions_per_run));
+        for (const item of dirty) {
+            if (signal.aborted || !await beforeApply())
+                break;
+            let output;
+            try {
+                output = await this.promote({
+                    scope: item.scope,
+                    signal,
+                    before_apply: beforeApply,
+                    with_apply_lease: withApplyLease,
+                });
+            }
+            catch (error) {
+                if (signal.aborted)
+                    break;
+                console.error("[hermes] skill promotion coordinator failed:", error instanceof Error ? error.message : "unknown error");
+                continue;
+            }
+            if (signal.aborted || output.outcome_class === "aborted")
+                break;
+            if (output.success && !await this.promotionCandidatesDurable(output.candidate_ids)) {
+                console.error("[hermes] skill promotion candidates were not durably persisted");
+            }
+        }
+    }
     runNow(request) {
         if (request) {
             const key = reviewSingleFlightKey(request);
@@ -285,6 +343,7 @@ export class BackgroundLifecycle {
             return Promise.resolve();
         if (this.activeRun)
             return this.activeRun;
+        this.promotionWakePending = false;
         let resolveReady;
         const ready = {
             promise: new Promise((resolve) => { resolveReady = resolve; }),
@@ -298,6 +357,7 @@ export class BackgroundLifecycle {
             if (this.activeRun === wrapped)
                 this.activeRun = undefined;
             void this.rearmDeadline();
+            this.wakePendingSkillPromotions();
         });
         this.activeRun = wrapped;
         return wrapped;
@@ -496,7 +556,7 @@ export class BackgroundLifecycle {
             if (controller.signal.aborted || !await refresher.start()) {
                 throw new HermesError("REVIEW_IN_PROGRESS", "The manual review lease was lost before provider work started.", true, "Retry after the current review lease is available.");
             }
-            const result = await runReviewSingleFlight({
+            const result = await this.manualReview({
                 ...request,
                 signal: controller.signal,
                 beforeApply: () => this.options.store.isLeaseCurrent(this.ownerId, lease.fencing_token),
@@ -517,6 +577,7 @@ export class BackgroundLifecycle {
             if (!committed) {
                 throw new HermesError("REVIEW_IN_PROGRESS", "The manual review stage could not be committed under the current lease.", true, "Retry so the durable candidates and stage fingerprint can be reconciled.");
             }
+            await this.runSkillPromotions(controller.signal, () => this.options.store.isLeaseCurrent(this.ownerId, lease.fencing_token), (operation) => this.options.store.withCurrentLease(this.ownerId, lease.fencing_token, operation), request.scope);
             return result;
         }
         finally {
@@ -527,6 +588,7 @@ export class BackgroundLifecycle {
             if (this.activeFence === lease.fencing_token)
                 this.activeFence = undefined;
             void this.rearmDeadline();
+            this.wakePendingSkillPromotions();
         }
     }
     async runCycle() {
@@ -621,6 +683,9 @@ export class BackgroundLifecycle {
                 }
                 const retryAfterMs = output.success ? undefined : this.cooldownMs(output.outcome_class);
                 await this.commitStage(this.ownerId, lease.fencing_token, item.session_id, completedStage, output.source_fingerprint || current.source_fingerprint, output.outcome_class, candidateIds, item.dirty_at, retryAfterMs);
+            }
+            if (!controller.signal.aborted) {
+                await this.runSkillPromotions(controller.signal, () => this.options.store.isLeaseCurrent(this.ownerId, lease.fencing_token), (operation) => this.options.store.withCurrentLease(this.ownerId, lease.fencing_token, operation));
             }
         }
         finally {

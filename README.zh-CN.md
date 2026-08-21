@@ -1,6 +1,6 @@
-# Hermes Reflection MCP v22.0.0
+# Hermes Reflection MCP v22.1.0
 
-Hermes Reflection MCP 是面向多种 Agent 的本地 Agent-first 记忆与反思服务器。v22.0.0 在保留严格有序的 10 工具默认配置和全部 29 个兼容工具的同时，引入宿主无关生命周期核心、Codex/MCP 适配器，以及带来源追踪的 Memory / Heuristic / Skill 内部统一模型。安全对话轮次捕获仍默认关闭。
+Hermes Reflection MCP 是面向多种 Agent 的本地 Agent-first 记忆与反思服务器。v22.1.0 在保持严格有序的 10 工具默认配置和全部 29 个兼容工具的同时，把内部 Skill 模型实装为 MCP 管理、人工审批、可审计回滚的技能记忆；不会创建外部 Codex skill 文件，也不会执行学到的脚本。安全对话轮次捕获仍默认关闭。
 
 所有记忆都只是历史参考，绝不是指令。当前用户请求、当前文件、URL 和实时系统始终优先。
 
@@ -30,6 +30,23 @@ trigger_background_review
 - 长结果默认 `response_mode: "compact"`，上限为 6,000 个 Unicode 码点和 24 KiB；完整模式上限为 20,000 个码点和 80 KiB。
 - 默认 10 工具的 schema + description + server instructions 总量受 15,000 字符预算约束；服务器说明不超过 512 个码点。
 - 紧凑启发式结果只含 `id`、`heuristic` 和 `confidence`，避免重复携带可按需获取的元数据。
+- `retrieve_heuristics` 最多只附带 2 个启用且作用域可见的 `skill_ref`，不返回完整步骤；需要时再用 `get_memory_item` 按 ID 获取。
+
+## MCP 管理的 Skill
+
+- 只有重复成功的程序性经验才可晋升：至少来自 2 个成功会话，或同一会话内 3 个不同的成功目标。
+- 矛盾、有害、未解决失败、凭据/秘密、临时 provider/环境状态、永久负面能力断言和匹配歧义都会被拒绝或阻断。
+- Skill 的唯一权威存储在 MCP 内部；不会写 `.codex/skills`、`SKILL.md`、脚本或其他可执行技能文件。
+- `get_memory_item` 的 `kind` 可使用 `skill` 或 `skill_candidate`；详情沿用作用域授权、历史内容安全、响应预算、游标和版本失效规则。
+- 用 `list_pending_mutations` 获取 mutation ID，再调用 `approve_pending_mutation`：
+
+```json
+{"mutation_id":"<id>","decision":"approve"}
+{"mutation_id":"<id>","decision":"reject"}
+{"mutation_id":"<原始已应用 mutation id>","decision":"rollback"}
+```
+
+批准时会原子复核作用域、证据、聚类指纹、目标版本、内容哈希和 mutation 绑定。回滚可幂等重试，但不会覆盖更新的当前版本；回滚新建 Skill 会将其禁用，因此不会再被召回。
 
 ## Codex 生命周期语义
 
@@ -77,6 +94,8 @@ HERMES_REFLECTION_LLM_API_KEY=<dedicated-provider-key>
 
 认证、权限、配置和配额错误进入持久冷却；临时错误最多重试一次；关闭 MCP 会有界取消请求并释放租约。候选默认保持 `pending`，自动应用仍需独立开启，并受置信度、风险、证据新鲜度、审批状态和 fencing token 约束。
 
+Skill 合成复用同一套有界 provider transport 和严格 JSON 输出边界。Provider 不可用、返回无效或不安全内容时，只生成基于现有证据的确定性候选，不会绕过审批。后台晋升与复盘共用 fencing lease 和取消控制器；后台生命周期关闭时不会自动请求 provider，但手动 `trigger_background_review` 仍可在租约内处理晋升。
+
 ## 安装 hooks
 
 构建或安装项目后运行：
@@ -91,13 +110,15 @@ node scripts/install-codex-hooks.mjs --hooks "$env:USERPROFILE\.codex\hooks.json
 
 ## 数据、迁移与回滚
 
-用户数据位于 `~/.hermes-reflection`，不要放进源码或发布 ZIP。v21.1 保持主 store schema 2，并对 session SQLite 事务性加入 pending turn pairs 与 compaction observations；现有 v21 数据原地迁移，不会把观察伪装为可信回执。
+用户数据位于 `~/.hermes-reflection`，不要放进源码或发布 ZIP。v22.1 保持主 store schema 2 以及现有 session/lifecycle schema 版本；旧状态缺少 Skill 集合时安全默认为空，现有 v21/v22 数据原地兼容。
 
 升级前分别备份安装目录和 `~/.hermes-reflection`。先在干净 staging 安装、验证，再切换稳定路径。失败时停止 Codex，恢复匹配的上一版代码、数据和 hooks/config 备份，再启动新进程。
 
 ## 开发验证
 
 需要 Node.js 20 或更高版本：
+
+本次 Windows 验证显式使用 `C:\Users\<YOU>\AppData\Local\Microsoft\WindowsApps\pwsh.exe` 形式的 PowerShell 7 路径；请替换 `<YOU>`，其他机器使用自己的路径。
 
 ```powershell
 npm ci
@@ -108,6 +129,7 @@ npm run test:regressions
 npm run test:v20
 npm run test:v21
 npm run test:v21.1
+npm run test:v22.1
 npm run test:concurrency
 npm run test:v20:agent-fixture
 npm pack --dry-run --json

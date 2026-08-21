@@ -12,8 +12,10 @@ import {
 import {
   getSessionReflections,
   getRawMemoryStores,
+  listSkillCandidateRecords,
   safeHeuristicText,
   scanHeuristicThreats,
+  skillPromotionScopeStates,
 } from "../storage.js";
 import {
   listSessionTurns,
@@ -51,6 +53,8 @@ import { SessionScopeError, type RequestedSessionScope } from "./session_scope.j
 import { mapMcpLifecycleEvent } from "./adapters/mcp/event_mapper.js";
 import { dispatchLifecycleEvent, type LifecycleDispatcherPorts } from "./lifecycle/dispatcher.js";
 import type { CanonicalLifecycleEvent, LifecycleHostMetadata } from "./lifecycle/events.js";
+import { compareStableText } from "./stable_order.js";
+import { isSkillPromotionScopeDirty } from "./learning/skill_candidate.js";
 
 // ============================================================
 // Tool Implementations
@@ -433,8 +437,19 @@ export async function handleTriggerBackgroundReview(args: any): Promise<string> 
     ? await resolveManualReviewScope(session_id, project_key)
     : await projectScopeRepository.resolve({ project_key });
   if (action === "status") {
-    const background = await backgroundLifecycle.status(scope);
-    const queue = await reviewQueueCounts(scope);
+    const [background, queue, promotionStates, promotionCandidates] = await Promise.all([
+      backgroundLifecycle.status(scope),
+      reviewQueueCounts(scope),
+      skillPromotionScopeStates(),
+      listSkillCandidateRecords(scope),
+    ]);
+    const scopedPromotionStates = promotionStates.filter((item) => item.scope === scope);
+    const recentPromotion = [...scopedPromotionStates]
+      .filter((item) => item.completed_at !== undefined && item.last_outcome_class !== undefined)
+      .sort((left, right) => Date.parse(right.completed_at ?? "") - Date.parse(left.completed_at ?? "")
+        || compareStableText(left.scope, right.scope))[0];
+    const pendingSkillCandidates = promotionCandidates.filter((candidate) =>
+      candidate.state === "pending" || candidate.state === "approved").length;
     return JSON.stringify({
       success: true,
       action,
@@ -455,6 +470,22 @@ export async function handleTriggerBackgroundReview(args: any): Promise<string> 
           lease: background.durable.lease,
           recent_runs: background.durable.recent_runs,
         },
+      },
+      skill_promotion: {
+        dirty_scope_count: scopedPromotionStates.filter(isSkillPromotionScopeDirty).length,
+        pending_candidate_count: pendingSkillCandidates,
+        ...(recentPromotion
+          ? {
+              recent_outcome: {
+                scope: recentPromotion.scope,
+                completed_at: recentPromotion.completed_at,
+                outcome_class: recentPromotion.last_outcome_class,
+              },
+            }
+          : {}),
+        ...(pendingSkillCandidates > 0
+          ? { admin_hint: "Use list_pending_mutations, then approve_pending_mutation to approve, reject, or roll back a skill candidate." }
+          : {}),
       },
     }, null, 2);
   }

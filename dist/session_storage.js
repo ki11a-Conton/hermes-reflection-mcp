@@ -4,6 +4,7 @@ import { join } from "path";
 import { STORE_DIR } from "./storage.js";
 import { withFileLock } from "./src/file_lock.js";
 import { codePointLength, redactSensitiveText } from "./src/redaction.js";
+import { compareStableText } from "./src/stable_order.js";
 import { OperationJournalStoreUnavailableError } from "./src/operation_journal.js";
 import { createCompactionReceipt, parseCompactionReceipt, } from "./src/compaction_handoff.js";
 import { assertSessionScopeVisibility, lifecycleNotReady, normalizePersistedSessionScope, normalizeRequestedSessionScope, } from "./src/session_scope.js";
@@ -1060,8 +1061,9 @@ export function validateSessionStorageSnapshot(value) {
             timestamp: isoTimestamp(row.timestamp, `session snapshot turns[${index}].timestamp`),
         };
     });
-    sessions.sort((left, right) => left.session_id.localeCompare(right.session_id));
-    turns.sort((left, right) => left.session_id.localeCompare(right.session_id) || left.turn_index - right.turn_index);
+    sessions.sort((left, right) => compareStableText(left.session_id, right.session_id));
+    turns.sort((left, right) => compareStableText(left.session_id, right.session_id)
+        || left.turn_index - right.turn_index);
     const sessionIds = new Set();
     for (const session of sessions) {
         if (sessionIds.has(session.session_id))

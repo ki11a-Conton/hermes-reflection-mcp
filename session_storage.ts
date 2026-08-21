@@ -13,6 +13,7 @@ import type {
 } from "./types.js";
 import { withFileLock } from "./src/file_lock.js";
 import { codePointLength, redactSensitiveText } from "./src/redaction.js";
+import { compareStableText } from "./src/stable_order.js";
 import { OperationJournalStoreUnavailableError } from "./src/operation_journal.js";
 import {
   createCompactionReceipt,
@@ -1278,8 +1279,9 @@ export function validateSessionStorageSnapshot(value: unknown): SessionStorageSn
     };
   });
 
-  sessions.sort((left, right) => left.session_id.localeCompare(right.session_id));
-  turns.sort((left, right) => left.session_id.localeCompare(right.session_id) || left.turn_index - right.turn_index);
+  sessions.sort((left, right) => compareStableText(left.session_id, right.session_id));
+  turns.sort((left, right) => compareStableText(left.session_id, right.session_id)
+    || left.turn_index - right.turn_index);
   const sessionIds = new Set<string>();
   for (const session of sessions) {
     if (sessionIds.has(session.session_id)) throw new Error(`duplicate session metadata: ${session.session_id}`);

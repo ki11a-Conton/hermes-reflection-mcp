@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { HermesError } from "./errors.js";
+import { canonicalizeStable } from "./stable_order.js";
 
 export interface CursorPayload {
   v: 1;
@@ -19,21 +20,9 @@ function cursorMac(payload: string): Buffer {
   return createHmac("sha256", CURSOR_AUTH_SECRET).update(payload, "utf8").digest();
 }
 
-function canonical(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonical);
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([key, item]) => [key, canonical(item)]),
-    );
-  }
-  return value;
-}
-
 export function queryHash(value: unknown): string {
   return createHash("sha256")
-    .update(JSON.stringify(canonical(value)) ?? "null", "utf8")
+    .update(JSON.stringify(canonicalizeStable(value)) ?? "null", "utf8")
     .digest("hex");
 }
 

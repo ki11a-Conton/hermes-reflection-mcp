@@ -103,7 +103,7 @@ const EXPECTED_ANNOTATIONS = {
   compact_session_context: READ_ONLY,
 };
 
-const EXPECTED_CONTRACT_SHA256 = "fd6e58e082bd1b4971d35060526ec88103a517b3e5d3af540a2cfb515c111b0c";
+const EXPECTED_CONTRACT_SHA256 = "a1165d06e2fcee90ce3af574860cd634ec51017cfa80d2b675ec1a4ef3302b26";
 const MAX_CORE_METADATA_CODE_POINTS = 12_500;
 const STANDARD_SCHEMA_TYPES = new Set([
   "array",
@@ -172,6 +172,16 @@ assert.deepEqual(
 );
 
 const byName = new Map(registered.map((tool) => [tool.name, tool]));
+assert.deepEqual(
+  byName.get("get_memory_item")?.inputSchema?.properties?.kind?.enum,
+  ["heuristic", "reflection", "session_turn", "review_candidate", "skill", "skill_candidate"],
+  "get_memory_item additive skill detail kinds drifted",
+);
+assert.deepEqual(
+  byName.get("approve_pending_mutation")?.inputSchema?.properties?.decision?.enum,
+  ["approve", "reject", "rollback"],
+  "approval decision contract drifted",
+);
 for (const tool of registered) {
   assert.deepEqual(
     tool.annotations,

@@ -1,5 +1,23 @@
 # Changelog
 
+## 22.1.0 - 2026-08-16
+
+### MCP-managed Skill promotion
+
+- Added deterministic complete-link promotion of repeated successful procedures, with exact-scope evidence, contradiction/harm/transient-state gates, stable fingerprints, bounded LLM synthesis, and deterministic fallback.
+- Added durable Skill records, audited revisions, approval-bound candidates, duplicate/supersession limits, atomic create/update application, and idempotent rollback that refuses newer-revision overwrite. Newly created skills are disabled when rolled back.
+- Added cancellable, same-scope single-flight promotion to the existing fenced background lifecycle. Automatic provider work stays disabled when the scheduler is disabled; manual review processes eligible promotion under the same lease.
+
+### Agent-first MCP integration
+
+- Added at most two compact active Skill references to heuristic retrieval without exposing full procedure steps. `get_memory_item` now supports bounded, scope-authorized `skill` and `skill_candidate` detail with historical safety and stale-cursor checks.
+- Extended the existing approval tool with typed Skill approval, rejection, and rollback routing; no public tool was added. The MCP never writes external Skill files or executes learned procedures.
+- Preserved the exact ordered 10-tool core profile, all 29 registered compatibility tools, store schema 2, compact/full response budgets, and provider-compatible public JSON Schema. The reviewed public contract hash is `a1165d06e2fcee90ce3af574860cd634ec51017cfa80d2b675ec1a4ef3302b26`.
+
+### Verification
+
+- Added focused Skill model, clustering, synthesis/transport, storage, lifecycle, and MCP subprocess suites covering restart, fencing loss, shutdown cancellation, scope isolation, provider fallback, approval races, rollback, response budgets, and OpenCode schema compatibility.
+
 ## 22.0.0 - 2026-08-13
 
 ### Portable learning core

@@ -48,8 +48,8 @@ jobs:
       - name: v22 portable lifecycle and learning core
         run: npm run test:v22
 
-      - name: v21 lifecycle, transaction, safety, and release suites
-        run: npm run test:v21
+      - name: v22.1 current Skill, lifecycle, storage, and MCP suites
+        run: npm run test:v22.1
 
       - name: Single and cross-process concurrency
         run: npm run test:concurrency

@@ -28,6 +28,11 @@ import type {
   HeuristicFeedbackInput,
   ReviewCandidate,
   CommittedReceipt,
+  SkillPromotionCandidate,
+  SkillPromotionDirtyScope,
+  SkillPromotionMetadata,
+  SkillRecord,
+  SkillRevision,
 } from "./types.js";
 
 import { 
@@ -55,6 +60,26 @@ import {
   withOperationJournalBarrier,
 } from "./src/operation_journal.js";
 import { serializeReflectionResources } from "./src/reflection_transaction.js";
+import {
+  SKILL_CLUSTER_ALGORITHM,
+  buildPromotionClusters,
+  isPromotionProcedureGrounded,
+  matchPromotionTarget,
+  type PromotionCluster,
+  type PromotionSnapshot,
+} from "./src/learning/skill_promotion.js";
+import {
+  SkillPromotionCandidateSchema,
+  SkillPromotionMetadataSchema,
+  SkillRecordSchema,
+  SkillRevisionSchema,
+  createSkillPromotionCandidate,
+  isSkillPromotionScopeDirty,
+  skillRevisionContentHash,
+  transitionSkillPromotionCandidate,
+  type CreateSkillPromotionCandidateInput,
+} from "./src/learning/skill_candidate.js";
+import { canonicalizeStable, compareStableText, stableUniqueSorted } from "./src/stable_order.js";
 
 const WINDOWS_RENAME_RETRIES = 5;
 const REVIEW_CANDIDATE_LESSON_MAX = 1_000;
@@ -62,6 +87,12 @@ const REVIEW_CANDIDATE_TAGS_MAX = 100;
 const REVIEW_CANDIDATE_SOURCE_IDS_MAX = 50;
 const REVIEW_CANDIDATE_PENDING_PER_SCOPE_MAX = 100;
 const REVIEW_CANDIDATE_TERMINAL_PER_SCOPE_MAX = 20;
+const SKILL_RECORDS_PER_SCOPE_MAX = 200;
+const SKILL_CANDIDATE_PENDING_PER_SCOPE_MAX = 100;
+const SKILL_CANDIDATE_TERMINAL_PER_SCOPE_MAX = 100;
+export const MAX_SKILL_CANDIDATES_PER_BATCH = 50;
+export const SKILL_CANDIDATE_CAPACITY_CODE = "SKILL_CANDIDATE_CAPACITY";
+const SKILL_PROMOTION_SCOPE_MAX = 1_000;
 const COMMITTED_RECEIPT_MAX = 2_048;
 const COMMITTED_RECEIPT_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -72,7 +103,7 @@ const STORE_PATH = join(STORE_DIR, "store.json");
 const REFLECTIONS_PATH = join(STORE_DIR, "reflections.jsonl");
 const RESOLVED_QUESTIONS_PATH = join(STORE_DIR, "resolved_questions.json");
 const operationJournalMutationContext = new AsyncLocalStorage<boolean>();
-export const VERSION = "22.0.0";
+export const VERSION = "22.1.0";
 export const HEURISTIC_DEDUP_THRESHOLD = 0.75;
 const WORLD_FACT_DEDUP_THRESHOLD = 0.65;
 export const HEURISTIC_MAX_COUNT = 500;
@@ -84,6 +115,15 @@ const AVG_HEURISTIC_DOC_LEN = 20;
 const AVG_REFLECTION_DOC_LEN = 60;
 const CJK_RE = /[\u3040-\u309f\u30a0-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/g;
 const CJK_REPLACE_RE = /[\u3040-\u309f\u30a0-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/g;
+
+export class SkillCandidateCapacityError extends Error {
+  readonly code = SKILL_CANDIDATE_CAPACITY_CODE;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "SkillCandidateCapacityError";
+  }
+}
 
 export interface HeuristicScoreDetail {
   text: number;
@@ -607,6 +647,24 @@ function validateV20StoreRaw(value: unknown): Record<string, unknown> {
   if (metadata.store_schema_version !== 2) {
     throw new Error(`store_schema_version must be 2, got ${String(metadata.store_schema_version)}`);
   }
+  if (metadata.skills !== undefined && !Array.isArray(metadata.skills)) {
+    throw new Error("store.json.metadata.skills must be an array");
+  }
+  if (metadata.skill_candidates !== undefined && !Array.isArray(metadata.skill_candidates)) {
+    throw new Error("store.json.metadata.skill_candidates must be an array");
+  }
+  asArray<unknown>(metadata.skills).forEach((item, index) => {
+    const parsed = SkillRecordSchema.safeParse(item);
+    if (!parsed.success) throw new Error(`store.json.metadata.skills[${index}] is invalid: ${parsed.error.message}`);
+  });
+  asArray<unknown>(metadata.skill_candidates).forEach((item, index) => {
+    const parsed = SkillPromotionCandidateSchema.safeParse(item);
+    if (!parsed.success) throw new Error(`store.json.metadata.skill_candidates[${index}] is invalid: ${parsed.error.message}`);
+  });
+  if (metadata.skill_promotion !== undefined) {
+    const parsed = SkillPromotionMetadataSchema.safeParse(metadata.skill_promotion);
+    if (!parsed.success) throw new Error(`store.json.metadata.skill_promotion is invalid: ${parsed.error.message}`);
+  }
   asArray<unknown>(raw.reflections).forEach((item, index) => validateV20ReflectionRaw(item, `store.json.reflections[${index}]`));
   asArray<unknown>(raw.heuristics).forEach((item, index) => validateV20HeuristicRaw(item, `store.json.heuristics[${index}]`));
   return raw;
@@ -706,6 +764,9 @@ export async function initializeStoreV20(): Promise<void> {
       write_count: 0,
       pending_mutations: [],
       review_candidates: [],
+      skills: [],
+      skill_candidates: [],
+      skill_promotion: { dirty_scopes: [] },
     };
     normalizedMetadata.store_schema_version = 2;
     const migrated: ReflectionStore = {
@@ -843,6 +904,9 @@ function emptyStore(): ReflectionStore {
       write_count: 0,
       pending_mutations: [],
       review_candidates: [],
+      skills: [],
+      skill_candidates: [],
+      skill_promotion: { dirty_scopes: [] },
     },
   };
 }
@@ -1204,6 +1268,85 @@ function boundReviewCandidateAudit(candidates: ReviewCandidate[]): ReviewCandida
   return candidates.filter((candidate) => retained.has(candidate.id));
 }
 
+function boundSkillCandidateAudit(
+  candidates: SkillPromotionCandidate[],
+  skills: readonly SkillRecord[] = [],
+): SkillPromotionCandidate[] {
+  const retained = new Set<string>();
+  const currentOriginsByScope = new Map<MemoryScope, Set<string>>();
+  for (const skill of skills) {
+    const revision = skill.revisions.find((item) => item.revision === skill.current_revision);
+    if (!revision) continue;
+    const origins = currentOriginsByScope.get(skill.scope) ?? new Set<string>();
+    origins.add(revision.origin_candidate_id);
+    currentOriginsByScope.set(skill.scope, origins);
+  }
+  const scopes = new Set(candidates.map((candidate) => candidate.scope));
+  for (const scope of scopes) {
+    const scoped = candidates.filter((candidate) => candidate.scope === scope);
+    for (const item of scoped.filter((candidate) => candidate.state === "pending" || candidate.state === "approved")
+      .slice(-SKILL_CANDIDATE_PENDING_PER_SCOPE_MAX)) {
+      retained.add(item.id);
+    }
+    const terminal = scoped.filter((candidate) => candidate.state !== "pending" && candidate.state !== "approved");
+    const pinned = terminal.filter((candidate) => currentOriginsByScope.get(scope)?.has(candidate.id))
+      .slice(-SKILL_CANDIDATE_TERMINAL_PER_SCOPE_MAX);
+    for (const item of pinned) {
+      retained.add(item.id);
+    }
+    const remaining = SKILL_CANDIDATE_TERMINAL_PER_SCOPE_MAX - pinned.length;
+    if (remaining > 0) {
+      for (const item of terminal.filter((candidate) => !retained.has(candidate.id)).slice(-remaining)) {
+        retained.add(item.id);
+      }
+    }
+  }
+  return candidates.filter((candidate) => retained.has(candidate.id));
+}
+
+function normalizeSkillRecords(value: unknown): SkillRecord[] {
+  const records = asArray<unknown>(value).map((item) => SkillRecordSchema.parse(item));
+  const ids = new Set<string>();
+  const perScope = new Map<MemoryScope, number>();
+  for (const record of records) {
+    if (ids.has(record.id)) throw new Error(`Duplicate skill record ID: ${record.id}`);
+    ids.add(record.id);
+    const count = (perScope.get(record.scope) ?? 0) + 1;
+    if (count > SKILL_RECORDS_PER_SCOPE_MAX) throw new Error(`Skill record limit exceeded for ${record.scope}`);
+    perScope.set(record.scope, count);
+  }
+  return records;
+}
+
+function normalizeSkillCandidates(value: unknown, skills: readonly SkillRecord[]): SkillPromotionCandidate[] {
+  const candidates = asArray<unknown>(value).map((item) => SkillPromotionCandidateSchema.parse(item));
+  const ids = new Set<string>();
+  const pendingByScope = new Map<MemoryScope, number>();
+  for (const candidate of candidates) {
+    if (ids.has(candidate.id)) throw new Error(`Duplicate skill candidate ID: ${candidate.id}`);
+    ids.add(candidate.id);
+    if (candidate.state === "pending" || candidate.state === "approved") {
+      const count = (pendingByScope.get(candidate.scope) ?? 0) + 1;
+      if (count > SKILL_CANDIDATE_PENDING_PER_SCOPE_MAX) {
+        throw new Error(`Pending skill candidate limit exceeded for ${candidate.scope}`);
+      }
+      pendingByScope.set(candidate.scope, count);
+    }
+  }
+  return boundSkillCandidateAudit(candidates, skills);
+}
+
+function normalizeSkillPromotionMetadata(value: unknown): { dirty_scopes: SkillPromotionDirtyScope[] } {
+  if (value === undefined) return { dirty_scopes: [] };
+  const parsed = SkillPromotionMetadataSchema.parse(value);
+  const seen = new Set<MemoryScope>();
+  for (const item of parsed.dirty_scopes) {
+    if (seen.has(item.scope)) throw new Error(`Duplicate skill promotion dirty scope: ${item.scope}`);
+    seen.add(item.scope);
+  }
+  return parsed;
+}
+
 export function idempotencyKeyHash(key: string): string {
   return createHash("sha256").update(key, "utf8").digest("hex");
 }
@@ -1231,7 +1374,8 @@ function normalizeCommittedReceipts(value: unknown, now = Date.now()): Record<st
       committed_at: new Date(committedAt).toISOString(),
     }]);
   }
-  entries.sort((left, right) => left[1].committed_at.localeCompare(right[1].committed_at) || left[0].localeCompare(right[0]));
+  entries.sort((left, right) => compareStableText(left[1].committed_at, right[1].committed_at)
+    || compareStableText(left[0], right[0]));
   const bounded = entries.slice(-COMMITTED_RECEIPT_MAX);
   return Object.fromEntries(bounded) as Record<string, CommittedReceipt>;
 }
@@ -1280,8 +1424,14 @@ function normalizeStoreMetadata(value: unknown): ReflectionStore["metadata"] | u
   const reviewMutationIds = new Set(reviewCandidates
     .filter((candidate) => candidate.state === "pending" && candidate.mutation_id)
     .map((candidate) => candidate.mutation_id!));
+  const skills = normalizeSkillRecords(input.skills);
+  const skillCandidates = normalizeSkillCandidates(input.skill_candidates, skills);
+  const skillMutationIds = new Set(skillCandidates
+    .filter((candidate) => (candidate.state === "pending" || candidate.state === "approved") && candidate.mutation_id)
+    .map((candidate) => candidate.mutation_id!));
   const consistentPending = pending.filter((mutation) =>
-    mutation.operation !== "apply_review_candidate" || reviewMutationIds.has(mutation.id));
+    (mutation.operation !== "apply_review_candidate" || reviewMutationIds.has(mutation.id))
+    && (mutation.operation !== "apply_skill_candidate" || skillMutationIds.has(mutation.id)));
 
   const provider = recordValue(input.external_provider);
   const providerName = typeof provider.name === "string" && provider.name.trim()
@@ -1296,6 +1446,9 @@ function normalizeStoreMetadata(value: unknown): ReflectionStore["metadata"] | u
     ...(typeof input.write_approval === "boolean" ? { write_approval: input.write_approval } : {}),
     pending_mutations: consistentPending,
     review_candidates: reviewCandidates,
+    skills,
+    skill_candidates: skillCandidates,
+    skill_promotion: normalizeSkillPromotionMetadata(input.skill_promotion),
     committed_receipts: normalizeCommittedReceipts(input.committed_receipts),
     ...(providerName
       ? {
@@ -1308,6 +1461,41 @@ function normalizeStoreMetadata(value: unknown): ReflectionStore["metadata"] | u
         }
       : {}),
   };
+}
+
+function nextSkillPromotionDirtyTimestamp(existing: SkillPromotionDirtyScope | undefined): string {
+  const previous = Math.max(
+    existing ? Date.parse(existing.dirty_at) : 0,
+    existing?.completed_at ? Date.parse(existing.completed_at) : 0,
+  );
+  return new Date(Math.max(Date.now(), Number.isFinite(previous) ? previous + 1 : 0)).toISOString();
+}
+
+function markSkillPromotionDirtyMut(store: ReflectionStore, scope: MemoryScope): void {
+  const metadata = store.metadata;
+  if (!metadata) throw new Error("Store metadata is unavailable");
+  const promotion: SkillPromotionMetadata = metadata.skill_promotion ?? { dirty_scopes: [] };
+  const existing = promotion.dirty_scopes.find((item) => item.scope === scope);
+  const dirtyAt = nextSkillPromotionDirtyTimestamp(existing);
+  if (existing) existing.dirty_at = dirtyAt;
+  else {
+    const requiredEvictions = promotion.dirty_scopes.length - SKILL_PROMOTION_SCOPE_MAX + 1;
+    if (requiredEvictions > 0) {
+      const evictable = promotion.dirty_scopes
+        .filter((item) => !isSkillPromotionScopeDirty(item))
+        .sort((left, right) =>
+          (Date.parse(left.completed_at!) - Date.parse(right.completed_at!))
+          || compareStableText(left.scope, right.scope));
+      if (evictable.length < requiredEvictions) {
+        throw new Error(`Active skill promotion scope limit reached (${SKILL_PROMOTION_SCOPE_MAX})`);
+      }
+      const evicted = new Set(evictable.slice(0, requiredEvictions).map((item) => item.scope));
+      promotion.dirty_scopes = promotion.dirty_scopes.filter((item) => !evicted.has(item.scope));
+    }
+    promotion.dirty_scopes.push({ scope, dirty_at: dirtyAt });
+  }
+  promotion.dirty_scopes.sort((left, right) => compareStableText(left.scope, right.scope));
+  metadata.skill_promotion = SkillPromotionMetadataSchema.parse(promotion);
 }
 
 // B15: removed dead code saveStore
@@ -1937,7 +2125,10 @@ function upsertHeuristicMut(store: ReflectionStore, input: HeuristicInput): Heur
         }
       }
     }
-    if (newEvidenceCount > 0 || tagsChanged) existing.updated_at = now;
+    if (newEvidenceCount > 0 || tagsChanged) {
+      existing.updated_at = now;
+      markSkillPromotionDirtyMut(store, existing.scope);
+    }
     return existing;
   }
 
@@ -1962,6 +2153,7 @@ function upsertHeuristicMut(store: ReflectionStore, input: HeuristicInput): Heur
     tags: input.tags ?? [],
   };
   store.heuristics.push(heuristic);
+  markSkillPromotionDirtyMut(store, heuristic.scope);
 
   // Register new heuristic in the dedup cache so subsequent calls in the same
   // write-lifetime see it without a full cache rebuild.
@@ -2469,18 +2661,8 @@ export async function getRawMemoryStores(): Promise<RawMemoryStores> {
 type ReviewCandidateDraft = Omit<ReviewCandidate, "created_at" | "state" | "mutation_id" | "evidence_fingerprint">
   & Partial<Pick<ReviewCandidate, "evidence_fingerprint">>;
 
-function canonicalJsonValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalJsonValue);
-  if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, item]) => [key, canonicalJsonValue(item)]));
-  }
-  return value;
-}
-
 export function pendingMutationPayloadHash(payload: Record<string, unknown>): string {
-  return createHash("sha256").update(JSON.stringify(canonicalJsonValue(payload)), "utf8").digest("hex");
+  return createHash("sha256").update(JSON.stringify(canonicalizeStable(payload)), "utf8").digest("hex");
 }
 
 function reviewCandidateContentHash(candidate: Pick<ReviewCandidate,
@@ -2824,6 +3006,679 @@ export async function reviewCandidateCounts(scope?: MemoryScope): Promise<{ pend
   };
 }
 
+export type SkillCandidateDraft = Omit<CreateSkillPromotionCandidateInput, "id" | "mutation_id">;
+
+function sortedUnique(values: readonly string[]): string[] {
+  return stableUniqueSorted(values);
+}
+
+export function skillReflectionContentHash(reflection: ReflectionFrame): string {
+  return pendingMutationPayloadHash(reflection as unknown as Record<string, unknown>);
+}
+
+export function skillPromotionEvidenceFingerprint(
+  snapshot: PromotionSnapshot,
+  sourceHeuristicIds: string[],
+  sourceReflectionIds: string[],
+): string {
+  const heuristicById = new Map(snapshot.heuristics.map((heuristic) => [heuristic.id, heuristic]));
+  const reflectionById = new Map(snapshot.reflections.map((reflection) => [reflection.id, reflection]));
+  const heuristics = sortedUnique(sourceHeuristicIds).map((id) => {
+    const heuristic = heuristicById.get(id);
+    if (!heuristic) return { id, missing: true };
+    return {
+      id: heuristic.id,
+      scope: heuristic.scope,
+      version: heuristic.version,
+      domain: heuristic.domain,
+      heuristic: heuristic.heuristic,
+      source_task: heuristic.source_task,
+      evidence: [...heuristic.evidence].sort((left, right) => compareStableText(left.id, right.id)),
+      feedback: [...heuristic.feedback].sort((left, right) =>
+        compareStableText(left.reflection_id, right.reflection_id) || compareStableText(left.value, right.value)),
+      reinforcement_count: heuristic.reinforcement_count,
+      contradiction_count: heuristic.contradiction_count,
+      contradiction_notes: heuristic.contradiction_notes,
+      confidence: heuristic.confidence,
+      supersedes: sortedUnique(heuristic.supersedes ?? []),
+      superseded_by: heuristic.superseded_by,
+      tags: sortedUnique(heuristic.tags),
+    };
+  });
+  const reflections = sortedUnique(sourceReflectionIds).map((id) => {
+    const reflection = reflectionById.get(id);
+    return reflection ? { id, content_hash: skillReflectionContentHash(reflection) } : { id, missing: true };
+  });
+  return pendingMutationPayloadHash({
+    scope: snapshot.scope,
+    source_heuristic_ids: sortedUnique(sourceHeuristicIds),
+    source_reflection_ids: sortedUnique(sourceReflectionIds),
+    heuristics,
+    reflections,
+  });
+}
+
+function skillCandidateMutationPayload(candidate: SkillPromotionCandidate): Record<string, unknown> {
+  return {
+    candidate_id: candidate.id,
+    candidate_fingerprint: candidate.fingerprint,
+    evidence_fingerprint: candidate.evidence_fingerprint,
+    scope: candidate.scope,
+    action: candidate.action,
+    target_skill_id: candidate.target_skill_id,
+    expected_target_revision: candidate.expected_target_revision,
+    proposed_revision_hash: candidate.proposed_revision.content_hash,
+  };
+}
+
+function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+  const normalizedLeft = sortedUnique(left);
+  const normalizedRight = sortedUnique(right);
+  return normalizedLeft.length === normalizedRight.length
+    && normalizedLeft.every((item, index) => item === normalizedRight[index]);
+}
+
+function sameSkillCandidateCluster(
+  left: SkillPromotionCandidate,
+  right: Pick<SkillPromotionCandidate,
+    "scope" | "action" | "target_skill_id" | "source_heuristic_ids">,
+): boolean {
+  return left.scope === right.scope
+    && left.action === right.action
+    && left.target_skill_id === right.target_skill_id
+    && sameStringSet(left.source_heuristic_ids, right.source_heuristic_ids);
+}
+
+function currentPromotionSnapshotMut(store: ReflectionStore, scope: MemoryScope): PromotionSnapshot {
+  return {
+    scope,
+    heuristics: structuredClone(store.heuristics.filter((heuristic) => heuristic.scope === scope)),
+    reflections: structuredClone(store.reflections.filter((reflection) => reflection.scope === scope)),
+    skills: structuredClone((store.metadata?.skills ?? []).filter((skill) => skill.scope === scope)),
+  };
+}
+
+function assertSkillCandidateEvidence(
+  store: ReflectionStore,
+  candidate: Pick<SkillPromotionCandidate,
+    | "id"
+    | "scope"
+    | "source_heuristic_ids"
+    | "source_reflection_ids"
+    | "evidence_fingerprint"
+    | "proposed_revision"
+    | "cluster_algorithm"
+    | "cluster_fingerprint"
+    | "confidence">,
+): { snapshot: PromotionSnapshot; cluster: PromotionCluster } {
+  if (candidate.source_heuristic_ids.length !== new Set(candidate.source_heuristic_ids).size
+      || candidate.source_reflection_ids.length !== new Set(candidate.source_reflection_ids).size) {
+    throw new Error(`Skill candidate ${candidate.id} has duplicate evidence IDs`);
+  }
+  const snapshot = currentPromotionSnapshotMut(store, candidate.scope);
+  const heuristicById = new Map(snapshot.heuristics.map((heuristic) => [heuristic.id, heuristic]));
+  for (const id of candidate.source_heuristic_ids) {
+    const heuristic = heuristicById.get(id);
+    if (!heuristic || heuristic.superseded_by || heuristic.contradiction_count > 0
+        || heuristic.feedback.some((item) => item.value === "harmful")) {
+      throw new Error(`Skill candidate ${candidate.id} heuristic evidence is missing, unsafe, or stale`);
+    }
+  }
+  const reflectionById = new Map(snapshot.reflections.map((reflection) => [reflection.id, reflection]));
+  const provenanceById = new Map(candidate.proposed_revision.provenance.map((item) => [item.source_id, item]));
+  if (provenanceById.size !== candidate.source_reflection_ids.length) {
+    throw new Error(`Skill candidate ${candidate.id} provenance does not match source reflections`);
+  }
+  for (const id of candidate.source_reflection_ids) {
+    const reflection = reflectionById.get(id);
+    const provenance = provenanceById.get(id);
+    if (!reflection || !provenance || provenance.source_type !== "reflection" || provenance.status !== "active"
+        || !fingerprintsEqual(provenance.content_hash, skillReflectionContentHash(reflection))) {
+      throw new Error(`Skill candidate ${candidate.id} reflection provenance is missing or stale`);
+    }
+  }
+  const current = skillPromotionEvidenceFingerprint(
+    snapshot,
+    candidate.source_heuristic_ids,
+    candidate.source_reflection_ids,
+  );
+  if (!fingerprintsEqual(candidate.evidence_fingerprint, current)) {
+    throw new Error(`Skill candidate ${candidate.id} evidence fingerprint mismatch`);
+  }
+  const authoritativeCluster = buildPromotionClusters(snapshot).find((cluster) =>
+    sameStringSet(cluster.heuristic_ids, candidate.source_heuristic_ids)
+    && sameStringSet(cluster.reflection_ids, candidate.source_reflection_ids));
+  if (candidate.cluster_algorithm !== SKILL_CLUSTER_ALGORITHM || !authoritativeCluster
+      || !fingerprintsEqual(candidate.cluster_fingerprint, authoritativeCluster.fingerprint)
+      || Math.abs(candidate.confidence - authoritativeCluster.confidence) > Number.EPSILON) {
+    throw new Error(`Skill candidate ${candidate.id} cluster fingerprint is stale or invalid`);
+  }
+  return { snapshot, cluster: authoritativeCluster };
+}
+
+function appendSkillRevision(record: SkillRecord, revision: SkillRevision, updatedAt: string): SkillRecord {
+  if (revision.revision !== record.current_revision + 1) {
+    throw new Error(`Skill ${record.id} revision is not monotonic`);
+  }
+  const revisions = [...record.revisions, revision];
+  const audit = [...record.compacted_revision_audit];
+  while (revisions.length > 20) {
+    const removed = revisions.shift();
+    if (!removed) break;
+    audit.push({
+      revision: removed.revision,
+      content_hash: removed.content_hash,
+      origin_candidate_id: removed.origin_candidate_id,
+      created_at: removed.created_at,
+    });
+  }
+  const boundedAudit = audit.sort((left, right) => left.revision - right.revision).slice(-100);
+  return SkillRecordSchema.parse({
+    ...record,
+    current_revision: revision.revision,
+    revisions,
+    compacted_revision_audit: boundedAudit,
+    updated_at: updatedAt,
+  });
+}
+
+function appliedSkillForCandidate(
+  skills: readonly SkillRecord[],
+  candidate: SkillPromotionCandidate,
+): SkillRecord | undefined {
+  if (candidate.action === "update" && candidate.target_skill_id) {
+    return skills.find((skill) => skill.id === candidate.target_skill_id);
+  }
+  return skills.find((skill) => skill.revisions.some((revision) => revision.origin_candidate_id === candidate.id));
+}
+
+function skillProcedureContentFields(revision: SkillRevision): string[] {
+  return [
+    revision.title,
+    revision.summary,
+    ...revision.steps,
+    revision.domain,
+    ...revision.tags,
+  ];
+}
+
+function hasUnsafeSkillProcedureContent(revision: SkillRevision): boolean {
+  return skillProcedureContentFields(revision).some((value) =>
+    firstThreatMessage(value, "strict") !== null
+    || redactSensitiveText(value, { strictHistorical: true }) !== value);
+}
+
+function blockedSkillRevision(revision: SkillRevision): SkillRevision {
+  const { content_hash: _contentHash, ...body } = revision;
+  const safeBody: Omit<SkillRevision, "content_hash"> = {
+    ...body,
+    title: "Blocked promotion candidate",
+    summary: "Procedure content was omitted by the pre-persistence safety gate.",
+    steps: ["Create a new proposal from current authoritative evidence."],
+    domain: "security-review",
+    tags: ["blocked-candidate"],
+  };
+  return SkillRevisionSchema.parse({
+    ...safeBody,
+    content_hash: skillRevisionContentHash(safeBody),
+  });
+}
+
+interface SkillCandidatePreflight {
+  proposedRevision: SkillRevision;
+  risk: SkillCandidateDraft["risk"];
+  riskReasons: string[];
+}
+
+function preflightSkillCandidateDraft(
+  store: ReflectionStore,
+  draft: SkillCandidateDraft,
+  candidateId: string,
+): SkillCandidatePreflight {
+  const classifications: string[] = [];
+  const unsafe = hasUnsafeSkillProcedureContent(draft.proposed_revision);
+  const proposedRevision = unsafe ? blockedSkillRevision(draft.proposed_revision) : draft.proposed_revision;
+  if (unsafe) classifications.push("unsafe_or_sensitive_content");
+
+  let authoritative: ReturnType<typeof assertSkillCandidateEvidence> | undefined;
+  try {
+    authoritative = assertSkillCandidateEvidence(store, {
+      id: candidateId,
+      scope: draft.scope,
+      source_heuristic_ids: draft.source_heuristic_ids,
+      source_reflection_ids: draft.source_reflection_ids,
+      evidence_fingerprint: draft.evidence_fingerprint,
+      proposed_revision: proposedRevision,
+      cluster_algorithm: draft.cluster_algorithm,
+      cluster_fingerprint: draft.cluster_fingerprint,
+      confidence: draft.confidence,
+    });
+  } catch {
+    classifications.push("stale_or_invalid_evidence");
+  }
+  if (authoritative) {
+    if (!unsafe && !isPromotionProcedureGrounded(authoritative.cluster, proposedRevision)) {
+      classifications.push("content_not_grounded_in_evidence");
+    }
+    const targetMatch = matchPromotionTarget(authoritative.cluster, authoritative.snapshot.skills);
+    if (targetMatch.risk_reasons.length > 0) classifications.push("ambiguous_target_match");
+    if (targetMatch.action !== draft.action
+        || targetMatch.target_skill_id !== draft.target_skill_id
+        || targetMatch.expected_target_revision !== draft.expected_target_revision) {
+      classifications.push("stale_action_or_target_match");
+    }
+  }
+
+  const prioritized = stableUniqueSorted(classifications);
+  const existing = stableUniqueSorted(draft.risk_reasons)
+    .filter((reason) => !prioritized.includes(reason));
+  const riskReasons = [...prioritized, ...existing].slice(0, 50);
+  return {
+    proposedRevision,
+    risk: classifications.length > 0 ? "high" : draft.risk,
+    riskReasons,
+  };
+}
+
+/** Persist skill candidates and approval mutations in one locked store write. */
+export async function enqueueSkillCandidateRecords(
+  drafts: SkillCandidateDraft[],
+): Promise<SkillPromotionCandidate[]> {
+  if (drafts.length > MAX_SKILL_CANDIDATES_PER_BATCH) {
+    throw new SkillCandidateCapacityError(`Skill candidate batch exceeds ${MAX_SKILL_CANDIDATES_PER_BATCH}`);
+  }
+  return mutateStore((store) => {
+    const metadata = store.metadata;
+    if (!metadata) throw new Error("Store metadata is unavailable");
+    const candidates = metadata.skill_candidates ?? [];
+    const pending = metadata.pending_mutations ?? [];
+    const saved: SkillPromotionCandidate[] = [];
+    for (const draft of drafts) {
+      const candidateId = draft.proposed_revision.origin_candidate_id;
+      const preflight = preflightSkillCandidateDraft(store, draft, candidateId);
+      const existingById = candidates.find((candidate) => candidate.id === candidateId);
+      const existingMutationId = existingById?.mutation_id;
+      const mutationId = existingMutationId ?? (preflight.risk !== "low" || preflight.riskReasons.length > 0
+        ? undefined
+        : randomUUID());
+      const candidate = createSkillPromotionCandidate({
+        ...draft,
+        id: candidateId,
+        proposed_revision: preflight.proposedRevision,
+        risk: preflight.risk,
+        risk_reasons: preflight.riskReasons,
+        ...(mutationId ? { mutation_id: mutationId } : {}),
+      });
+      if (candidate.state === "pending") assertSkillCandidateEvidence(store, candidate);
+
+      if (existingById) {
+        if (existingById.fingerprint !== candidate.fingerprint) {
+          throw new Error(`Skill candidate id collision: ${candidateId}`);
+        }
+        if ((existingById.state === "pending" || existingById.state === "approved")
+            && (!existingMutationId || !pending.some((mutation) => mutation.id === existingMutationId))) {
+          throw new Error(`Skill candidate ${candidateId} has no matching pending mutation`);
+        }
+        saved.push(structuredClone(existingById));
+        continue;
+      }
+
+      const duplicate = candidates.find((item) => item.fingerprint === candidate.fingerprint);
+      if (duplicate) {
+        saved.push(structuredClone(duplicate));
+        continue;
+      }
+
+      if (candidate.state === "pending") {
+        const pendingForScope = candidates.filter((item) => item.scope === candidate.scope
+          && (item.state === "pending" || item.state === "approved")).length;
+        const superseded = candidates.filter((item) => item.state === "pending"
+          && sameSkillCandidateCluster(item, candidate));
+        if (pendingForScope - superseded.length >= SKILL_CANDIDATE_PENDING_PER_SCOPE_MAX) {
+          throw new SkillCandidateCapacityError(`Pending skill candidate limit reached for ${candidate.scope}`);
+        }
+        const now = new Date().toISOString();
+        for (const stale of superseded) {
+          const index = candidates.findIndex((item) => item.id === stale.id);
+          const finalized = transitionSkillPromotionCandidate(stale, "superseded", now, `superseded by ${candidate.id}`);
+          candidates.splice(index, 1, finalized);
+          if (stale.mutation_id) {
+            const mutationIndex = pending.findIndex((mutation) => mutation.id === stale.mutation_id);
+            if (mutationIndex >= 0) pending.splice(mutationIndex, 1);
+          }
+        }
+        const payload = skillCandidateMutationPayload(candidate);
+        pending.push({
+          id: candidate.mutation_id!,
+          created_at: candidate.created_at,
+          operation: "apply_skill_candidate",
+          preview: `Apply skill candidate ${candidate.id}`,
+          payload,
+          payload_hash: pendingMutationPayloadHash(payload),
+          state: "pending",
+        });
+      }
+      candidates.push(candidate);
+      saved.push(structuredClone(candidate));
+    }
+    metadata.skill_candidates = boundSkillCandidateAudit(candidates, metadata.skills ?? []);
+    metadata.pending_mutations = pending;
+    return saved;
+  }, "none");
+}
+
+export async function getSkillPromotionSnapshot(scope: MemoryScope): Promise<PromotionSnapshot> {
+  await mutationQueue;
+  const store = await getCachedStore();
+  return currentPromotionSnapshotMut(store, scope);
+}
+
+export async function listSkillRecords(scope?: MemoryScope): Promise<SkillRecord[]> {
+  await mutationQueue;
+  const store = await getCachedStore();
+  return structuredClone((store.metadata?.skills ?? []).filter((skill) => !scope || skill.scope === scope));
+}
+
+export async function getSkillRecord(id: string): Promise<SkillRecord | null> {
+  const skills = await listSkillRecords();
+  return skills.find((skill) => skill.id === id) ?? null;
+}
+
+export async function listSkillCandidateRecords(scope?: MemoryScope): Promise<SkillPromotionCandidate[]> {
+  await mutationQueue;
+  const store = await getCachedStore();
+  return structuredClone((store.metadata?.skill_candidates ?? [])
+    .filter((candidate) => !scope || candidate.scope === scope));
+}
+
+export async function getSkillCandidateRecord(id: string): Promise<SkillPromotionCandidate | null> {
+  const candidates = await listSkillCandidateRecords();
+  return candidates.find((candidate) => candidate.id === id) ?? null;
+}
+
+export async function skillCandidateIdsExist(ids: string[]): Promise<boolean> {
+  if (ids.length === 0) return true;
+  const candidates = await listSkillCandidateRecords();
+  const known = new Set(candidates.map((candidate) => candidate.id));
+  return ids.every((id) => known.has(id));
+}
+
+export async function dirtySkillPromotionScopes(): Promise<SkillPromotionDirtyScope[]> {
+  await mutationQueue;
+  const store = await getCachedStore();
+  return structuredClone((store.metadata?.skill_promotion?.dirty_scopes ?? [])
+    .filter(isSkillPromotionScopeDirty));
+}
+
+/** Bounded promotion lifecycle metadata for compact administrative status. */
+export async function skillPromotionScopeStates(): Promise<SkillPromotionDirtyScope[]> {
+  await mutationQueue;
+  const store = await getCachedStore();
+  return structuredClone(store.metadata?.skill_promotion?.dirty_scopes ?? []);
+}
+
+function reconcileStaleSkillCandidateMutationsMut(
+  store: ReflectionStore,
+  scope: MemoryScope,
+): Set<string> {
+  const metadata = store.metadata;
+  if (!metadata) return new Set();
+  const candidates = metadata.skill_candidates ?? [];
+  const pending = metadata.pending_mutations ?? [];
+  const invalidated = new Set<string>();
+  const now = new Date().toISOString();
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    if (candidate.scope !== scope || (candidate.state !== "pending" && candidate.state !== "approved")) continue;
+    const mutationIndex = pending.findIndex((mutation) => mutation.id === candidate.mutation_id
+      && mutation.operation === "apply_skill_candidate");
+    const mutation = mutationIndex >= 0 ? pending[mutationIndex] : undefined;
+    let current = mutation !== undefined;
+    if (mutation) {
+      try {
+        assertSkillMutationBinding(store, mutation, candidate);
+      } catch {
+        current = false;
+      }
+    }
+    if (current) continue;
+    candidates[index] = transitionSkillPromotionCandidate(
+      candidate,
+      "superseded",
+      now,
+      "authoritative promotion evidence, content, or target changed",
+    );
+    if (mutationIndex >= 0) pending.splice(mutationIndex, 1);
+    invalidated.add(candidate.id);
+  }
+  metadata.skill_candidates = boundSkillCandidateAudit(candidates, metadata.skills ?? []);
+  metadata.pending_mutations = pending;
+  return invalidated;
+}
+
+export async function commitSkillPromotionFingerprint(
+  scope: MemoryScope,
+  dirtyAt: string,
+  fingerprint: string,
+  outcomeClass: string,
+  candidateIds: string[],
+): Promise<boolean> {
+  if (!SHA256_RE.test(fingerprint) || !outcomeClass.trim() || outcomeClass.length > 100) {
+    throw new Error("Invalid skill promotion completion metadata");
+  }
+  return mutateStore((store) => {
+    const metadata = store.metadata;
+    const item = metadata?.skill_promotion?.dirty_scopes.find((entry) => entry.scope === scope);
+    if (!metadata || !item || item.dirty_at !== dirtyAt) return false;
+    const invalidated = reconcileStaleSkillCandidateMutationsMut(store, scope);
+    if (candidateIds.some((id) => invalidated.has(id))) return false;
+    const candidates = new Map((metadata.skill_candidates ?? []).map((candidate) => [candidate.id, candidate]));
+    if (!candidateIds.every((id) => candidates.get(id)?.scope === scope)) return false;
+    item.completed_fingerprint = fingerprint;
+    item.completed_at = new Date(Math.max(Date.now(), Date.parse(item.dirty_at))).toISOString();
+    item.last_outcome_class = outcomeClass.trim();
+    metadata.skill_promotion = SkillPromotionMetadataSchema.parse(metadata.skill_promotion);
+    return true;
+  }, "none");
+}
+
+function assertSkillMutationBinding(
+  store: ReflectionStore,
+  mutation: PendingMutation,
+  candidate: SkillPromotionCandidate,
+): void {
+  if (!mutation.payload || !mutation.payload_hash
+      || !fingerprintsEqual(pendingMutationPayloadHash(mutation.payload), mutation.payload_hash)) {
+    throw new Error(`Pending mutation ${mutation.id} payload hash mismatch`);
+  }
+  const expected = skillCandidateMutationPayload(candidate);
+  if (!fingerprintsEqual(pendingMutationPayloadHash(expected), mutation.payload_hash)) {
+    throw new Error(`Skill candidate ${candidate.id} mutation binding mismatch`);
+  }
+  if (candidate.risk !== "low" || candidate.risk_reasons.length > 0) {
+    throw new Error(`Skill candidate ${candidate.id} is not approvable`);
+  }
+  if (hasUnsafeSkillProcedureContent(candidate.proposed_revision)) {
+    throw new Error(`Skill candidate ${candidate.id} content is unsafe or contains sensitive data`);
+  }
+  const authoritative = assertSkillCandidateEvidence(store, candidate);
+  if (!isPromotionProcedureGrounded(authoritative.cluster, candidate.proposed_revision)) {
+    throw new Error(`Skill candidate ${candidate.id} content is not grounded in its evidence cluster`);
+  }
+  const targetMatch = matchPromotionTarget(authoritative.cluster, authoritative.snapshot.skills);
+  if (targetMatch.risk_reasons.length > 0
+      || targetMatch.action !== candidate.action
+      || targetMatch.target_skill_id !== candidate.target_skill_id
+      || targetMatch.expected_target_revision !== candidate.expected_target_revision) {
+    throw new Error(`Skill candidate ${candidate.id} action or target match is stale or ambiguous`);
+  }
+}
+
+export async function applyClaimedSkillCandidateMutation(
+  mutationId: string,
+  claimToken: string,
+): Promise<{ candidate: SkillPromotionCandidate; skill: SkillRecord } | null> {
+  return mutateStore((store) => {
+    const metadata = store.metadata;
+    if (!metadata) return null;
+    const pending = metadata.pending_mutations ?? [];
+    const mutationIndex = pending.findIndex((item) => item.id === mutationId
+      && item.operation === "apply_skill_candidate"
+      && item.state === "processing"
+      && item.claim_token === claimToken);
+    if (mutationIndex < 0) return null;
+    const mutation = pending[mutationIndex];
+    const candidates = metadata.skill_candidates ?? [];
+    const candidateIndex = candidates.findIndex((item) => item.mutation_id === mutationId && item.state === "pending");
+    const candidate = candidateIndex >= 0 ? SkillPromotionCandidateSchema.parse(candidates[candidateIndex]) : undefined;
+    if (!candidate) throw new Error(`Skill candidate for mutation ${mutationId} is missing or finalized`);
+    assertSkillMutationBinding(store, mutation, candidate);
+
+    const skills = metadata.skills ?? [];
+    const now = new Date().toISOString();
+    let skill: SkillRecord;
+    if (candidate.action === "create") {
+      if (skills.filter((item) => item.scope === candidate.scope).length >= SKILL_RECORDS_PER_SCOPE_MAX) {
+        throw new Error(`Skill capacity reached for ${candidate.scope}`);
+      }
+      const skillId = `skill:${pendingMutationPayloadHash({ candidate_id: candidate.id }).slice(0, 40)}`;
+      if (skills.some((item) => item.id === skillId)) throw new Error(`Skill ID collision: ${skillId}`);
+      skill = SkillRecordSchema.parse({
+        id: skillId,
+        scope: candidate.scope,
+        status: "active",
+        current_revision: 1,
+        revisions: [candidate.proposed_revision],
+        compacted_revision_audit: [],
+        created_at: now,
+        updated_at: now,
+      });
+      skills.push(skill);
+    } else {
+      const skillIndex = skills.findIndex((item) => item.id === candidate.target_skill_id
+        && item.scope === candidate.scope);
+      const target = skillIndex >= 0 ? skills[skillIndex] : undefined;
+      if (!target || target.status !== "active"
+          || target.current_revision !== candidate.expected_target_revision) {
+        throw new Error(`Skill candidate ${candidate.id} target revision is stale or unavailable`);
+      }
+      skill = appendSkillRevision(target, candidate.proposed_revision, now);
+      skills.splice(skillIndex, 1, skill);
+    }
+
+    const approved = transitionSkillPromotionCandidate(candidate, "approved", now, "explicit mutation approval");
+    const applied = transitionSkillPromotionCandidate(approved, "applied", now, `applied revision ${skill.current_revision}`);
+    candidates.splice(candidateIndex, 1, applied);
+    pending.splice(mutationIndex, 1);
+    metadata.skills = skills;
+    metadata.skill_candidates = boundSkillCandidateAudit(candidates, skills);
+    metadata.pending_mutations = pending;
+    reconcileStaleSkillCandidateMutationsMut(store, candidate.scope);
+    return { candidate: structuredClone(applied), skill: structuredClone(skill) };
+  }, "none");
+}
+
+export async function rejectSkillCandidateMutation(
+  mutationId: string,
+): Promise<SkillPromotionCandidate | null> {
+  return mutateStore((store) => {
+    const metadata = store.metadata;
+    if (!metadata) return null;
+    const pending = metadata.pending_mutations ?? [];
+    const mutationIndex = pending.findIndex((mutation) => mutation.id === mutationId
+      && mutation.operation === "apply_skill_candidate"
+      && ((mutation.state ?? "pending") === "pending" || isPendingClaimStale(mutation)));
+    if (mutationIndex < 0) return null;
+    const candidates = metadata.skill_candidates ?? [];
+    const candidateIndex = candidates.findIndex((candidate) => candidate.mutation_id === mutationId
+      && candidate.state === "pending");
+    const candidate = candidateIndex >= 0 ? candidates[candidateIndex] : undefined;
+    if (!candidate) return null;
+    const rejected = transitionSkillPromotionCandidate(
+      candidate,
+      "rejected",
+      new Date().toISOString(),
+      "explicit mutation rejection",
+    );
+    pending.splice(mutationIndex, 1);
+    candidates.splice(candidateIndex, 1, rejected);
+    metadata.pending_mutations = pending;
+    metadata.skill_candidates = boundSkillCandidateAudit(candidates, metadata.skills ?? []);
+    return structuredClone(rejected);
+  }, "none");
+}
+
+export async function rollbackAppliedSkillCandidate(
+  mutationId: string,
+): Promise<{ candidate: SkillPromotionCandidate; skill: SkillRecord; idempotent: boolean } | null> {
+  return mutateStore((store) => {
+    const metadata = store.metadata;
+    if (!metadata) return null;
+    const candidates = metadata.skill_candidates ?? [];
+    const candidateIndex = candidates.findIndex((item) => item.mutation_id === mutationId
+      && (item.state === "applied" || item.state === "rolled_back"));
+    const candidate = candidateIndex >= 0 ? candidates[candidateIndex] : undefined;
+    if (!candidate) return null;
+    const skills = metadata.skills ?? [];
+    const skill = appliedSkillForCandidate(skills, candidate);
+    if (!skill) throw new Error(`Applied skill for candidate ${candidate.id} is missing`);
+    const appliedRevision = skill.revisions.find((revision) =>
+      revision.revision === candidate.proposed_revision.revision);
+    if (!appliedRevision
+        || appliedRevision.origin_candidate_id !== candidate.id
+        || !fingerprintsEqual(appliedRevision.content_hash, candidate.proposed_revision.content_hash)) {
+      throw new Error(`Rollback binding for candidate ${candidate.id} does not match the applied skill revision`);
+    }
+    if (candidate.state === "rolled_back") {
+      const current = skill.revisions.find((revision) => revision.revision === skill.current_revision);
+      if (!current || current.rollback_of_candidate_id !== candidate.id) {
+        throw new Error(`Rollback audit for candidate ${candidate.id} is inconsistent with the current revision`);
+      }
+      return { candidate: structuredClone(candidate), skill: structuredClone(skill), idempotent: true };
+    }
+    if (skill.current_revision !== candidate.proposed_revision.revision) {
+      throw new Error(`Cannot rollback candidate ${candidate.id}: a newer revision is current`);
+    }
+    const previous = candidate.action === "update"
+      ? skill.revisions.find((revision) => revision.revision === candidate.proposed_revision.revision - 1)
+      : candidate.proposed_revision;
+    if (!previous) throw new Error(`Cannot rollback candidate ${candidate.id}: prior revision is unavailable`);
+    const now = new Date().toISOString();
+    const rollbackBody: Omit<SkillRevision, "content_hash"> = {
+      revision: skill.current_revision + 1,
+      title: previous.title,
+      summary: previous.summary,
+      steps: [...previous.steps],
+      domain: previous.domain,
+      tags: [...previous.tags],
+      confidence: previous.confidence,
+      provenance: previous.provenance.map((item) => ({ ...item })),
+      origin_candidate_id: candidate.id,
+      created_at: now,
+      rollback_of_candidate_id: candidate.id,
+    };
+    const revision = SkillRevisionSchema.parse({
+      ...rollbackBody,
+      content_hash: skillRevisionContentHash(rollbackBody),
+    });
+    const skillIndex = skills.findIndex((item) => item.id === skill.id);
+    const rolledSkill = appendSkillRevision(skill, revision, now);
+    if (candidate.action === "create") rolledSkill.status = "disabled";
+    const validatedSkill = SkillRecordSchema.parse(rolledSkill);
+    const rolledCandidate = transitionSkillPromotionCandidate(candidate, "rolled_back", now, "explicit rollback");
+    skills.splice(skillIndex, 1, validatedSkill);
+    candidates.splice(candidateIndex, 1, rolledCandidate);
+    metadata.skills = skills;
+    metadata.skill_candidates = boundSkillCandidateAudit(candidates, skills);
+    reconcileStaleSkillCandidateMutationsMut(store, candidate.scope);
+    return {
+      candidate: structuredClone(rolledCandidate),
+      skill: structuredClone(validatedSkill),
+      idempotent: false,
+    };
+  }, "none");
+}
+
 export async function rejectPendingMutation(mutationId: string): Promise<PendingMutation | null> {
   return mutateStore((store) => {
     const pending = store.metadata?.pending_mutations ?? [];
@@ -2970,6 +3825,7 @@ function applyHeuristicFeedbackMut(
       value: input.value,
       created_at: reflection.timestamp,
     });
+    markSkillPromotionDirtyMut(store, heuristic.scope);
   }
 }
 
@@ -3139,6 +3995,13 @@ function pruneHeuristicsMut(store: ReflectionStore): number {
   if (store.heuristics.length <= HEURISTIC_MAX_COUNT) return 0;
 
   const totalBefore = store.heuristics.length;
+  const scopeById = new Map(store.heuristics.map((heuristic) => [heuristic.id, heuristic.scope]));
+  const markRemovedScopes = (): void => {
+    const remaining = new Set(store.heuristics.map((heuristic) => heuristic.id));
+    const scopes = new Set<MemoryScope>();
+    for (const [id, scope] of scopeById) if (!remaining.has(id)) scopes.add(scope);
+    for (const scope of scopes) markSkillPromotionDirtyMut(store, scope);
+  };
   let activeCount = 0;
   const supersededScored: Array<{ heuristic: Heuristic; score: number }> = [];
   const activeUnpinnedScored: Array<{ heuristic: Heuristic; score: number }> = [];
@@ -3175,6 +4038,7 @@ function pruneHeuristicsMut(store: ReflectionStore): number {
     if (supersededToRemove.size > 0 && activeCount <= HEURISTIC_MAX_COUNT) {
       store.heuristics = store.heuristics.filter((h) => !supersededToRemove.has(h.id));
       _heuristicDedupCache.delete(store);
+      markRemovedScopes();
       return supersededToRemove.size;
     }
 
@@ -3199,6 +4063,7 @@ function pruneHeuristicsMut(store: ReflectionStore): number {
   _heuristicByIdCache.delete(store);
   _heuristicSearchTextCache.delete(store);
   _heuristicTagSetCache.delete(store);
+  markRemovedScopes();
   return removedInPhase1 + toRemove.size;
 }
 
@@ -3214,6 +4079,7 @@ export async function contradictHeuristic(id: string, reason?: string, operation
       const date = new Date().toISOString().slice(0, 10);
       heuristic.contradiction_notes.push(`[${date}] ${reason}`);
     }
+    markSkillPromotionDirtyMut(store, heuristic.scope);
     return sanitizeHeuristicForOutput(heuristic);
   }, "none", operationName, { id, reason });
 }
@@ -3221,16 +4087,23 @@ export async function contradictHeuristic(id: string, reason?: string, operation
 export async function deleteHeuristic(id: string, operationName?: string): Promise<boolean> {
   return mutateStore((store) => {
     const byId = getOrBuildHeuristicByIdMap(store);
-    if (!byId.has(id)) return false;
+    const removed = byId.get(id);
+    if (!removed) return false;
+    const affectedScopes = new Set<MemoryScope>([removed.scope]);
     // I1-fix: clean up dangling references from other heuristics before removing
     for (const h of store.heuristics) {
-      if (h.superseded_by === id) delete h.superseded_by;
+      if (h.superseded_by === id) {
+        delete h.superseded_by;
+        affectedScopes.add(h.scope);
+      }
       if (h.supersedes?.includes(id)) {
         h.supersedes = h.supersedes.filter((sid) => sid !== id);
+        affectedScopes.add(h.scope);
       }
     }
     store.heuristics = store.heuristics.filter((heuristic) => heuristic.id !== id);
     byId.delete(id);
+    for (const scope of affectedScopes) markSkillPromotionDirtyMut(store, scope);
     return true;
   }, "none", operationName, { id });
 }
@@ -3317,8 +4190,10 @@ export async function updateHeuristic(
         if (normalizedConfidence !== undefined) h.confidence = normalizedConfidence;
         if (normalizedDomain !== undefined) h.domain = normalizedDomain;
         getOrBuildHeuristicByIdMap(store).delete(replacement.id);
+        markSkillPromotionDirtyMut(store, h.scope);
         return sanitizeHeuristicForOutput(h);
       }
+      markSkillPromotionDirtyMut(store, replacement.scope);
       return sanitizeHeuristicForOutput(replacement);
     }
 
@@ -3329,6 +4204,7 @@ export async function updateHeuristic(
     h.version = h.version ?? 1;
     h.supersedes = h.supersedes ?? [];
     h.updated_at = new Date().toISOString();
+    markSkillPromotionDirtyMut(store, h.scope);
     return sanitizeHeuristicForOutput(h);
   }, "none", operationName, { id, ...update });
 }
@@ -3371,11 +4247,13 @@ export async function mergeHeuristics(targetId: string, sourceIds: string[], ope
 
       source.superseded_by = targetId;
       source.updated_at = now;
+      markSkillPromotionDirtyMut(store, source.scope);
       target.supersedes = target.supersedes ?? [];
       if (!target.supersedes.includes(sourceId)) target.supersedes.push(sourceId);
     }
 
     target.updated_at = now;
+    markSkillPromotionDirtyMut(store, target.scope);
     if (store.heuristics.length > HEURISTIC_MAX_COUNT) pruneHeuristicsMut(store);
     return sanitizeHeuristicForOutput(target);
   }, "none", operationName, { target_id: targetId, source_ids: sourceIds });
@@ -3439,9 +4317,9 @@ export async function listHeuristics(options: ListHeuristicsOptions = {}): Promi
   const compare = (a: Heuristic, b: Heuristic): number => {
     switch (sort) {
       case "updated_at":
-        return b.updated_at.localeCompare(a.updated_at);
+        return compareStableText(b.updated_at, a.updated_at);
       case "created_at":
-        return b.created_at.localeCompare(a.created_at);
+        return compareStableText(b.created_at, a.created_at);
       case "reinforcement":
         return b.reinforcement_count - a.reinforcement_count;
       case "confidence":
@@ -3611,7 +4489,7 @@ function scoreHeuristicsForQuery(
   const scoreCompare = (a: ScoredHeuristic, b: ScoredHeuristic): number =>
     b.score - a.score
     || b.heuristic.confidence - a.heuristic.confidence
-    || a.heuristic.id.localeCompare(b.heuristic.id);
+    || compareStableText(a.heuristic.id, b.heuristic.id);
 
   for (const heuristic of store.heuristics) {
     if (heuristic.superseded_by) continue;
@@ -3705,7 +4583,7 @@ function newestFirstSlice(
 
   // Fallback: full copy + sort (preserves v12 behavior for imported/out-of-order data).
   return [...reflections]
-    .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+    .sort((a, b) => compareStableText(b.timestamp, a.timestamp))
     .slice(offset, offset + limit);
 }
 
@@ -3977,7 +4855,7 @@ export async function getRecentReflections(limit = 20, scope: MemoryScope = "glo
   const { cache, resolvedIndex } = await getCachedStoreAndResolvedQuestions();
   const recent = cache.store.reflections
     .filter((reflection) => reflection.scope === "global" || reflection.scope === scope)
-    .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+    .sort((a, b) => compareStableText(b.timestamp, a.timestamp))
     .slice(0, limit);
   return recent.map((reflection) => sanitizeReflectionForOutput(reflection, resolvedIndex));
 }
@@ -4041,7 +4919,7 @@ export async function getReflectionChain(
 
   others.sort((a, b) => {
     if (b.similarity !== a.similarity) return b.similarity - a.similarity;
-    return a.reflection.timestamp.localeCompare(b.reflection.timestamp);
+    return compareStableText(a.reflection.timestamp, b.reflection.timestamp);
   });
 
   if (!seedEntry) {
@@ -4082,7 +4960,7 @@ export async function getSessionSummary(sessionId: string): Promise<SessionSumma
     b: { priority: Priority; timestamp: string },
   ): number => {
     const pd = PRIORITY_ORDER[b.priority] - PRIORITY_ORDER[a.priority];
-    return pd !== 0 ? pd : b.timestamp.localeCompare(a.timestamp);
+    return pd !== 0 ? pd : compareStableText(b.timestamp, a.timestamp);
   };
 
   for (const reflection of sessionReflections) {
@@ -4417,7 +5295,9 @@ export async function getWorldModel(
     bucketByIndex.set(index, nextKey);
   };
 
-  const orderedReflections = cache.reflectionsAreAscending ? store.reflections : [...store.reflections].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  const orderedReflections = cache.reflectionsAreAscending
+    ? store.reflections
+    : [...store.reflections].sort((a, b) => compareStableText(a.timestamp, b.timestamp));
 
   for (const reflection of orderedReflections) {
     if (cutoff && reflection.timestamp < cutoff) continue;
@@ -4479,7 +5359,7 @@ export async function getWorldModel(
     facts = facts.filter((f) => f.polarity === polarity);
   }
 
-  facts.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+  facts.sort((a, b) => compareStableText(b.timestamp, a.timestamp));
   return facts.slice(0, limit);
 }
 
@@ -4678,7 +5558,7 @@ export async function getOpenQuestions(
   const openQCompare = (a: OpenQuestionSummary, b: OpenQuestionSummary): number => {
     const priorityDelta = PRIORITY_RANK[b.priority] - PRIORITY_RANK[a.priority];
     if (priorityDelta !== 0) return priorityDelta;
-    return b.timestamp.localeCompare(a.timestamp);
+    return compareStableText(b.timestamp, a.timestamp);
   };
 
   for (const reflection of store.reflections) {
@@ -5100,16 +5980,21 @@ function applyReplaceImportFields(
   incoming: Partial<ReflectionStore>,
 ): ResolvedQuestionIndex | undefined {
   let replacementResolvedIndex: ResolvedQuestionIndex | undefined;
+  const affectedPromotionScopes = new Set<MemoryScope>();
   if (incoming.reflections) {
+    for (const reflection of store.reflections) affectedPromotionScopes.add(reflection.scope);
     store.reflections = uniqueById(
       (incoming.reflections as Partial<ReflectionFrame>[]).map(normalizeReflectionFrame),
     );
+    for (const reflection of store.reflections) affectedPromotionScopes.add(reflection.scope);
     replacementResolvedIndex = resolvedQuestionsFromReflections(store.reflections);
   }
   if (incoming.heuristics) {
+    for (const heuristic of store.heuristics) affectedPromotionScopes.add(heuristic.scope);
     store.heuristics = uniqueById(
       (incoming.heuristics as Partial<Heuristic>[]).map(normalizeHeuristicRecord),
     );
+    for (const heuristic of store.heuristics) affectedPromotionScopes.add(heuristic.scope);
   }
   if (incoming.affordance_gaps) {
     store.affordance_gaps = uniqueById(
@@ -5120,6 +6005,7 @@ function applyReplaceImportFields(
   if (incoming.memory_board) store.memory_board = normalizeMemoryBoard(incoming.memory_board as Partial<MemoryBoard>);
   if (incoming.user_profile) store.user_profile = normalizeMemoryBoard(incoming.user_profile as Partial<MemoryBoard>, 1800);
   reconcileSessionCounters(store, true);
+  for (const scope of affectedPromotionScopes) markSkillPromotionDirtyMut(store, scope);
   return replacementResolvedIndex;
 }
 
@@ -5200,6 +6086,7 @@ export async function importData(
   assertImportObject(incoming);
   const mutationResult = await mutateStore((store) => {
     const originalSessionIds = new Set(Object.keys(store.sessions));
+    const affectedPromotionScopes = new Set<MemoryScope>();
     let replacementResolvedIndex: ResolvedQuestionIndex | undefined;
     let mergedResolvedIndex: ResolvedQuestionIndex | undefined;
     const mergedNewReflections: ReflectionFrame[] = [];
@@ -5222,6 +6109,7 @@ export async function importData(
             mergedNewReflections.push(r);
             store.reflections.push(r);
             existingIds.add(r.id);
+            affectedPromotionScopes.add(r.scope);
             newReflections++;
           }
         }
@@ -5240,6 +6128,7 @@ export async function importData(
           store.heuristics.push(normalized);
           existingIds.add(normalized.id);
           existingTexts.add(textLower);
+          affectedPromotionScopes.add(normalized.scope);
           newHeuristics++;
         }
         // B7-fix: enforce HEURISTIC_MAX_COUNT after merge
@@ -5301,6 +6190,7 @@ export async function importData(
     // Session counters are derived from the records actually present in the
     // store. Partial imports must not leave orphan references or stale counts.
     reconcileSessionCounters(store, true);
+    for (const scope of affectedPromotionScopes) markSkillPromotionDirtyMut(store, scope);
     newSessions = Object.keys(store.sessions)
       .filter((id) => !originalSessionIds.has(id))
       .length;
@@ -5348,7 +6238,14 @@ export async function importData(
 
 export async function clearData(collection: ClearCollection, operationName?: string): Promise<void> {
   await mutateStore((store) => {
+    const affectedScopes = collection === "heuristics" || collection === "reflections"
+      ? new Set<MemoryScope>([
+        ...store.heuristics.map((heuristic) => heuristic.scope),
+        ...store.reflections.map((reflection) => reflection.scope),
+      ])
+      : new Set<MemoryScope>();
     applyClearDataFields(store, collection);
+    for (const scope of affectedScopes) markSkillPromotionDirtyMut(store, scope);
   }, collection === "reflections" || collection === "all" ? "rewrite" : "none", operationName, { collection }, undefined,
   collection === "reflections" || collection === "all" ? async (resolved) => {
       for (const key of Object.keys(resolved)) delete resolved[key];
@@ -5378,6 +6275,13 @@ function applyClearDataFields(store: ReflectionStore, collection: ClearCollectio
       store.heuristics = [];
       store.memory_board = { entries: [], char_limit: store.memory_board?.char_limit ?? 2200, used_chars: 0 };
       store.user_profile = { entries: [], char_limit: store.user_profile?.char_limit ?? 1800, used_chars: 0 };
+      if (store.metadata) {
+        store.metadata.skills = [];
+        store.metadata.skill_candidates = [];
+        store.metadata.skill_promotion = { dirty_scopes: [] };
+        store.metadata.pending_mutations = (store.metadata.pending_mutations ?? [])
+          .filter((mutation) => mutation.operation !== "apply_skill_candidate");
+      }
       break;
   }
 }
@@ -5674,7 +6578,7 @@ export async function generateProjectExperienceMarkdown(
     if (selected.length === 0) return null;
 
     // Newest-first for presentation, dedupe, apply limit
-    selected.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    selected.sort((a, b) => compareStableText(b.timestamp, a.timestamp));
     selected = dedupeNewestFirst(selected);
     selected = selected.slice(0, limit);
   } else {
@@ -5708,7 +6612,7 @@ export async function generateProjectExperienceMarkdown(
         if (cutoff !== undefined && r.timestamp < cutoff) continue;
         filtered.push(r);
       }
-      filtered.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+      filtered.sort((a, b) => compareStableText(b.timestamp, a.timestamp));
       selected = dedupeNewestFirst(filtered).slice(0, limit);
     }
 
@@ -6058,9 +6962,9 @@ export async function generateHeuristicsExport(
   const sortCompare = (a: Heuristic, b: Heuristic): number => {
     switch (sort) {
       case "updated_at":
-        return b.updated_at.localeCompare(a.updated_at);
+        return compareStableText(b.updated_at, a.updated_at);
       case "created_at":
-        return b.created_at.localeCompare(a.created_at);
+        return compareStableText(b.created_at, a.created_at);
       case "reinforcement":
         return b.reinforcement_count - a.reinforcement_count;
       case "confidence":
@@ -6160,7 +7064,7 @@ export async function getDomainSummary(
   const openQuestionDetailCompare = (a: DomainOpenQuestionDetail, b: DomainOpenQuestionDetail): number => {
     const priorityDelta = PRIORITY_RANK[b.priority] - PRIORITY_RANK[a.priority];
     if (priorityDelta !== 0) return priorityDelta;
-    return b.timestamp.localeCompare(a.timestamp);
+    return compareStableText(b.timestamp, a.timestamp);
   };
 
   for (const reflection of store.reflections) {

@@ -1,10 +1,10 @@
-# Hermes Reflection MCP v22.0.0
+# Hermes Reflection MCP v22.1.0
 
 Hermes Reflection MCP is a local, Agent-first memory and reflection server for Codex Desktop. It keeps the v19-compatible 29-tool surface, but the recommended Codex profile exposes only 10 high-value tools to reduce tool metadata and context usage.
 
 All memory is reference data, never instructions. The server is local-first, rejects unsafe transfer paths, redacts sensitive derived/output text, and requires explicit confirmation for destructive reset.
 
-v22.0 adds a host-independent lifecycle and learning core while preserving v21.1 behavior. Codex and direct MCP events now map into one canonical dispatcher; Memory, Heuristic, and Skill are distinct internal objects with provenance, and skill candidates cannot bypass explicit state transitions. Optional turn capture remains bounded, redacted, paired atomically, and disabled by default. The compatibility layer remains exactly 29 unique tools, and the default Agent-first profile remains the exact ordered 10-tool list below.
+v22.1 makes the internal Skill model operational without adding tools: repeated successful procedures can become MCP-managed approval candidates, approved skills are recalled as at most two compact references, and `get_memory_item` provides bounded detail by ID. Skill creation, updates, rejection, and rollback use the existing manual mutation workflow. No learned script is executed and no external Codex skill file is created. The compatibility layer remains exactly 29 unique tools, and the default Agent-first profile remains the exact ordered 10-tool list below.
 
 ## Agent-first core profile
 
@@ -72,6 +72,24 @@ The core profile and compact responses address different costs: the profile redu
 - Indexed session turns live in SQLite FTS5 and are included only when clients explicitly append them.
 - `get_memory_item` returns one bounded item/section by opaque ID so the agent does not have to request a large list again.
 
+### MCP-managed skills
+
+- A promotion candidate requires repeated procedural success: evidence from at least two successful sessions, or three distinct successful goals in one session.
+- Contradictory, harmful, unresolved-failure, credential-bearing, transient provider/environment, ambiguous-match, and permanent-negative evidence is rejected or blocked.
+- The MCP is the canonical skill store. It does not write `.codex/skills`, `SKILL.md`, shell scripts, or any other executable skill artifact.
+- `retrieve_heuristics` may attach at most two active, visible `skill_ref` records to its first result. References contain bounded metadata only; procedure steps require `get_memory_item` with `kind: "skill"`.
+- Inspect a proposal with `get_memory_item` and `kind: "skill_candidate"`. Use `list_pending_mutations` to find its mutation ID.
+
+Administrative decisions use the existing tool:
+
+```json
+{"mutation_id":"<id>","decision":"approve"}
+{"mutation_id":"<id>","decision":"reject"}
+{"mutation_id":"<original-applied-id>","decision":"rollback"}
+```
+
+Approval revalidates exact scope, current evidence, cluster identity, target revision, content hashes, and the pending-mutation binding atomically. Rollback is audited and idempotent, but refuses to overwrite a newer current revision. A rolled-back newly created skill is disabled and is not recalled.
+
 `reflect_on_task.heuristic_feedback` accepts `helpful`, `harmful`, or `irrelevant` feedback for retrieved heuristic IDs. Feedback changes later ranking; it does not rewrite the original reflection.
 
 ## Project scopes
@@ -104,6 +122,8 @@ Only the latest ten scoped reflection records, capped at 24,000 serialized chara
 Candidates remain untrusted suggestions. Before persistence, v21 rechecks exact scope, source evidence, freshness, content identity, write-approval state, and the current fencing token under the authoritative lock. This anti-mislearning/TOCTOU evidence gate prevents stale or cross-scope provider output from becoming memory.
 
 `review_mode: "auto"` uses LLM review when ready and otherwise falls back to deterministic review. `review_mode: "llm"` fails closed when the provider is unavailable.
+
+Skill synthesis uses the same bounded provider transport and strict JSON boundary. Provider failure or unsafe/invalid output produces a deterministic evidence-derived proposal; it never bypasses explicit approval. Background promotion shares the session-review fencing lease, is cancellable during shutdown, and does not make automatic provider calls while the background lifecycle is disabled. A manual background review can still process eligible promotion work under its lease.
 
 Auto-apply is a separate opt-in. A candidate is eligible only when confidence is at least 0.85, it has no risk reasons, remains pending, is at most 1,000 characters, and has source reflection IDs. Auto-apply is blocked when write approval is enabled or the background fencing lease is stale. It never edits skills, User Profile, or Memory Board.
 
@@ -146,13 +166,15 @@ Safe export redacts derived content by default. Raw export requires an explicit 
 
 ## Migration and rollback
 
-v21.1 keeps the main store schema at version 2 and transactionally extends the session database with bounded pending turn pairs and compaction observations. Existing v21 sessions migrate in place without rewriting trusted receipts. Future or corrupt authoritative state fails closed and preserves content-addressed evidence; it is not silently replaced.
+v22.1 keeps the main store schema at version 2 and the existing session/lifecycle schema versions. Existing v21/v22 state migrates in place; skill collections default safely when absent. Future or corrupt authoritative state fails closed and preserves content-addressed evidence; it is not silently replaced.
 
 Before upgrading, stop the old MCP process, back up the installed code directory, and separately back up `~/.hermes-reflection`. Install into a clean staging directory, run the full validation matrix, then switch Codex to the validated path. To roll back, stop Codex, restore the previous code directory and matching data backup, then restart a fresh Codex process.
 
 ## Development and verification
 
 Node.js 20 or newer is required.
+
+The verified Windows workflow invokes PowerShell 7 explicitly at `C:\Users\<YOU>\AppData\Local\Microsoft\WindowsApps\pwsh.exe`; replace `<YOU>` or use your own PowerShell 7 path.
 
 ```powershell
 npm ci
@@ -168,10 +190,11 @@ npm run test:concurrency
 npm run test:v20:agent-fixture
 npm run test:v21
 npm run test:v21.1
+npm run test:v22.1
 ```
 
 `npm run test:v20:agent` runs 20 fresh-process Codex Agent workflows and requires at least 18/20 passes with zero destructive-tool violations. It needs the local `codex` executable and can make model calls. The fixture grader is deterministic and offline.
 
-CI is latest-first on Windows and Linux with Node 20 and 22. It runs strict TypeScript, current base regressions, v21 lifecycle/transaction/safety/release suites, concurrency checks, package dry-run, and production audit. Historical compatibility suites remain available as opt-in local commands but do not block the v21 release.
+CI is latest-first on Windows and Linux with Node 20 and 22. It runs strict TypeScript, the v22.1 promotion/MCP suites, current compatibility and safety regressions, concurrency checks, package dry-run, and production audit. Historical compatibility suites remain available as opt-in local commands.
 
 See [`INSTALL_HERMES_MCP.md`](INSTALL_HERMES_MCP.md) for installation and [`CHANGELOG.md`](CHANGELOG.md) for release history.

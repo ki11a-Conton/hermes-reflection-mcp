@@ -17,6 +17,15 @@ export type Priority = "high" | "medium" | "low";
 export type Polarity = "affirm" | "negate";
 export type InsightStatus = "confirmed" | "needs_verification";
 export type MemoryScope = "global" | `project:${string}`;
+export type SkillStatus = "active" | "disabled";
+export type SkillPromotionAction = "create" | "update";
+export type SkillPromotionState =
+  | "pending"
+  | "approved"
+  | "applied"
+  | "rejected"
+  | "superseded"
+  | "rolled_back";
 
 export interface HeuristicEvidence {
   id: string;
@@ -187,6 +196,83 @@ export interface ReviewCandidate {
   mutation_id?: string;
 }
 
+export interface SkillRevisionAudit {
+  revision: number;
+  content_hash: string;
+  origin_candidate_id: string;
+  created_at: string;
+}
+
+export interface SkillRevision extends SkillRevisionAudit {
+  title: string;
+  summary: string;
+  steps: string[];
+  domain: string;
+  tags: string[];
+  confidence: number;
+  provenance: Array<{
+    source_type: "reflection" | "memory" | "heuristic" | "external";
+    source_id: string;
+    content_hash: string;
+    observed_at: string;
+    status: "active" | "invalidated" | "contradictory";
+  }>;
+  rollback_of_candidate_id?: string;
+}
+
+export interface SkillRecord {
+  id: string;
+  scope: MemoryScope;
+  status: SkillStatus;
+  current_revision: number;
+  revisions: SkillRevision[];
+  compacted_revision_audit: SkillRevisionAudit[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SkillPromotionTransition {
+  from: SkillPromotionState;
+  to: SkillPromotionState;
+  at: string;
+  reason: string;
+}
+
+export interface SkillPromotionCandidate {
+  id: string;
+  action: SkillPromotionAction;
+  scope: MemoryScope;
+  target_skill_id?: string;
+  expected_target_revision?: number;
+  proposed_revision: SkillRevision;
+  source_heuristic_ids: string[];
+  source_reflection_ids: string[];
+  cluster_algorithm: string;
+  cluster_fingerprint: string;
+  evidence_fingerprint: string;
+  confidence: number;
+  risk: "low" | "medium" | "high";
+  risk_reasons: string[];
+  state: SkillPromotionState;
+  fingerprint: string;
+  mutation_id?: string;
+  created_at: string;
+  updated_at: string;
+  history: SkillPromotionTransition[];
+}
+
+export interface SkillPromotionDirtyScope {
+  scope: MemoryScope;
+  dirty_at: string;
+  completed_fingerprint?: string;
+  completed_at?: string;
+  last_outcome_class?: string;
+}
+
+export interface SkillPromotionMetadata {
+  dirty_scopes: SkillPromotionDirtyScope[];
+}
+
 export interface MemoryEntry {
   id: string;
   content: string;
@@ -274,6 +360,9 @@ export interface ReflectionStore {
     write_approval?: boolean;
     pending_mutations?: PendingMutation[];
     review_candidates?: ReviewCandidate[];
+    skills?: SkillRecord[];
+    skill_candidates?: SkillPromotionCandidate[];
+    skill_promotion?: SkillPromotionMetadata;
     committed_receipts?: Record<string, CommittedReceipt>;
     external_provider?: { name: string; endpoint?: string; db_path?: string; auto_sync?: boolean };
   };

@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { withFileLock } from "./file_lock.js";
 import { AuthoritativeStateError, preserveCorruptUtf8, readAuthoritativeJson } from "./authoritative_state.js";
+import { compareStableText } from "./stable_order.js";
 const SCHEMA_VERSION = 2;
 const MAX_DIRTY_SESSIONS = 100;
 const MAX_RECENT_RUNS = 20;
@@ -309,7 +310,7 @@ export class BackgroundStateStore {
         await this.mutate((state) => {
             const previous = state.reviewed_sessions[sessionId];
             state.dirty_sessions[sessionId] = { dirty_at: timestamp, ...previous };
-            const ordered = Object.entries(state.dirty_sessions).sort((a, b) => a[1].dirty_at.localeCompare(b[1].dirty_at));
+            const ordered = Object.entries(state.dirty_sessions).sort((a, b) => compareStableText(a[1].dirty_at, b[1].dirty_at) || compareStableText(a[0], b[0]));
             while (ordered.length > MAX_DIRTY_SESSIONS) {
                 const [oldest] = ordered.shift();
                 delete state.dirty_sessions[oldest];
@@ -410,7 +411,8 @@ export class BackgroundStateStore {
                     [stage]: { fingerprint: reviewedFingerprint, completed_at: finishedAt },
                 };
                 const reviewed = Object.entries(state.reviewed_sessions)
-                    .sort((a, b) => latestStageTimestamp(a[1]).localeCompare(latestStageTimestamp(b[1])));
+                    .sort((a, b) => compareStableText(latestStageTimestamp(a[1]), latestStageTimestamp(b[1]))
+                    || compareStableText(a[0], b[0]));
                 while (reviewed.length > MAX_DIRTY_SESSIONS) {
                     const [oldest] = reviewed.shift();
                     delete state.reviewed_sessions[oldest];
@@ -460,7 +462,8 @@ export class BackgroundStateStore {
                 retry_after: item.retry_after,
                 outcome_class: item.outcome_class,
             }))
-                .sort((a, b) => a.dirty_at.localeCompare(b.dirty_at));
+                .sort((a, b) => compareStableText(a.dirty_at, b.dirty_at)
+                || compareStableText(a.session_id, b.session_id));
         });
     }
     async status() {

@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { STORE_DIR } from "../storage.js";
-import type { MemoryScope } from "../types.js";
+import {
+  dirtySkillPromotionScopes,
+  skillCandidateIdsExist,
+  STORE_DIR,
+} from "../storage.js";
+import type { MemoryScope, SkillPromotionDirtyScope } from "../types.js";
 import { BackgroundStateStore, type BackgroundStatus, type ReviewStage } from "./background_state.js";
 import {
   getReviewReadinessStatus,
@@ -14,6 +18,11 @@ import {
 } from "./review_engine.js";
 import { HermesError } from "./errors.js";
 import { durableReviewCandidateIds } from "./review_queue.js";
+import {
+  runSkillPromotionSingleFlight,
+  type SkillPromotionRunOptions,
+  type SkillPromotionRunResult,
+} from "./skill_promotion_coordinator.js";
 import { HookInbox, hookInbox, type HookEvent } from "./hook_inbox.js";
 import { HookInboxPump, type HookInboxPumpStatus } from "./hook_inbox_pump.js";
 import {
@@ -31,6 +40,7 @@ import {
 } from "./session_scope.js";
 import { resolvePersistedSessionAccess } from "./session_access.js";
 import { captureSessionSnapshot, releaseSessionSnapshot } from "./storage_enhanced.js";
+import { compareStableText } from "./stable_order.js";
 import {
   persistCompactionReceipt,
   persistCompactionObservation,
@@ -87,6 +97,10 @@ export interface BackgroundLifecycleOptions {
     stage?: ReviewStage,
   ) => Promise<{ source_fingerprint: string; reflection_count: number; scope?: MemoryScope }>;
   candidates_durable?: (candidateIds: string[]) => Promise<boolean>;
+  promotion_dirty_scopes?: () => Promise<SkillPromotionDirtyScope[]>;
+  promote?: (input: SkillPromotionRunOptions) => Promise<SkillPromotionRunResult>;
+  promotion_candidates_durable?: (candidateIds: string[]) => Promise<boolean>;
+  manual_review?: (input: RunReviewOptions) => Promise<ReviewEngineResult>;
   hook_inbox?: HookInbox;
   process_hook_event?: (event: HookEvent) => Promise<void>;
   turn_capture_enabled?: boolean;
@@ -243,6 +257,10 @@ export class BackgroundLifecycle {
   private readonly review: NonNullable<BackgroundLifecycleOptions["review"]>;
   private readonly sourceState: NonNullable<BackgroundLifecycleOptions["source_state"]>;
   private readonly candidatesDurable: NonNullable<BackgroundLifecycleOptions["candidates_durable"]>;
+  private readonly promotionDirtyScopes: NonNullable<BackgroundLifecycleOptions["promotion_dirty_scopes"]>;
+  private readonly promote: NonNullable<BackgroundLifecycleOptions["promote"]>;
+  private readonly promotionCandidatesDurable: NonNullable<BackgroundLifecycleOptions["promotion_candidates_durable"]>;
+  private readonly manualReview: NonNullable<BackgroundLifecycleOptions["manual_review"]>;
   private readonly inbox: HookInbox;
   private readonly processHookEvent: NonNullable<BackgroundLifecycleOptions["process_hook_event"]>;
   private readonly turnCaptureEnabled: boolean;
@@ -253,6 +271,7 @@ export class BackgroundLifecycle {
   private deadlineBackoffUntil = 0;
   private deadlineArmGeneration = 0;
   private deadlineRearmQueue: Promise<void> = Promise.resolve();
+  private promotionWakePending = false;
   private activeRun: Promise<void> | undefined;
   private activeReviewReady: { promise: Promise<void>; resolve: () => void } | undefined;
   private activeController: AbortController | undefined;
@@ -269,6 +288,10 @@ export class BackgroundLifecycle {
       return getReviewSourceState(sessionId, "recent", scope, stage);
     });
     this.candidatesDurable = options.candidates_durable ?? durableReviewCandidateIds;
+    this.promotionDirtyScopes = options.promotion_dirty_scopes ?? dirtySkillPromotionScopes;
+    this.promote = options.promote ?? runSkillPromotionSingleFlight;
+    this.promotionCandidatesDurable = options.promotion_candidates_durable ?? skillCandidateIdsExist;
+    this.manualReview = options.manual_review ?? runReviewSingleFlight;
     this.inbox = options.hook_inbox ?? hookInbox;
     this.turnCaptureEnabled = options.turn_capture_enabled ?? truthy(process.env.HERMES_REFLECTION_CODEX_TURN_CAPTURE);
     this.processHookEvent = options.process_hook_event ?? ((event) => this.applyHookEvent(event));
@@ -373,6 +396,22 @@ export class BackgroundLifecycle {
   async notifyReflectionSaved(sessionId: string): Promise<void> {
     await this.options.store.markDirty(sessionId);
     await this.rearmDeadline();
+    this.notifySkillPromotionDirty();
+  }
+
+  /** Wake the existing fenced background runner after a committed learning mutation. */
+  notifySkillPromotionDirty(): void {
+    if (!this.options.enabled || this.stopping) return;
+    this.promotionWakePending = true;
+    this.wakePendingSkillPromotions();
+  }
+
+  private wakePendingSkillPromotions(): void {
+    if (!this.promotionWakePending || !this.options.enabled || this.stopping
+        || this.activeRun !== undefined || this.activeFence !== undefined || this.fenceClaiming) return;
+    void this.runNow().catch((error) => {
+      console.error("[hermes] background skill promotion failed:", error instanceof Error ? error.message : "unknown error");
+    });
   }
 
   async notifySessionEnd(sessionId: string): Promise<void> {
@@ -394,6 +433,39 @@ export class BackgroundLifecycle {
     return getReviewReadinessStatus().ready ? "llm" : "deterministic";
   }
 
+  private async runSkillPromotions(
+    signal: AbortSignal,
+    beforeApply: () => Promise<boolean>,
+    withApplyLease: <T>(operation: () => Promise<T>) => Promise<T | undefined>,
+    onlyScope?: MemoryScope,
+  ): Promise<void> {
+    const dirty = (await this.promotionDirtyScopes())
+      .filter((item) => onlyScope === undefined || item.scope === onlyScope)
+      .sort((left, right) => Date.parse(left.dirty_at) - Date.parse(right.dirty_at)
+        || compareStableText(left.scope, right.scope))
+      .slice(0, Math.max(1, this.options.max_sessions_per_run));
+    for (const item of dirty) {
+      if (signal.aborted || !await beforeApply()) break;
+      let output: SkillPromotionRunResult;
+      try {
+        output = await this.promote({
+          scope: item.scope,
+          signal,
+          before_apply: beforeApply,
+          with_apply_lease: withApplyLease,
+        });
+      } catch (error) {
+        if (signal.aborted) break;
+        console.error("[hermes] skill promotion coordinator failed:", error instanceof Error ? error.message : "unknown error");
+        continue;
+      }
+      if (signal.aborted || output.outcome_class === "aborted") break;
+      if (output.success && !await this.promotionCandidatesDurable(output.candidate_ids)) {
+        console.error("[hermes] skill promotion candidates were not durably persisted");
+      }
+    }
+  }
+
   runNow(): Promise<void>;
   runNow(request: ManualReviewRequest): Promise<ReviewEngineResult>;
   runNow(request?: ManualReviewRequest): Promise<void> | Promise<ReviewEngineResult> {
@@ -409,6 +481,7 @@ export class BackgroundLifecycle {
     }
     if (!this.options.enabled || this.stopping) return Promise.resolve();
     if (this.activeRun) return this.activeRun;
+    this.promotionWakePending = false;
     let resolveReady!: () => void;
     const ready = {
       promise: new Promise<void>((resolve) => { resolveReady = resolve; }),
@@ -420,6 +493,7 @@ export class BackgroundLifecycle {
       if (this.activeReviewReady === ready) this.activeReviewReady = undefined;
       if (this.activeRun === wrapped) this.activeRun = undefined;
       void this.rearmDeadline();
+      this.wakePendingSkillPromotions();
     });
     this.activeRun = wrapped;
     return wrapped;
@@ -637,7 +711,7 @@ export class BackgroundLifecycle {
           "Retry after the current review lease is available.",
         );
       }
-      const result = await runReviewSingleFlight({
+      const result = await this.manualReview({
         ...request,
         signal: controller.signal,
         beforeApply: () => this.options.store.isLeaseCurrent(this.ownerId, lease.fencing_token),
@@ -678,6 +752,12 @@ export class BackgroundLifecycle {
           "Retry so the durable candidates and stage fingerprint can be reconciled.",
         );
       }
+      await this.runSkillPromotions(
+        controller.signal,
+        () => this.options.store.isLeaseCurrent(this.ownerId, lease.fencing_token),
+        (operation) => this.options.store.withCurrentLease(this.ownerId, lease.fencing_token, operation),
+        request.scope,
+      );
       return result;
     } finally {
       controller.signal.removeEventListener("abort", stopRefresher);
@@ -686,6 +766,7 @@ export class BackgroundLifecycle {
       await this.options.store.releaseLease(this.ownerId, lease.fencing_token);
       if (this.activeFence === lease.fencing_token) this.activeFence = undefined;
       void this.rearmDeadline();
+      this.wakePendingSkillPromotions();
     }
   }
 
@@ -790,6 +871,13 @@ export class BackgroundLifecycle {
           candidateIds,
           item.dirty_at,
           retryAfterMs,
+        );
+      }
+      if (!controller.signal.aborted) {
+        await this.runSkillPromotions(
+          controller.signal,
+          () => this.options.store.isLeaseCurrent(this.ownerId, lease.fencing_token),
+          (operation) => this.options.store.withCurrentLease(this.ownerId, lease.fencing_token, operation),
         );
       }
     } finally {

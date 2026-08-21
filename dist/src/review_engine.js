@@ -4,6 +4,7 @@ import { getLlmReviewReadiness, getLlmReviewSemanticFingerprint, getLlmReviewSou
 import { redactSensitiveText } from "./redaction.js";
 import { autoApplyReviewCandidate, enqueueReviewCandidates } from "./review_queue.js";
 import { semanticReviewRiskReasons } from "./review_risk.js";
+import { compareStableText } from "./stable_order.js";
 export const MAX_RECENT_REFLECTIONS = 10;
 export const MAX_FULL_REFLECTIONS = 200;
 export const MAX_REVIEW_CANDIDATES = 50;
@@ -160,7 +161,7 @@ export async function runReview(options) {
     // selection, fingerprinting, provider input, or heuristic comparisons.
     const allSessionReflections = store.reflections
         .filter((reflection) => reflection.session_id === options.session_id && reflection.scope === options.scope)
-        .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+        .sort((a, b) => compareStableText(a.timestamp, b.timestamp) || compareStableText(a.id, b.id));
     const reviewedReflections = options.review_scope === "recent"
         ? allSessionReflections.slice(-MAX_RECENT_REFLECTIONS)
         : allSessionReflections.slice(-MAX_FULL_REFLECTIONS);
@@ -365,7 +366,7 @@ export async function getReviewSourceState(sessionId, reviewScope = "recent", re
     const scope = requestedScope ?? sessionReflections[0]?.scope;
     const allSessionReflections = sessionReflections
         .filter((reflection) => reflection.scope === scope)
-        .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+        .sort((a, b) => compareStableText(a.timestamp, b.timestamp) || compareStableText(a.id, b.id));
     const reviewed = reviewScope === "recent"
         ? allSessionReflections.slice(-MAX_RECENT_REFLECTIONS)
         : allSessionReflections.slice(-MAX_FULL_REFLECTIONS);
